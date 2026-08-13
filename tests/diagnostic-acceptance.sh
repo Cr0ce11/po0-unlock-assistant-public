@@ -83,18 +83,30 @@ test_redaction_examples() (
     sanitizer=$(extract_function sanitize_diagnostic_stream)
     [[ -n ${sanitizer} ]] || { fail '未能提取脱敏函数'; return 1; }
     eval "${sanitizer}"
-    sample=$'server=https://panel.example.com:443/api\nipv4=203.0.113.24:45222\nipv6=2001:db8::1234\nuser=root@example.com\npassword=VisibleSecret\nfingerprint=SHA256:abcdefghijklmnop\n{"token":"TokenValueShouldDisappear"}\n/home/alice/config'
+    sample=$'server=https://panel.example.com:443/api\nipv4=203.0.113.24:45222\nipv6=2001:db8::1234\nuser=root@example.com\npassword=VisibleSecret\nfingerprint=SHA256:abcdefghijklmnop\n{"token":"TokenValueShouldDisappear"}\n/home/alice/config\nadjacent-spaces=192.0.2.1 198.51.100.2\nthree-adjacent=192.0.2.3 198.51.100.4 203.0.113.5\nadjacent-comma=192.0.2.6,198.51.100.7\nadjacent-port=192.0.2.8 198.51.100.9:45123'
     output=$(sanitize_diagnostic_stream <<<"${sample}")
     for secret in \
         'panel.example.com' '203.0.113.24' '45222' '2001:db8::1234' \
         'root@example.com' 'VisibleSecret' 'abcdefghijklmnop' \
-        'TokenValueShouldDisappear' '/home/alice'; do
+        'TokenValueShouldDisappear' '/home/alice' \
+        '192.0.2.1' '198.51.100.2' \
+        '192.0.2.3' '198.51.100.4' '203.0.113.5' \
+        '192.0.2.6' '198.51.100.7' \
+        '192.0.2.8' '198.51.100.9' '45123'; do
         assert_not_contains "${output}" "${secret}" \
             "脱敏后仍包含：${secret}" || return 1
     done
     for marker in '[已隐藏地址]' '[已隐藏账号]' '[已隐藏敏感内容]' '[已隐藏指纹]'; do
         assert_contains "${output}" "${marker}" \
             "脱敏输出缺少标记：${marker}" || return 1
+    done
+    for expected in \
+        'adjacent-spaces=[已隐藏地址] [已隐藏地址]' \
+        'three-adjacent=[已隐藏地址] [已隐藏地址] [已隐藏地址]' \
+        'adjacent-comma=[已隐藏地址],[已隐藏地址]' \
+        'adjacent-port=[已隐藏地址] [已隐藏地址]:[已隐藏端口]'; do
+        assert_contains "${output}" "${expected}" \
+            "同行相邻地址没有按预期逐个隐藏：${expected}" || return 1
     done
 )
 
