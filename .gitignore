@@ -1,0 +1,27 @@
+.DS_Store
+.idea/
+.vscode/
+
+# 运行时连接配置，可能包含真实私网地址与 SSH 端口。
+/hosts.conf
+/hosts.conf.*
+
+# 构建候选、日志与备份。
+/po0-unlock.sh.tmp.*
+*.candidate
+*.log
+*.bak
+*.backup
+/backups/
+/bundle-history/
+/*-backups/
+
+# 凭据和 SSH 本地状态。
+.env
+.env.*
+*.key
+*.pem
+*.pub
+id_*
+known_hosts
+known_hosts.*

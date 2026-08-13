@@ -1,0 +1,409 @@
+name: CI and Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify deterministic bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Resolve and validate release version
+        id: version
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mapfile -t versions < <(
+            sed -nE 's/^SCRIPT_VERSION=((0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5}))$/\1/p' po0-unlock.sh
+          )
+          [[ ${#versions[@]} -eq 1 ]] || {
+            printf '%s\n' 'po0-unlock.sh 必须且只能声明一个正式版本号。' >&2
+            exit 1
+          }
+          version=${versions[0]}
+          if [[ ${GITHUB_REF_TYPE} == tag ]]; then
+            [[ ${GITHUB_REF_NAME} =~ ^v(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$ ]] || {
+              printf 'Tag 格式无效：%s\n' "${GITHUB_REF_NAME}" >&2
+              exit 1
+            }
+            [[ ${GITHUB_REF_NAME} == "v${version}" ]] || {
+              printf 'Tag 与脚本版本不一致：%s != v%s\n' "${GITHUB_REF_NAME}" "${version}" >&2
+              exit 1
+            }
+          fi
+          printf 'version=%s\n' "${version}" >>"${GITHUB_OUTPUT}"
+
+      - name: Check shell syntax and bundle self-test
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+          for file in setup.sh overseas-exit-role.sh cn-entry-role.sh tools/build-cn-entry-role.sh tools/build-single-file.sh po0-unlock.sh; do
+            /bin/bash -n "${file}"
+          done
+          /bin/bash tools/build-cn-entry-role.sh --check
+          output=$(timeout 30 /bin/bash po0-unlock.sh self-test)
+          [[ $(grep -Fxc 'SELF_TEST=PASS' <<<"${output}" || true) -eq 1 ]]
+          [[ $(grep -Fxc "Po0 单文件版本=${RELEASE_VERSION}" <<<"${output}" || true) -eq 1 ]]
+          [[ $(grep -Fxc 'Po0 单文件版本类型=公开版' <<<"${output}" || true) -eq 1 ]]
+          cmp -s <(/bin/bash po0-unlock.sh __extract-role overseas-exit) overseas-exit-role.sh
+          cmp -s <(/bin/bash po0-unlock.sh __extract-role cn-entry) cn-entry-role.sh
+
+      - name: Rebuild bundle deterministically
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+          work=$(mktemp -d)
+          cleanup() { rm -rf -- "${work}"; }
+          trap cleanup EXIT
+          mkdir -p "${work}/project/tools" "${work}/project/src/cn-entry-role"
+          cp -- setup.sh overseas-exit-role.sh cn-entry-role.sh "${work}/project/"
+          cp -- tools/build-cn-entry-role.sh tools/build-single-file.sh "${work}/project/tools/"
+          cp -- src/cn-entry-role/*.sh.inc "${work}/project/src/cn-entry-role/"
+          /bin/bash "${work}/project/tools/build-single-file.sh" "${RELEASE_VERSION}" >/dev/null
+          cmp -s "${work}/project/po0-unlock.sh" po0-unlock.sh || {
+            printf '%s\n' '提交的 po0-unlock.sh 不是当前源码的确定性构建结果。' >&2
+            exit 1
+          }
+
+      - name: Check acceptance test registration and CI coverage
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          /bin/bash -n tests/check-acceptance-registration.sh
+          /bin/bash tests/check-acceptance-registration.sh
+
+      - name: Run updater acceptance tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ -f tests/update-acceptance.sh ]] || {
+            printf '%s\n' '缺少 tests/update-acceptance.sh。' >&2
+            exit 1
+          }
+          /bin/bash -n tests/update-acceptance.sh
+          /bin/bash tests/update-acceptance.sh
+
+      - name: Run build backup retention tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ -f tests/build-backup-acceptance.sh ]]
+          /bin/bash -n tests/build-backup-acceptance.sh
+          /bin/bash tests/build-backup-acceptance.sh
+
+      - name: Run installed entry acceptance tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ -f tests/install-entry-acceptance.sh ]]
+          /bin/bash -n tests/install-entry-acceptance.sh
+          /bin/bash tests/install-entry-acceptance.sh
+
+      - name: Run config migration acceptance tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ -f tests/config-migration-acceptance.sh ]]
+          /bin/bash -n tests/config-migration-acceptance.sh
+          /bin/bash tests/config-migration-acceptance.sh
+
+      - name: Run CF Probe latency compatibility tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ -f tests/cf-probe-acceptance.sh ]]
+          /bin/bash -n tests/cf-probe-acceptance.sh
+          /bin/bash tests/cf-probe-acceptance.sh
+
+      - name: Run Komari latency compatibility tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ -f tests/komari-acceptance.sh ]]
+          /bin/bash -n tests/komari-acceptance.sh
+          /bin/bash tests/komari-acceptance.sh
+
+      - name: Run health check and safe repair tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ -f tests/health-acceptance.sh ]]
+          /bin/bash -n tests/health-acceptance.sh
+          /bin/bash tests/health-acceptance.sh
+
+      - name: Run sanitized diagnostic report tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ -f tests/diagnostic-acceptance.sh ]]
+          /bin/bash -n tests/diagnostic-acceptance.sh
+          /bin/bash tests/diagnostic-acceptance.sh
+
+      - name: Prepare release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          cp -- po0-unlock.sh po0-unlock-v2.sh
+          sha256sum po0-unlock-v2.sh >po0-unlock-v2.sh.sha256
+
+      - name: Preserve verified release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: po0-release-assets
+          path: |
+            po0-unlock-v2.sh
+            po0-unlock-v2.sh.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  debian:
+    name: Debian ${{ matrix.version }} (${{ matrix.codename }}) compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: "12"
+            codename: bookworm
+          - version: "13"
+            codename: trixie
+    container:
+      image: debian:${{ matrix.version }}-slim
+    steps:
+      - name: Install Debian ${{ matrix.version }} test dependencies
+        shell: sh
+        run: |
+          set -eu
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bash ca-certificates coreutils curl diffutils findutils git grep iputils-ping jq mawk openssh-client sed util-linux
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Confirm Debian ${{ matrix.codename }} toolchain
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /etc/os-release
+          [[ ${ID} == debian ]]
+          [[ ${VERSION_ID} == "${{ matrix.version }}" ]]
+          [[ ${VERSION_CODENAME} == "${{ matrix.codename }}" ]]
+          /bin/bash --version | sed -n '1p'
+          mawk -W version
+          sha256sum --version | sed -n '1p'
+
+      - name: Check shell syntax on Debian ${{ matrix.version }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for file in setup.sh overseas-exit-role.sh cn-entry-role.sh tools/build-cn-entry-role.sh tools/build-single-file.sh po0-unlock.sh tests/check-acceptance-registration.sh tests/*-acceptance.sh; do
+            [[ -f ${file} ]] || {
+              printf '缺少 Debian %s 验收文件：%s\n' '${{ matrix.version }}' "${file}" >&2
+              exit 1
+            }
+            /bin/bash -n "${file}"
+          done
+          /bin/bash tools/build-cn-entry-role.sh --check
+          /bin/bash tests/check-acceptance-registration.sh
+
+      - name: Run bundle self-test on Debian ${{ matrix.version }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          output=$(timeout 30 /bin/bash po0-unlock.sh self-test)
+          [[ $(grep -Fxc 'SELF_TEST=PASS' <<<"${output}" || true) -eq 1 ]]
+          mapfile -t versions < <(sed -n 's/^Po0 单文件版本=//p' <<<"${output}")
+          [[ ${#versions[@]} -eq 1 ]]
+          [[ ${versions[0]} =~ ^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$ ]]
+          [[ $(grep -Fxc 'Po0 单文件版本类型=公开版' <<<"${output}" || true) -eq 1 ]]
+
+      - name: Run updater acceptance tests on Debian ${{ matrix.version }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          timeout 300 /bin/bash tests/update-acceptance.sh
+
+      - name: Run build backup retention tests on Debian ${{ matrix.version }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          timeout 120 /bin/bash tests/build-backup-acceptance.sh
+
+      - name: Run installed entry acceptance tests on Debian ${{ matrix.version }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          timeout 120 /bin/bash tests/install-entry-acceptance.sh
+
+      - name: Run config migration acceptance tests on Debian ${{ matrix.version }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          timeout 120 /bin/bash tests/config-migration-acceptance.sh
+
+      - name: Run CF Probe latency compatibility tests on Debian ${{ matrix.version }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          timeout 120 /bin/bash tests/cf-probe-acceptance.sh
+
+      - name: Run Komari latency compatibility tests on Debian ${{ matrix.version }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          timeout 120 /bin/bash tests/komari-acceptance.sh
+
+      - name: Run health check and safe repair tests on Debian ${{ matrix.version }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          timeout 120 /bin/bash tests/health-acceptance.sh
+
+      - name: Run sanitized diagnostic report tests on Debian ${{ matrix.version }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          timeout 120 /bin/bash tests/diagnostic-acceptance.sh
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - verify
+      - debian
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: po0-release-assets
+          path: dist
+
+      - name: Recheck release checksum
+        shell: bash
+        working-directory: dist
+        run: |
+          sha256sum -c po0-unlock-v2.sh.sha256
+
+      - name: Publish verified release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          tag=${GITHUB_REF_NAME}
+          assets=(
+            dist/po0-unlock-v2.sh
+            dist/po0-unlock-v2.sh.sha256
+          )
+          release_created=no
+          release_published=no
+
+          cleanup_draft() {
+            local rc=$?
+            trap - EXIT
+            if [[ ${release_created} == yes && ${release_published} != yes ]]; then
+              gh release delete "${tag}" --yes --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 || true
+            fi
+            exit "${rc}"
+          }
+          trap cleanup_draft EXIT
+
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            printf 'Release %s 已存在；拒绝覆盖或复用同一版本。\n' "${tag}" >&2
+            exit 1
+          fi
+
+          gh release create "${tag}" \
+            --verify-tag --draft --generate-notes --title "Po0 解锁助手 ${tag}" \
+            --repo "${GITHUB_REPOSITORY}"
+          release_created=yes
+
+          gh release upload "${tag}" "${assets[@]}" --repo "${GITHUB_REPOSITORY}"
+
+          release_json=
+          verified=no
+          for attempt in 1 2 3 4 5; do
+            release_json=$(gh release view "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json tagName,isDraft,isPrerelease,assets)
+
+            if RELEASE_JSON=${release_json} python3 - "${tag}" "${assets[@]}" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+
+          tag = sys.argv[1]
+          paths = [pathlib.Path(value) for value in sys.argv[2:]]
+          release = json.loads(os.environ["RELEASE_JSON"])
+
+          if release.get("tagName") != tag or release.get("isDraft") is not True:
+              raise SystemExit(1)
+          if release.get("isPrerelease") is not False:
+              raise SystemExit(1)
+
+          remote_assets = release.get("assets") or []
+          if len(remote_assets) != len(paths):
+              raise SystemExit(1)
+
+          remote_digests = {}
+          for asset in remote_assets:
+              name = asset.get("name")
+              digest = asset.get("digest")
+              if not isinstance(name, str) or name in remote_digests:
+                  raise SystemExit(1)
+              remote_digests[name] = digest
+
+          expected_names = {path.name for path in paths}
+          if set(remote_digests) != expected_names:
+              raise SystemExit(1)
+
+          for path in paths:
+              local_digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+              if remote_digests[path.name] != local_digest:
+                  raise SystemExit(1)
+          PY
+            then
+              verified=yes
+              break
+            fi
+
+            [[ ${attempt} != 5 ]] || break
+            sleep 2
+          done
+
+          [[ ${verified} == yes ]] || {
+            printf '%s\n' '草稿 Release 的附件数量、名称或 GitHub digest 与本地 SHA-256 不一致；不会发布。' >&2
+            exit 1
+          }
+
+          gh release edit "${tag}" --draft=false --latest --repo "${GITHUB_REPOSITORY}"
+          release_published=yes
+          trap - EXIT

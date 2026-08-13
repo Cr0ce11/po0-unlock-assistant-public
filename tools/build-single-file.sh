@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+TOOLS_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SOURCE_DIR=${TOOLS_DIR%/tools}
+SETUP_SOURCE=${SOURCE_DIR}/setup.sh
+EXIT_SOURCE=${SOURCE_DIR}/overseas-exit-role.sh
+CN_ENTRY_SOURCE=${SOURCE_DIR}/cn-entry-role.sh
+CN_ENTRY_BUILDER=${TOOLS_DIR}/build-cn-entry-role.sh
+OUTPUT=${SOURCE_DIR}/po0-unlock.sh
+BACKUP_DIR=${SOURCE_DIR}-backups/bundle-history
+BACKUP_RETENTION_LIMIT=10
+SCRIPT_VERSION=${1:-2.5.17}
+
+[[ ${SCRIPT_VERSION} =~ ^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$ ]] \
+    || { printf '%s\n' '版本号必须使用 x.y.z 格式。' >&2; exit 2; }
+
+[[ -r ${CN_ENTRY_BUILDER} ]] || { printf '缺少国内入口模块构建器：%s\n' "${CN_ENTRY_BUILDER}" >&2; exit 1; }
+/bin/bash "${CN_ENTRY_BUILDER}" --build >/dev/null
+
+for source_file in "${SETUP_SOURCE}" "${EXIT_SOURCE}" "${CN_ENTRY_SOURCE}"; do
+    [[ -r ${source_file} ]] || { printf '缺少源文件：%s\n' "${source_file}" >&2; exit 1; }
+    /bin/bash -n "${source_file}"
+done
+
+EXIT_DELIMITER=__PO0_OVERSEAS_EXIT_ROLE_783424F8_PAYLOAD__
+CN_ENTRY_DELIMITER=__PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
+grep -Fq -- "${EXIT_DELIMITER}" "${EXIT_SOURCE}" \
+    && { printf '%s\n' '国外出口组件与内嵌结束标记冲突。' >&2; exit 1; }
+grep -Fq -- "${CN_ENTRY_DELIMITER}" "${CN_ENTRY_SOURCE}" \
+    && { printf '%s\n' '国内入口组件与内嵌结束标记冲突。' >&2; exit 1; }
+
+EXIT_HASH=$(sha256sum "${EXIT_SOURCE}" | awk '{print $1}')
+CN_ENTRY_HASH=$(sha256sum "${CN_ENTRY_SOURCE}" | awk '{print $1}')
+[[ ${EXIT_HASH} =~ ^[0-9a-f]{64}$ && ${CN_ENTRY_HASH} =~ ^[0-9a-f]{64}$ ]] \
+    || { printf '%s\n' '无法计算组件 SHA-256。' >&2; exit 1; }
+
+candidate=$(mktemp "${OUTPUT}.tmp.XXXXXX")
+cleanup_build() {
+    local rc=$?
+    trap - EXIT INT TERM HUP
+    rm -f -- "${candidate:-}"
+    exit "${rc}"
+}
+trap cleanup_build EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+emit_runtime_support() {
+    cat <<'RUNTIME_HEAD'
+
+cleanup_runtime() {
+    local rc=${1:-0} directory=${RUNTIME_DIR:-}
+    trap - EXIT INT TERM HUP
+    set +e
+    [[ -n ${EXIT_ROLE:-} ]] && rm -f -- "${EXIT_ROLE}" "${EXIT_ROLE}.new"
+    [[ -n ${CN_ENTRY_ROLE_LOCAL:-} ]] && rm -f -- "${CN_ENTRY_ROLE_LOCAL}" "${CN_ENTRY_ROLE_LOCAL}.new"
+    if [[ -n ${directory} ]]; then
+        case "${directory}" in
+            /tmp/po0-unlock.*)
+                rm -f -- "${directory}/po0-cn-entry-helper.self-test.sh"
+                rmdir -- "${directory}" 2>/dev/null || true
+                ;;
+            *) printf '警告：拒绝清理异常临时目录：%s\n' "${directory}" >&2 ;;
+        esac
+    fi
+    RUNTIME_DIR=
+    EXIT_ROLE=
+    CN_ENTRY_ROLE_LOCAL=
+    return "${rc}"
+}
+
+runtime_exit_cleanup() {
+    local rc=$?
+    cleanup_runtime "${rc}" || true
+    exit "${rc}"
+}
+
+materialize_roles() {
+    local exit_new cn_entry_new exit_actual cn_entry_actual
+    if [[ -n ${RUNTIME_DIR:-} && -r ${EXIT_ROLE:-} && -r ${CN_ENTRY_ROLE_LOCAL:-} ]]; then
+        return 0
+    fi
+    command -v sha256sum >/dev/null || die '系统缺少 sha256sum，无法校验内置组件。'
+    RUNTIME_DIR=$(mktemp -d /tmp/po0-unlock.XXXXXXXX) \
+        || die '无法创建内置组件临时目录。'
+    chmod 0700 "${RUNTIME_DIR}"
+    EXIT_ROLE=${RUNTIME_DIR}/overseas-exit-role.sh
+    CN_ENTRY_ROLE_LOCAL=${RUNTIME_DIR}/cn-entry-role.sh
+    exit_new=${EXIT_ROLE}.new
+    cn_entry_new=${CN_ENTRY_ROLE_LOCAL}.new
+    trap runtime_exit_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+
+    cat >"${exit_new}" <<'__PO0_OVERSEAS_EXIT_ROLE_783424F8_PAYLOAD__'
+RUNTIME_HEAD
+    sed -n '1,$p' "${EXIT_SOURCE}"
+    cat <<'RUNTIME_MIDDLE'
+__PO0_OVERSEAS_EXIT_ROLE_783424F8_PAYLOAD__
+    cat >"${cn_entry_new}" <<'__PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__'
+RUNTIME_MIDDLE
+    sed -n '1,$p' "${CN_ENTRY_SOURCE}"
+    cat <<RUNTIME_TAIL
+__PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
+    chmod 0600 "\${exit_new}" "\${cn_entry_new}"
+    exit_actual=\$(sha256sum "\${exit_new}" | awk '{print \$1}')
+    cn_entry_actual=\$(sha256sum "\${cn_entry_new}" | awk '{print \$1}')
+    [[ \${exit_actual} == '${EXIT_HASH}' ]] || die '国外出口内置组件哈希校验失败。'
+    [[ \${cn_entry_actual} == '${CN_ENTRY_HASH}' ]] || die '国内入口内置组件哈希校验失败。'
+    /bin/bash -n "\${exit_new}" || die '国外出口内置组件语法检查失败。'
+    /bin/bash -n "\${cn_entry_new}" || die '国内入口内置组件语法检查失败。'
+    mv "\${exit_new}" "\${EXIT_ROLE}"
+    mv "\${cn_entry_new}" "\${CN_ENTRY_ROLE_LOCAL}"
+    chmod 0700 "\${EXIT_ROLE}" "\${CN_ENTRY_ROLE_LOCAL}"
+}
+
+extract_embedded_role() {
+    materialize_roles
+    case "\${1:-}" in
+        overseas-exit) sed -n '1,\$p' "\${EXIT_ROLE}" ;;
+        cn-entry) sed -n '1,\$p' "\${CN_ENTRY_ROLE_LOCAL}" ;;
+        *) die '用法：__extract-role overseas-exit|cn-entry' ;;
+    esac
+}
+
+bundle_self_test() {
+    local helper_test helper_shebang
+    /bin/bash -n "\${SCRIPT_PATH}" || die '单文件主控语法检查失败。'
+    materialize_roles
+    helper_test="\${RUNTIME_DIR}/po0-cn-entry-helper.self-test.sh"
+    awk 'index(\$0, "cat >\\"\${tmp}\\" <<\\047EOF\\047") {f=1; next} f && \$0=="EOF" {exit} f {print}' \
+        "\${CN_ENTRY_ROLE_LOCAL}" >"\${helper_test}"
+    [[ -s \${helper_test} ]] || die '未能从国内入口组件提取 po0-cn-entry helper。'
+    IFS= read -r helper_shebang <"\${helper_test}"
+    [[ \${helper_shebang} == '#!/usr/bin/env bash' ]] \
+        || die '国内入口生成的 po0-cn-entry helper 缺少有效 shebang。'
+    /bin/bash -n "\${helper_test}" \
+        || die '国内入口生成的 po0-cn-entry helper 语法检查失败。'
+    rm -f -- "\${helper_test}"
+    printf 'Po0 单文件版本=%s\\n' '${SCRIPT_VERSION}'
+    printf 'Po0 单文件版本类型=%s\\n' "\${SCRIPT_EDITION_LABEL}"
+    printf 'overseas-exit-role SHA-256=%s\\n' '${EXIT_HASH}'
+    printf 'cn-entry-role SHA-256=%s\\n' '${CN_ENTRY_HASH}'
+    printf '%s\\n' \
+        "scan-agents -> cn-entry:\${CN_ENTRY_CMD_SCAN}" \
+        "rollback[1] -> cn-entry:\${CN_ENTRY_CMD_ROLLBACK_SERVICES}" \
+        "rollback[2] -> overseas-exit:\${EXIT_CMD_ROLLBACK}" \
+        "rollback[3] -> cn-entry:\${CN_ENTRY_CMD_ROLLBACK_FINALIZE}" \
+        "status -> cn-entry:\${CN_ENTRY_CMD_STATUS}" \
+        "status -> overseas-exit:\${EXIT_CMD_STATUS}" \
+        "health -> cn-entry:\${CN_ENTRY_CMD_HEALTH}" \
+        "health -> overseas-exit:\${EXIT_CMD_HEALTH}" \
+        "repair -> overseas-exit:\${EXIT_CMD_REPAIR}"
+    printf '%s\\n' 'SELF_TEST=PASS'
+}
+RUNTIME_TAIL
+}
+
+in_preflight=no
+in_health_check=no
+in_diagnostic_report=no
+source_ref='${SCRIPT_DIR}/cn-entry-role.sh'
+bundle_ref='${CN_ENTRY_ROLE_LOCAL}'
+while IFS= read -r line || [[ -n ${line} ]]; do
+    case "${line}" in
+        '# 本脚本必须在国外出口 VPS 上以 root 运行。')
+            printf '%s\n' "${line}"
+            ;;
+        'SCRIPT_VERSION=${SCRIPT_VERSION:-dev}')
+            printf 'SCRIPT_VERSION=%q\n' "${SCRIPT_VERSION}"
+            ;;
+        'SCRIPT_EDITION_LABEL=公开版')
+            printf '%s\n' 'SCRIPT_EDITION_LABEL=公开版'
+            ;;
+        'EXIT_ROLE=${SCRIPT_DIR}/overseas-exit-role.sh')
+            printf '%s\n' 'RUNTIME_DIR=' 'EXIT_ROLE='
+            ;;
+        'CN_ENTRY_ROLE_LOCAL=${SCRIPT_DIR}/cn-entry-role.sh')
+            printf '%s\n' 'CN_ENTRY_ROLE_LOCAL='
+            ;;
+        'require_root() '*)
+            printf '%s\n' "${line}"
+            emit_runtime_support
+            ;;
+        'preflight() {')
+            in_preflight=yes
+            printf '%s\n' "${line}"
+            ;;
+        'health_check() (')
+            in_health_check=yes
+            printf '%s\n' "${line}"
+            ;;
+        'diagnostic_report() (')
+            in_diagnostic_report=yes
+            printf '%s\n' "${line}"
+            ;;
+        '    require_root')
+            printf '%s\n' "${line}"
+            if [[ ${in_preflight} == yes ]]; then
+                printf '%s\n' '    materialize_roles'
+                in_preflight=no
+            elif [[ ${in_health_check} == yes ]]; then
+                printf '%s\n' '    materialize_roles'
+                in_health_check=no
+            elif [[ ${in_diagnostic_report} == yes ]]; then
+                printf '%s\n' '    materialize_roles'
+                in_diagnostic_report=no
+            fi
+            ;;
+        '  ./${PROGRAM_NAME} authorize')
+            printf '%s\n' "${line}"
+            printf '%s\n' '  ./${PROGRAM_NAME} self-test'
+            ;;
+        '    help|-h|--help) usage ;;')
+            printf '%s\n' '    self-test) bundle_self_test ;;'
+            printf '%s\n' '    __extract-role) extract_embedded_role "${2:-}" ;;'
+            printf '%s\n' "${line}"
+            ;;
+        *)
+            line=${line//"${source_ref}"/"${bundle_ref}"}
+            printf '%s\n' "${line}"
+            ;;
+    esac
+done <"${SETUP_SOURCE}" >"${candidate}"
+
+chmod 0700 "${candidate}"
+/bin/bash -n "${candidate}"
+/bin/bash "${candidate}" self-test >/dev/null
+/bin/bash "${candidate}" __extract-role overseas-exit | cmp -s - "${EXIT_SOURCE}"
+/bin/bash "${candidate}" __extract-role cn-entry | cmp -s - "${CN_ENTRY_SOURCE}"
+
+if [[ -f ${OUTPUT} && ! -L ${OUTPUT} ]] && cmp -s "${candidate}" "${OUTPUT}"; then
+    rm -f -- "${candidate}"
+    candidate=
+    trap - EXIT INT TERM HUP
+    printf '%s\n' '单文件生成物未变化，未创建备份。'
+    printf '版本：%s\n' "${SCRIPT_VERSION}"
+    sha256sum "${OUTPUT}"
+    exit 0
+fi
+
+if [[ -f ${OUTPUT} ]]; then
+    install -d -m 0700 "${BACKUP_DIR}"
+    managed_rows=()
+    newest_sequence=0
+    shopt -s nullglob
+    for path in "${BACKUP_DIR}"/po0-unlock.managed.*; do
+        [[ -f ${path} && ! -L ${path} ]] \
+            || { printf '拒绝处理异常受管备份：%s\n' "${path}" >&2; exit 1; }
+        name=${path##*/}
+        sequence=${name#po0-unlock.managed.}
+        sequence=${sequence%%.*}
+        [[ ${sequence} =~ ^[0-9]{10,}$ ]] \
+            || { printf '受管备份序号无效：%s\n' "${path}" >&2; exit 1; }
+        managed_rows+=("${sequence}"$'\t'"${path}")
+        (( 10#${sequence} > newest_sequence )) \
+            && newest_sequence=$((10#${sequence}))
+    done
+    shopt -u nullglob
+
+    current_sequence=$(date -u +%s)
+    [[ ${current_sequence} =~ ^[0-9]{10,}$ ]] \
+        || { printf '%s\n' '无法生成受管备份序号。' >&2; exit 1; }
+    if (( current_sequence <= newest_sequence )); then
+        current_sequence=$((newest_sequence + 1))
+    fi
+    previous=$(mktemp \
+        "${BACKUP_DIR}/po0-unlock.managed.${current_sequence}.v${SCRIPT_VERSION}.previous.XXXXXXXX")
+    cp -p "${OUTPUT}" "${previous}"
+    printf '已备份上一单文件版本：%s\n' "${previous}"
+
+    managed_rows+=("${current_sequence}"$'\t'"${previous}")
+    remove_count=$((${#managed_rows[@]} - BACKUP_RETENTION_LIMIT))
+    if (( remove_count > 0 )); then
+        removed=0
+        while IFS=$'\t' read -r sequence path; do
+            (( removed < remove_count )) || break
+            [[ -f ${path} && ! -L ${path} ]] \
+                || { printf '拒绝删除异常受管备份：%s\n' "${path}" >&2; exit 1; }
+            rm -f -- "${path}"
+            removed=$((removed + 1))
+        done < <(printf '%s\n' "${managed_rows[@]}" | LC_ALL=C sort -n -k1,1)
+        (( removed == remove_count )) \
+            || { printf '%s\n' '受管备份保留数量收敛失败。' >&2; exit 1; }
+    fi
+fi
+mv "${candidate}" "${OUTPUT}"
+trap - EXIT INT TERM HUP
+
+printf '已生成：%s\n' "${OUTPUT}"
+printf '版本：%s\n' "${SCRIPT_VERSION}"
+sha256sum "${OUTPUT}"
