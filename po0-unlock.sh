@@ -6984,6 +6984,56 @@ write_last_script_backup() {
     fi
 }
 
+# 改写"上一版"指针前先快照，供替换失败时原样还原。
+# 指针原本不存在时输出 absent；成功时输出快照文件路径。
+snapshot_last_script_backup() {
+    local snapshot
+    if [[ ! -e ${UPDATE_LAST_BACKUP} && ! -L ${UPDATE_LAST_BACKUP} ]]; then
+        printf '%s\n' absent
+        return 0
+    fi
+    [[ -f ${UPDATE_LAST_BACKUP} && ! -L ${UPDATE_LAST_BACKUP} \
+        && $(stat -c '%u' "${UPDATE_LAST_BACKUP}") == 0 \
+        && $(stat -c '%a' "${UPDATE_LAST_BACKUP}") == 600 \
+        && $(stat -c '%h' "${UPDATE_LAST_BACKUP}") == 1 ]] \
+        || return 1
+    snapshot=$(mktemp "${UPDATE_STATE_ROOT}/.last-backup-before.XXXXXXXX") || return 1
+    if ! install -o root -g root -m 0600 "${UPDATE_LAST_BACKUP}" "${snapshot}"; then
+        rm -f -- "${snapshot}"
+        return 1
+    fi
+    printf '%s\n' "${snapshot}"
+}
+
+# 把"上一版"指针还原成快照时的内容；快照值为 absent 时删除指针。
+restore_last_script_backup_pointer() {
+    local snapshot=${1:-} pointer_replacement=
+    [[ -n ${snapshot} ]] || return 1
+    if [[ ${snapshot} == absent ]]; then
+        [[ ! -L ${UPDATE_LAST_BACKUP} ]] || return 1
+        rm -f -- "${UPDATE_LAST_BACKUP}" || return 1
+        return 0
+    fi
+    [[ -f ${snapshot} && ! -L ${snapshot} ]] || return 1
+    [[ ! -L ${UPDATE_LAST_BACKUP} ]] || return 1
+    pointer_replacement=$(mktemp "${UPDATE_STATE_ROOT}/.last-backup-restore.XXXXXXXX") || return 1
+    if install -o root -g root -m 0600 "${snapshot}" "${pointer_replacement}" \
+        && mv -fT -- "${pointer_replacement}" "${UPDATE_LAST_BACKUP}"; then
+        return 0
+    fi
+    rm -f -- "${pointer_replacement}"
+    return 1
+}
+
+# 指针已还原后，本次新建的备份就成了没人引用的孤儿，删掉以免占用保留额度。
+discard_orphan_script_backup() {
+    local backup=${1:-}
+    case "${backup}" in
+        "${UPDATE_BACKUP_DIR}"/po0-unlock.v*.backup.*) rm -f -- "${backup}" || return 1 ;;
+        *) return 1 ;;
+    esac
+}
+
 prune_script_backups() (
     local protected=$1 path name owner links mtime oldest_mtime oldest_path= oldest_index= index
     local remaining=0 allowed_nonprotected=$((UPDATE_BACKUP_KEEP - 1))
@@ -7046,7 +7096,7 @@ perform_script_update() (
     set +x
     ulimit -c 0 2>/dev/null || true
     local release_json metadata tag latest_version asset_url expected_hash current_hash candidate= backup= installed_hash
-    local answer rc
+    local answer rc pointer_snapshot= restore_pointer=no keep_orphan_backup=no
     UPDATE_TRANSACTION_CANDIDATE=
     cleanup_update_transaction() {
         rc=$?
@@ -7055,6 +7105,21 @@ perform_script_update() (
             "${SCRIPT_PATH}.update."*) rm -f -- "${UPDATE_TRANSACTION_CANDIDATE}" ;;
         esac
         UPDATE_TRANSACTION_CANDIDATE=
+        # 替换没有真正完成时，把"上一版"指针还原成本次改写前的内容，
+        # 否则本次新建的备份会顶掉真正的恢复点，"恢复上一版助手"将永远回答无需撤销。
+        if [[ ${restore_pointer:-no} == yes ]]; then
+            if restore_last_script_backup_pointer "${pointer_snapshot}"; then
+                if [[ ${keep_orphan_backup:-no} != yes && -n ${backup:-} ]]; then
+                    discard_orphan_script_backup "${backup}" \
+                        || printf '%s\n' '提醒：更新失败后未能清理本次新建的脚本备份。' >&2
+                fi
+            else
+                printf '%s\n' '警告：更新失败后未能还原原脚本备份指针；请人工核对 /var/lib/po0-unlock/updater 下的备份。' >&2
+            fi
+        fi
+        case "${pointer_snapshot:-}" in
+            "${UPDATE_STATE_ROOT}/.last-backup-before."*) rm -f -- "${pointer_snapshot}" ;;
+        esac
         exit "${rc}"
     }
     trap cleanup_update_transaction EXIT
@@ -7121,13 +7186,17 @@ perform_script_update() (
         || die '无法备份当前脚本，已停止更新。'
     [[ $(sha256sum "${backup}" | awk '{print $1}') == "${current_hash}" ]] \
         || die '当前脚本备份哈希异常，已停止更新。'
+    pointer_snapshot=$(snapshot_last_script_backup) \
+        || die '无法保存原脚本备份指针，已停止更新；当前脚本尚未替换。'
+    restore_pointer=yes
     write_last_script_backup "${backup}" \
         || die '无法登记更新前脚本，已停止更新；当前脚本尚未替换。'
     chmod 0700 "${candidate}" || die '无法设置候选脚本权限。'
     chown root:root "${candidate}" || die '无法设置候选脚本属主。'
     [[ $(sha256sum "${candidate}" | awk '{print $1}') == "${expected_hash}" ]] \
         || die '安装前候选脚本哈希发生变化，已停止更新。'
-    mv -fT -- "${candidate}" "${SCRIPT_PATH}" || die '原子替换失败；旧脚本备份仍保留。'
+    mv -fT -- "${candidate}" "${SCRIPT_PATH}" \
+        || die '原子替换失败；当前脚本未改动，原有的恢复上一版入口仍然可用。'
     candidate=
     UPDATE_TRANSACTION_CANDIDATE=
     installed_hash=$(sha256sum "${SCRIPT_PATH}" | awk '{print $1}')
@@ -7141,8 +7210,11 @@ perform_script_update() (
             UPDATE_TRANSACTION_CANDIDATE=
             die '更新后哈希校验失败，已经恢复旧脚本。'
         fi
+        # 目标脚本既不是新版也没能恢复成旧版，用户要靠这个备份人工恢复，不能删。
+        keep_orphan_backup=yes
         die '更新后哈希校验失败，自动恢复也未能完成；请使用保留的备份人工恢复。'
     fi
+    restore_pointer=no
     prune_script_backups "${backup}" \
         || printf '%s\n' '提醒：脚本已经更新成功，但旧备份未能安全整理；现有备份均已保留。' >&2
     printf '\n脚本已安全更新到 v%s；备份已保留。\n' "${latest_version}"
@@ -7151,10 +7223,25 @@ perform_script_update() (
 
 perform_script_restore() (
     local backup_name backup_path backup_version backup_edition backup_hash recorded_hash extra current_hash current_backup= replacement= answer rc
+    local pointer_snapshot= restore_pointer=no
     cleanup_restore_transaction() {
         rc=$?
         trap - EXIT INT TERM HUP
         case "${replacement:-}" in "${SCRIPT_PATH}.restore."*) rm -f -- "${replacement}" ;; esac
+        # 撤销没有真正完成时还原"上一版"指针，否则这台机器再也无法通过助手退回旧版。
+        if [[ ${restore_pointer:-no} == yes ]]; then
+            if restore_last_script_backup_pointer "${pointer_snapshot}"; then
+                if [[ -n ${current_backup:-} ]]; then
+                    discard_orphan_script_backup "${current_backup}" \
+                        || printf '%s\n' '提醒：撤销失败后未能清理本次新建的脚本备份。' >&2
+                fi
+            else
+                printf '%s\n' '警告：撤销失败后未能还原原脚本备份指针；请人工核对 /var/lib/po0-unlock/updater 下的备份。' >&2
+            fi
+        fi
+        case "${pointer_snapshot:-}" in
+            "${UPDATE_STATE_ROOT}/.last-backup-before."*) rm -f -- "${pointer_snapshot}" ;;
+        esac
         exit "${rc}"
     }
     trap cleanup_restore_transaction EXIT
@@ -7210,11 +7297,15 @@ perform_script_restore() (
     [[ $(sha256sum "${current_backup}" | awk '{print $1}') == "${current_hash}" ]] \
         || die '当前脚本备份哈希异常，已停止撤销。'
     prepare_legacy_config_for_version "${backup_version}"
+    pointer_snapshot=$(snapshot_last_script_backup) \
+        || die '无法保存原脚本备份指针，已停止撤销；当前脚本尚未替换。'
+    restore_pointer=yes
     write_last_script_backup "${current_backup}" \
         || die '无法登记撤销前的脚本，已停止撤销；当前脚本尚未替换。'
     if [[ ${SCRIPT_PATH} == "${OFFICIAL_SCRIPT_PATH}" ]] \
         && version_gt "${CANONICAL_ENTRY_VERSION}" "${backup_version}"; then
             restore_legacy_manager_entry "${backup_path}" "${backup_hash}"
+            restore_pointer=no
             finalize_legacy_config_for_version "${backup_version}" \
                 || printf '%s\n' '提醒：助手已经恢复成功，旧版配置可正常使用，但新位置的相同配置未能安全清理。' >&2
             prune_script_backups "${current_backup}" \
@@ -7227,8 +7318,10 @@ perform_script_restore() (
         || die '无法写入撤销更新候选。'
     [[ $(sha256sum "${replacement}" | awk '{print $1}') == "${backup_hash}" ]] \
         || die '撤销更新候选哈希异常。'
-    mv -fT -- "${replacement}" "${SCRIPT_PATH}" || die '撤销脚本更新失败。'
+    mv -fT -- "${replacement}" "${SCRIPT_PATH}" \
+        || die '撤销脚本更新失败；当前脚本未改动，原有的恢复上一版入口仍然可用。'
     replacement=
+    restore_pointer=no
     finalize_legacy_config_for_version "${backup_version}" \
         || printf '%s\n' '提醒：助手已经恢复成功，旧版配置可正常使用，但新位置的相同配置未能安全清理。' >&2
     prune_script_backups "${current_backup}" \
