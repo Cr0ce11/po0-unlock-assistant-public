@@ -804,7 +804,7 @@ remove_managed_public_key_file() {
 }
 
 rollback() {
-    local state installed_before bin_installed_before active_before enabled_before
+    local state installed_before bin_installed_before active_before enabled_before closed_marker
     require_root
     state=$(active_state)
     installed_before=$(<"${state}/tinyproxy-installed-before")
@@ -829,7 +829,13 @@ rollback() {
     fi
     if [[ ${bin_installed_before} == no ]]; then apt-get purge -y tinyproxy-bin; fi
     date -u +%Y-%m-%dT%H:%M:%SZ >"${state}/rolled-back-at"
-    mv "${ACTIVE_FILE}" "${state}/ACTIVE.closed"
+    # 与国内入口的同一步骤对齐：拒绝覆盖已有封存记录，失败必须中止，
+    # 否则重跑回滚会静默盖掉上一份记录，或在封存失败后仍然报告「已回滚」。
+    closed_marker=${state}/ACTIVE.closed
+    [[ ! -e ${closed_marker} && ! -L ${closed_marker} ]] \
+        || die '历史状态中已存在 ACTIVE.closed，拒绝覆盖。'
+    mv -- "${ACTIVE_FILE}" "${closed_marker}" \
+        || die '最终封存 ACTIVE 状态失败；隧道与密钥已清理，可安全重试完整回滚。'
     log "国外出口已回滚，历史状态保留在：${state}"
 }
 

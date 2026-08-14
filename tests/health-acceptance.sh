@@ -415,6 +415,63 @@ CASES
 # 被插入 StrictHostKeyChecking=no 的隧道仍会被判为「属于本助手」并被 enable --now 拉起。
 # 两端 health() 的返回码是「一键健康检查」判定总体结果的唯一依据：0 正常、2 提醒、1 异常。
 # 此前只跑过全绿路径，把「提醒」误判成「正常」这类改动不会被任何用例发现。
+# 国外出口封存 ACTIVE 此前是裸 mv：没有 --、不查目标是否已存在、失败也不中止。
+# 回滚重跑会静默盖掉上一份封存记录；mv 失败还会带着已清理的隧道继续报告「已回滚」。
+test_overseas_rollback_seals_active_safely() (
+    local case_dir fixture_state rc out
+    case_dir=$(mktemp -d "${TMPDIR:-/tmp}/po0-seal-active.XXXXXXXX")
+    trap 'rm -rf -- "${case_dir}"' EXIT
+    fixture_state=${case_dir}/20260805T010203Z
+    mkdir -p -- "${fixture_state}"
+    STATE_ROOT=${case_dir}
+    ACTIVE_FILE=${case_dir}/ACTIVE
+    TUNNEL_UNIT=${case_dir}/tunnel.service
+    PROXY_UNIT=${case_dir}/proxy.service
+    PROXY_CONF=${case_dir}/proxy.conf
+    KEY_FILE=${case_dir}/key
+    KNOWN_HOSTS=${case_dir}/known-hosts
+    printf '%s\n' no >"${fixture_state}/tinyproxy-installed-before"
+    printf '%s\n' no >"${fixture_state}/tinyproxy-bin-installed-before"
+    printf '%s\n' no >"${fixture_state}/tinyproxy-active-before"
+    printf '%s\n' no >"${fixture_state}/tinyproxy-enabled-before"
+    printf '%s\n' "${fixture_state}" >"${ACTIVE_FILE}"
+
+    eval "$(sed -n '/^rollback() {/,/^}/p' "${EXIT_SOURCE}")"
+    require_root() { :; }
+    active_state() { printf '%s\n' "${fixture_state}"; }
+    remove_managed_file() { :; }
+    remove_managed_public_key_file() { :; }
+    systemctl() { :; }
+    apt-get() { :; }
+    log() { printf '%s\n' "$*"; }
+    die() { printf '%s\n' "$*" >&2; exit 1; }
+
+    rc=0
+    out=$( (rollback) 2>&1 ) || rc=$?
+    [[ ${rc} -eq 0 ]] || { fail "正常回滚失败：${out}"; return 1; }
+    [[ -f ${fixture_state}/ACTIVE.closed ]] \
+        || { fail '回滚没有封存 ACTIVE 记录'; return 1; }
+    [[ ! -e ${ACTIVE_FILE} ]] || { fail '回滚后 ACTIVE 仍然存在'; return 1; }
+
+    # 重跑回滚：已有封存记录时必须拒绝覆盖。
+    printf '%s\n' "${fixture_state}" >"${ACTIVE_FILE}"
+    printf '%s\n' 'first-seal' >"${fixture_state}/ACTIVE.closed"
+    rc=0
+    out=$( (rollback) 2>&1 ) || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '已有 ACTIVE.closed 时回滚没有拒绝覆盖'; return 1; }
+    assert_contains "${out}" '拒绝覆盖' '拒绝覆盖的原因不明确' || return 1
+    assert_eq 'first-seal' "$(<"${fixture_state}/ACTIVE.closed")" \
+        '上一份封存记录被覆盖' || return 1
+
+    # 封存失败必须中止，不能继续报告「已回滚」。
+    rm -f -- "${fixture_state}/ACTIVE.closed"
+    mv() { return 1; }
+    rc=0
+    out=$( (rollback) 2>&1 ) || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '封存失败时回滚没有中止'; return 1; }
+    assert_not_contains "${out}" '国外出口已回滚' '封存失败仍然报告已回滚' || return 1
+)
+
 test_health_exit_codes_are_runtime_covered() (
     local case_dir fixture_state systemd_root dropin_dir cn_health rc
     case_dir=$(mktemp -d "${TMPDIR:-/tmp}/po0-health-rc.XXXXXXXX")
@@ -1728,6 +1785,7 @@ main() {
     run_case '检查结果不依赖终端列宽并按职责分组' test_readable_layout_contract
     run_case '公网连接的检查、状态与修复使用通用措辞' test_public_connection_path_uses_generic_copy
     run_case '安全修复的用户确认闸门实跑验证' test_safe_repair_confirmation_at_runtime
+    run_case '国外出口回滚安全封存 ACTIVE 记录' test_overseas_rollback_seals_active_safely
     run_case '两端健康检查的返回码实跑覆盖' test_health_exit_codes_are_runtime_covered
     run_case '安全修复校验隧道单元的主机密钥参数' test_repair_verifies_tunnel_host_key_options
     run_case '自动修复严格限制在确认后的自有核心服务' test_safe_repair_boundary

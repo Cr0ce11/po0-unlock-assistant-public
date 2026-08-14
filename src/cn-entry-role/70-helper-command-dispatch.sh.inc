@@ -53,7 +53,10 @@ case "${1:-}" in
         command -v flock >/dev/null \
             || { echo '系统缺少 flock，无法安全恢复 cf-probe 测速目标。' >&2; exit 1; }
         exec 9>"${state}/service-proxy.lock"
-        flock -n 9 || exit 0
+        # 拿不到锁时不能静默当成功：守卫由 .path 单元触发，面板的新配置版本号
+        # 一旦被接受就不会再变，静默放弃会让安全测速目标长期不恢复。
+        flock -w "${CN_ENTRY_LOCK_WAIT_SECONDS}" 9 \
+            || { echo '等待服务配置锁超时，未恢复 cf-probe 测速目标。' >&2; exit 1; }
         confirm_helper_state_open "${state}" \
             || { echo '安装状态正在关闭或已经变化，拒绝恢复 cf-probe 测速目标。' >&2; exit 1; }
         [[ -f ${state}/managed-services ]] && grep -Fxq -- "${unit}" "${state}/managed-services" \
