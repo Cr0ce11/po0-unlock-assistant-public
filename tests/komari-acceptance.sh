@@ -499,7 +499,7 @@ EOF
         rc=$?
         set -e
 
-        assert_eq 0 "${rc}" "${scenario} 场景守卫没有保守退出" || return 1
+        [[ ${rc} -eq 0 ]] || { fail "${scenario} 守卫没有保守退出（rc=${rc}）｜输出：${out}"; return 1; }
         assert_not_contains "${output}" "${secret}" "${scenario} 场景输出泄漏身份令牌" || return 1
         if (( expected_curl_calls == 0 )); then
             [[ ! -e ${curl_log} ]] \
@@ -533,6 +533,187 @@ EOF
                     || { fail "${scenario} 场景错误创建了身份隔离备份"; return 1; }
                 ;;
         esac
+    done
+)
+
+# 启用失败时必须撤销本次创建的 Komari 身份守卫。此前只在产物里数字符串出现次数：
+# TX_KOMARI_IDENTITY_CREATED 共出现 6 次，删掉两处真正的赋值仍剩 4 次，断言照样通过。
+test_enable_rollback_removes_identity_guard() (
+    local case_dir log rc
+    case_dir=$(mktemp -d "${TEMP_BASE}/po0-identity-rollback.XXXXXXXX")
+    trap 'rm -rf -- "${case_dir}"' EXIT
+    log=${case_dir}/rollback.log
+    : >"${log}"
+
+    eval "$(sed -n '/^enable_transaction_cleanup() {/,/^}/p' "${CN_ENTRY_ROLE}")"
+    remove_komari_identity_guard() { printf 'REMOVE_IDENTITY %s %s\n' "$1" "$2" >>"${log}"; }
+    remove_cf_probe_go_guard_units() { printf 'REMOVE_GUARD_UNITS\n' >>"${log}"; }
+    rollback_cf_probe_go_latency_compat() { :; }
+    remove_cf_probe_latency_compat() { :; }
+    remove_cf_probe_direct_report_compat() { :; }
+    remove_managed_unit() { printf 'REMOVE_MANAGED\n' >>"${log}"; }
+    restart_and_verify_running() { :; }
+    systemctl() { :; }
+
+    TX_COMMITTED=no
+    TX_UNIT=komari-agent.service
+    TX_STATE=${case_dir}/state
+    TX_DROPIN_DIR=${case_dir}/dropin
+    TX_DROPIN_FILE=${TX_DROPIN_DIR}/90-po0-unlock-proxy.conf
+    TX_DROPIN_MAY_EXIST=no
+    TX_COMPAT_DIR=${case_dir}/compat
+    TX_COMPAT_CREATED=no
+    TX_COMPAT_CURL_CREATED=no
+    TX_CF_GUARD_CREATED=yes
+    TX_KOMARI_IDENTITY_CREATED=yes
+    TX_KOMARI_IDENTITY_DIR=${case_dir}/identity
+    TX_ORIGINAL_RUNNING=no
+    TX_LIST_MAY_CHANGE=yes
+    rc=0
+    ( enable_transaction_cleanup 1 ) >/dev/null 2>&1 || rc=$?
+
+    grep -Fq "REMOVE_IDENTITY ${case_dir}/identity komari-agent.service" "${log}" \
+        || { fail '启用失败没有撤销本次创建的 Komari 身份守卫'; return 1; }
+    grep -Fxq REMOVE_GUARD_UNITS "${log}" \
+        || { fail '启用失败没有撤销本次创建的 cf-probe 动态配置守卫'; return 1; }
+    grep -Fxq REMOVE_MANAGED "${log}" \
+        || { fail '启用失败没有回退托管清单'; return 1; }
+
+    # 未创建过身份守卫时不得误删他人文件。
+    : >"${log}"
+    TX_KOMARI_IDENTITY_CREATED=no
+    ( enable_transaction_cleanup 1 ) >/dev/null 2>&1 || true
+    ! grep -Fq REMOVE_IDENTITY "${log}" \
+        || { fail '未创建身份守卫时仍执行了删除'; return 1; }
+
+    # 事务已提交时一律不撤销。
+    : >"${log}"
+    TX_COMMITTED=yes
+    TX_KOMARI_IDENTITY_CREATED=yes
+    ( enable_transaction_cleanup 0 ) >/dev/null 2>&1 || true
+    [[ ! -s ${log} ]] || { fail '事务已提交仍执行了撤销动作'; return 1; }
+)
+
+# 身份守卫在既没有 jq 也没有 python3 时必须保守保留缓存身份，绝不隔离或删除。
+# CI 两个作业都装了 jq，这条分支此前从未被执行过，而它属于安全红线。
+test_identity_guard_parser_selection() (
+    local root fake real case_dir guard config identity logger_log bash_env
+    local tool scenario out rc before_hash
+    root=${WORK_ROOT}/identity-parser
+    install -d -m 0700 "${root}"
+    fake=${root}/fake
+    real=${root}/real
+    install -d -m 0700 "${fake}" "${real}"
+    # bash 必须在受控 PATH 里：桩脚本的 #!/usr/bin/env bash 需要按 PATH 找到它。
+    for tool in sed readlink mv cat date rm mkdir dirname mktemp bash; do
+        command -v "${tool}" >/dev/null 2>&1 \
+            || { fail "夹具缺少必需命令：${tool}"; return 1; }
+        ln -sf "$(command -v "${tool}")" "${real}/${tool}"
+    done
+    cat >"${fake}/chmod" <<'EOF'
+#!/usr/bin/env bash
+args=()
+for arg in "$@"; do [[ ${arg} == -- ]] || args[${#args[@]}]=${arg}; done
+/bin/chmod "${args[@]}"
+EOF
+    cat >"${fake}/install" <<'EOF'
+#!/usr/bin/env bash
+args=()
+while (( $# > 0 )); do
+    case "$1" in
+        -o|-g) shift 2 ;;
+        --) shift ;;
+        *) args[${#args[@]}]=$1; shift ;;
+    esac
+done
+/usr/bin/install "${args[@]}"
+EOF
+    cat >"${fake}/logger" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${PO0_TEST_LOGGER_LOG}"
+EOF
+    cat >"${fake}/curl" <<'EOF'
+#!/usr/bin/env bash
+printf 'CURL\n' >>"${PO0_TEST_CURL_LOG}"
+exit 7
+EOF
+    chmod 0700 "${fake}/chmod" "${fake}/install" "${fake}/logger" "${fake}/curl"
+    # macOS 自带的 bash 3.2 没有 mapfile 内建，用与既有守卫用例相同的垫片补齐。
+    bash_env=${root}/bash-env
+    cat >"${bash_env}" <<'EOF'
+mapfile() {
+    local array_name=MAPFILE line quoted index=0
+    if [[ ${1:-} == -t ]]; then shift; fi
+    [[ $# -le 1 ]] || return 2
+    [[ $# -eq 0 ]] || array_name=$1
+    eval "${array_name}=()"
+    while IFS= read -r line || [[ -n ${line} ]]; do
+        printf -v quoted '%q' "${line}"
+        eval "${array_name}[${index}]=${quoted}"
+        index=$((index + 1))
+    done
+}
+EOF
+    chmod 0600 "${bash_env}"
+
+    for scenario in no-parser jq-only python3-only; do
+        case_dir=${root}/${scenario}
+        guard=${case_dir}/guard
+        config=${case_dir}/config
+        identity=${case_dir}/komari/auto-discovery.json
+        logger_log=${case_dir}/logger.log
+        install -d -m 0700 "${case_dir}" "${identity%/*}" "${case_dir}/bin"
+        komari_identity_guard_content >"${guard}"
+        chmod 0700 "${guard}"
+        printf '%s\n%s\n%s\n' "${KOMARI_IDENTITY_MARKER}" "${identity}" \
+            'https://panel.example.test' >"${config}"
+        chmod 0600 "${config}"
+        printf '{"uuid":"node-1","token":"PARSER_SCENARIO_TOKEN"}\n' >"${identity}"
+        chmod 0600 "${identity}"
+        before_hash=$(sha256sum "${identity}" | awk '{print $1}')
+        case "${scenario}" in
+            jq-only)
+                command -v jq >/dev/null 2>&1 \
+                    && ln -sf "$(command -v jq)" "${case_dir}/bin/jq"
+                ;;
+            python3-only)
+                command -v python3 >/dev/null 2>&1 \
+                    && ln -sf "$(command -v python3)" "${case_dir}/bin/python3"
+                ;;
+        esac
+        if [[ ${scenario} != no-parser && ! -e ${case_dir}/bin/${scenario%%-only} ]]; then
+            printf '    （本机没有 %s，跳过该分支的真实解析）\n' "${scenario%%-only}" >&2
+            continue
+        fi
+
+        set +e
+        out=$(
+            BASH_ENV="${bash_env}" \
+            PATH="${case_dir}/bin:${fake}:${real}" \
+            PO0_TEST_LOGGER_LOG="${logger_log}" \
+            PO0_TEST_CURL_LOG="${case_dir}/curl.log" \
+                /bin/bash "${guard}" "${config}" 2>&1
+        )
+        rc=$?
+        set -e
+        assert_eq 0 "${rc}" "${scenario} 场景守卫没有保守退出" || return 1
+        [[ -f ${identity} && ! -L ${identity} ]] \
+            || { fail "${scenario} 场景删除了缓存身份"; return 1; }
+        assert_eq "${before_hash}" "$(sha256sum "${identity}" | awk '{print $1}')" \
+            "${scenario} 场景改动了缓存身份" || return 1
+        assert_not_contains "${out}" PARSER_SCENARIO_TOKEN \
+            "${scenario} 场景输出泄漏了身份令牌" || return 1
+        if [[ ${scenario} == no-parser ]]; then
+            [[ ! -e ${case_dir}/curl.log ]] \
+                || { fail '没有解析器时仍向面板发起了验证'; return 1; }
+            [[ -f ${logger_log} ]] \
+                || { fail '没有解析器时没有走保守保留分支（未产生任何系统日志）'; return 1; }
+            grep -Fq 'No jq or python3 is available' "${logger_log}" \
+                || { fail '没有解析器时没有记录保守保留的原因'; return 1; }
+        else
+            [[ -f ${case_dir}/curl.log ]] \
+                || { fail "${scenario} 场景没有进入面板验证，解析分支未被执行"; return 1; }
+        fi
     done
 )
 
@@ -981,6 +1162,8 @@ main() {
     run_case 'Agent 扫描取消不探测代理且批量读取元数据' test_agent_scan_cancel_skips_proxy_probe_and_batches_metadata
     run_case '已配置 Agent 可从扫描入口检查更新或安全撤销' test_managed_agent_action_menu_can_refresh_or_disable
     run_case '代理文件被外部删除后仍可注销托管记录' test_disable_service_handles_externally_removed_dropin
+    run_case '启用失败会撤销身份守卫与动态配置守卫' test_enable_rollback_removes_identity_guard
+    run_case '身份守卫在缺少解析器时保守保留身份' test_identity_guard_parser_selection
     printf '结果：%d 通过，%d 失败\n' "${PASS_COUNT}" "${FAIL_COUNT}"
     (( FAIL_COUNT == 0 ))
 }
