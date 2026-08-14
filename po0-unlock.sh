@@ -985,7 +985,7 @@ remove_managed_public_key_file() {
 }
 
 rollback() {
-    local state installed_before bin_installed_before active_before enabled_before
+    local state installed_before bin_installed_before active_before enabled_before closed_marker
     require_root
     state=$(active_state)
     installed_before=$(<"${state}/tinyproxy-installed-before")
@@ -1010,7 +1010,13 @@ rollback() {
     fi
     if [[ ${bin_installed_before} == no ]]; then apt-get purge -y tinyproxy-bin; fi
     date -u +%Y-%m-%dT%H:%M:%SZ >"${state}/rolled-back-at"
-    mv "${ACTIVE_FILE}" "${state}/ACTIVE.closed"
+    # 与国内入口的同一步骤对齐：拒绝覆盖已有封存记录，失败必须中止，
+    # 否则重跑回滚会静默盖掉上一份记录，或在封存失败后仍然报告「已回滚」。
+    closed_marker=${state}/ACTIVE.closed
+    [[ ! -e ${closed_marker} && ! -L ${closed_marker} ]] \
+        || die '历史状态中已存在 ACTIVE.closed，拒绝覆盖。'
+    mv -- "${ACTIVE_FILE}" "${closed_marker}" \
+        || die '最终封存 ACTIVE 状态失败；隧道与密钥已清理，可安全重试完整回滚。'
     log "国外出口已回滚，历史状态保留在：${state}"
 }
 
@@ -2956,7 +2962,10 @@ case "${1:-}" in
         command -v flock >/dev/null \
             || { echo '系统缺少 flock，无法安全恢复 cf-probe 测速目标。' >&2; exit 1; }
         exec 9>"${state}/service-proxy.lock"
-        flock -n 9 || exit 0
+        # 拿不到锁时不能静默当成功：守卫由 .path 单元触发，面板的新配置版本号
+        # 一旦被接受就不会再变，静默放弃会让安全测速目标长期不恢复。
+        flock -w "${CN_ENTRY_LOCK_WAIT_SECONDS}" 9 \
+            || { echo '等待服务配置锁超时，未恢复 cf-probe 测速目标。' >&2; exit 1; }
         confirm_helper_state_open "${state}" \
             || { echo '安装状态正在关闭或已经变化，拒绝恢复 cf-probe 测速目标。' >&2; exit 1; }
         [[ -f ${state}/managed-services ]] && grep -Fxq -- "${unit}" "${state}/managed-services" \
@@ -4278,8 +4287,8 @@ __PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
     chmod 0600 "${exit_new}" "${cn_entry_new}"
     exit_actual=$(sha256sum "${exit_new}" | awk '{print $1}')
     cn_entry_actual=$(sha256sum "${cn_entry_new}" | awk '{print $1}')
-    [[ ${exit_actual} == '0da23eee38deb7922074536572214020ef94947167feb5c4d284886719fa55ab' ]] || die '国外出口内置组件哈希校验失败。'
-    [[ ${cn_entry_actual} == 'bbb7db61348d9399804e010ab2be6b4f1507412f7128542c4a5f22414caf100f' ]] || die '国内入口内置组件哈希校验失败。'
+    [[ ${exit_actual} == 'dcf40c95a7f8f980296a82bfb1e7b40b85183ce582c4bb802eb6a9411e63ae96' ]] || die '国外出口内置组件哈希校验失败。'
+    [[ ${cn_entry_actual} == 'b2c471d859fe8a85960786124823c5941553ebe550542252e6b22500d5fdf7fc' ]] || die '国内入口内置组件哈希校验失败。'
     /bin/bash -n "${exit_new}" || die '国外出口内置组件语法检查失败。'
     /bin/bash -n "${cn_entry_new}" || die '国内入口内置组件语法检查失败。'
     mv "${exit_new}" "${EXIT_ROLE}"
@@ -4309,8 +4318,8 @@ bundle_self_test() {
     rm -f -- "${helper_test}"
     printf 'Po0 单文件版本=%s\n' '2.5.19'
     printf 'Po0 单文件版本类型=%s\n' "${SCRIPT_EDITION_LABEL}"
-    printf 'overseas-exit-role SHA-256=%s\n' '0da23eee38deb7922074536572214020ef94947167feb5c4d284886719fa55ab'
-    printf 'cn-entry-role SHA-256=%s\n' 'bbb7db61348d9399804e010ab2be6b4f1507412f7128542c4a5f22414caf100f'
+    printf 'overseas-exit-role SHA-256=%s\n' 'dcf40c95a7f8f980296a82bfb1e7b40b85183ce582c4bb802eb6a9411e63ae96'
+    printf 'cn-entry-role SHA-256=%s\n' 'b2c471d859fe8a85960786124823c5941553ebe550542252e6b22500d5fdf7fc'
     printf '%s\n'         "scan-agents -> cn-entry:${CN_ENTRY_CMD_SCAN}"         "rollback[1] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_SERVICES}"         "rollback[2] -> overseas-exit:${EXIT_CMD_ROLLBACK}"         "rollback[3] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_FINALIZE}"         "status -> cn-entry:${CN_ENTRY_CMD_STATUS}"         "status -> overseas-exit:${EXIT_CMD_STATUS}"         "health -> cn-entry:${CN_ENTRY_CMD_HEALTH}"         "health -> overseas-exit:${EXIT_CMD_HEALTH}"         "repair -> overseas-exit:${EXIT_CMD_REPAIR}"
     printf '%s\n' 'SELF_TEST=PASS'
 }

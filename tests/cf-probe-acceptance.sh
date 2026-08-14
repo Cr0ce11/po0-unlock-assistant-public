@@ -581,6 +581,46 @@ FAKE_CURL
 # go-pending 与兼容目录残留，健康检查看不到，停用也会以「不在托管清单」拒绝清理。
 # 归属校验此前只查属主和硬链接数，不查权限位：包装脚本被放宽成人人可写后
 # 仍会被判为「属于本助手」，而它们会被注入服务 PATH 的最前面。
+# reconcile-cf-probe 由 .path 单元触发。拿不到锁时若静默 exit 0，面板推送的新配置
+# 版本号已被接受、.path 不会再触发，安全测速目标可能长期不恢复。必须有界等待并明确失败。
+test_reconcile_cf_probe_waits_for_lock() (
+    local case_dir branch flock_log rc out
+    case_dir=$(mktemp -d "${TMPDIR:-/tmp}/po0-reconcile-lock.XXXXXXXX")
+    trap 'rm -rf -- "${case_dir}"' EXIT
+    flock_log=${case_dir}/flock.log
+    mkdir -p -- "${case_dir}/state"
+    : >"${flock_log}"
+
+    branch=$(sed -n '/^    reconcile-cf-probe)/,/^        ;;/p' "${CN_ENTRY_ROLE}")
+    [[ -n ${branch} ]] || { fail '未能提取 reconcile-cf-probe 分支'; return 1; }
+    branch=${branch#*reconcile-cf-probe)}
+    branch=${branch%;;}
+    eval "run_reconcile() { set -- reconcile-cf-probe \"\$1\"; ${branch} }"
+
+    CN_ENTRY_LOCK_WAIT_SECONDS=30
+    usage() { :; }
+    valid_helper_service_unit() { return 0; }
+    helper_active_state() { printf '%s\n' "${case_dir}/state"; }
+    confirm_helper_state_open() { :; }
+    managed_dropin_owned() { :; }
+    # 记录真实调用参数，并模拟等待超时。
+    flock() { printf '%s\n' "$*" >>"${flock_log}"; return 1; }
+    command() {
+        if [[ ${1:-} == -v ]]; then return 0; fi
+        builtin command "$@"
+    }
+
+    rc=0
+    out=$( (run_reconcile cf-probe.service) 2>&1 ) || rc=$?
+    [[ ${rc} -ne 0 ]] \
+        || { fail '拿不到服务配置锁时守卫静默当成功退出'; return 1; }
+    assert_contains "${out}" '等待服务配置锁超时' '锁等待超时没有给出明确原因' || return 1
+    assert_contains "$(<"${flock_log}")" '-w 30' \
+        '守卫没有使用有界等待（应为 -w ${CN_ENTRY_LOCK_WAIT_SECONDS}）' || return 1
+    ! grep -Fq -- '-n' "${flock_log}" \
+        || { fail '守卫仍在使用非阻塞锁'; return 1; }
+)
+
 test_cf_probe_compat_ownership_checks_mode() (
     local case_dir compat nc_content rc
     case_dir=$(mktemp -d "${TMPDIR:-/tmp}/po0-compat-mode.XXXXXXXX")
@@ -756,6 +796,7 @@ main() {
     run_case 'Go Agent 首次事务中断后可自动恢复' test_go_agent_stale_first_transaction_recovery
     run_case 'Go Agent 面板动态配置覆盖可持续收敛' test_go_agent_dynamic_config_guard
     run_case '服务专用兼容文件可直连上报、失败回退并安全清理' test_wrapper_lifecycle_and_scope
+    run_case '测速目标守卫拿不到锁时有界等待并明确失败' test_reconcile_cf_probe_waits_for_lock
     run_case 'cf-probe 兼容文件归属校验包含权限位' test_cf_probe_compat_ownership_checks_mode
     run_case '启用事务在 drop-in 落盘前失败也会补偿 cf-probe' test_enable_rollback_compensates_before_dropin_flag
     run_case '启用、刷新、失败回滚、停用和扫描路径均已接入' test_source_lifecycle_contracts
