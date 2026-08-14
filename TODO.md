@@ -12,7 +12,7 @@
 | HAND-001 | P1 | 进行中 | [`docs/HANDOVER.md`](docs/HANDOVER.md) | Claude Code 临时维护期（2026-08-14 起） | 交回 Codex 时在 `docs/HANDOVER.md` 追加交接结束小节，记录期间合并的 PR、发布的版本、未完成事项、回退方式、交回时的 `main` 提交与开放项，并同步更新 `PROJECT.md` 的维护执行方 |
 | GOV-002 | P2 | 待决定 | 项目所有者决定 | 是否启用 GitHub Issue 作为需求与缺陷的登记入口 | 所有者作出决定；若启用，同步调整 `PROJECT.md`、本文件和协作说明，改由 Issue 承载需求与优先级 |
 | GOV-003 | P3 | 暂缓 | 项目所有者决定 | 是否授予开源许可 | 当前明确不授予；未经所有者明确决定，不新增 `LICENSE`、不在文档中宣称开源或暗示已授权复制、修改、再发布及商业使用 |
-| OPS-001 | P2 | 待办 | 待建立 | 明确真机验证的授权与执行方式 | 记录一次可重复的授权流程：由谁授权、在哪台服务器、做哪些只读或可回退的检查、失败如何恢复；不把地址、端口或凭据写入仓库 |
+| OPS-001 | P2 | 暂缓 | 项目所有者决定（2026-08-14） | v2.5.18 的专门真机验证 | 当前不安排临时验证机；项目所有者在日后实际使用中验证。若使用中发现问题，按缺陷单独立项并优先处理；若今后决定恢复专门验证，先记录授权方式、检查项和失败恢复路径，且不把地址、端口或凭据写入仓库 |
 | REL-001 | — | 完成 | [PR #5](https://github.com/DTB201/po0-unlock-assistant-public/pull/5) | 准备并发布 v2.5.18 | 版本号、生成物、标签与 Release 一致；本地验收清单、公开 CI 与两个 Release 附件摘要核对全部通过 |
 | FIX-001 | — | 完成 | [PR #1](https://github.com/DTB201/po0-unlock-assistant-public/pull/1)、[PR #2](https://github.com/DTB201/po0-unlock-assistant-public/pull/2)、[PR #3](https://github.com/DTB201/po0-unlock-assistant-public/pull/3)、[PR #4](https://github.com/DTB201/po0-unlock-assistant-public/pull/4) | v2.5.18 的四项修复与门禁加固 | 同行 IPv4 脱敏、单文件构建语义门禁、ShellCheck 基线与变量作用域、远程组件与入口写锁超时保护均已合并并随 v2.5.18 发布，详见 `CHANGELOG.md` |
 
