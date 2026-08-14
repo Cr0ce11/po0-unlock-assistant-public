@@ -11,6 +11,10 @@ PASS_COUNT=0
 FAIL_COUNT=0
 
 fail() { printf '    失败：%s\n' "$*" >&2; return 1; }
+assert_eq() {
+    local expected=$1 actual=$2 message=$3
+    [[ ${actual} == "${expected}" ]] || fail "${message}（期望=${expected}，实际=${actual}）"
+}
 assert_contains() {
     local haystack=$1 needle=$2 message=$3
     grep -Fq -- "${needle}" <<<"${haystack}" || fail "${message}（缺少：${needle}）"
@@ -409,6 +413,105 @@ CASES
 # 隧道单元的归属校验此前只用两条 grep 锚定 ExecStart 的首尾子串，中间的
 # -i、UserKnownHostsFile、StrictHostKeyChecking=yes、ExitOnForwardFailure 全不在范围内。
 # 被插入 StrictHostKeyChecking=no 的隧道仍会被判为「属于本助手」并被 enable --now 拉起。
+# 两端 health() 的返回码是「一键健康检查」判定总体结果的唯一依据：0 正常、2 提醒、1 异常。
+# 此前只跑过全绿路径，把「提醒」误判成「正常」这类改动不会被任何用例发现。
+test_health_exit_codes_are_runtime_covered() (
+    local case_dir fixture_state systemd_root dropin_dir cn_health rc
+    case_dir=$(mktemp -d "${TMPDIR:-/tmp}/po0-health-rc.XXXXXXXX")
+    trap 'rm -rf -- "${case_dir}"' EXIT
+    fixture_state=${case_dir}/state
+    systemd_root=${case_dir}/systemd
+    dropin_dir=${systemd_root}/demo-agent.service.d
+    mkdir -p -- "${fixture_state}" "${dropin_dir}"
+
+    # —— 国内入口 health()：0 / 2 / 1 三种返回码 ——
+    TUNNEL_USER=po0tunnel
+    APT_CONF=${case_dir}/apt.conf
+    PROFILE_CONF=${case_dir}/profile.sh
+    HELPER=${case_dir}/helper.sh
+    HTTP_PROXY_URL=http://127.0.0.1:13128
+    SOCKS_PROXY_URL=socks5h://127.0.0.1:19080
+    : >"${APT_CONF}"
+    : >"${PROFILE_CONF}"
+    : >"${HELPER}"
+    : >"${fixture_state}/managed-services"
+
+    # 只把硬编码的 systemd 根目录换成夹具目录，其余逻辑原样执行。
+    cn_health=$(sed -n '/^health() (/,/^)$/p' "${CN_SOURCE}")
+    eval "${cn_health//\/etc\/systemd\/system/${systemd_root}}"
+    require_root() { :; }
+    health_group() { :; }
+    health_line() { printf '%s %s\n' "$1" "$2"; }
+    health_safe_state() { printf '%s\n' "${fixture_state}"; }
+    health_regular_root_file() { return 0; }
+    valid_service_unit() { return 0; }
+    tunnel_authorized_keys_hardened() { return 0; }
+    id() { printf '%s\n' 4242; }
+    pgrep() { return 0; }
+    ss() { printf '%s\n' 'LISTEN 0 128 127.0.0.1:13128' 'LISTEN 0 128 127.0.0.1:19080'; }
+    curl() { return 0; }
+    systemctl() { return 0; }
+    grep() { return 0; }
+    bash() { return 0; }
+
+    rc=0
+    health >/dev/null 2>&1 || rc=$?
+    assert_eq 0 "${rc}" '国内入口全绿时没有返回 0' || return 1
+
+    # 托管 Agent 配置完整但没有运行：只应计入提醒，返回 2。
+    printf '%s\n' 'demo-agent.service' >"${fixture_state}/managed-services"
+    printf '%s\n' '# Managed by Po0 Unlock; do not edit manually.' '[Service]' \
+        >"${dropin_dir}/90-po0-unlock-proxy.conf"
+    systemctl() {
+        case "$*" in
+            *'show -p LoadState'*) printf '%s\n' loaded ;;
+            *'is-active'*) return 1 ;;
+            *) return 0 ;;
+        esac
+    }
+    rc=0
+    health >/dev/null 2>&1 || rc=$?
+    assert_eq 2 "${rc}" '国内入口只有提醒时没有返回 2（提醒被当成了正常或异常）' || return 1
+
+    # 安装记录损坏：必须计入异常，返回 1。
+    health_safe_state() { return 1; }
+    rc=0
+    health >/dev/null 2>&1 || rc=$?
+    assert_eq 1 "${rc}" '国内入口出现异常时没有返回 1' || return 1
+
+    # —— 国外出口 health()：0 与 1 两种返回码（该端没有提醒态）——
+    unset -f health
+    eval "$(sed -n '/^health() (/,/^)$/p' "${EXIT_SOURCE}")"
+    PROXY_CONF=${case_dir}/proxy.conf
+    PROXY_UNIT=${case_dir}/proxy.service
+    TUNNEL_UNIT=${case_dir}/tunnel.service
+    KNOWN_HOSTS=${case_dir}/known-hosts
+    KEY_FILE=${case_dir}/key
+    printf '%s\n' '203.0.113.10' >"${fixture_state}/cn-entry-private-ip"
+    printf '%s\n' '198.51.100.20' >"${fixture_state}/overseas-exit-private-ip"
+    printf '%s\n' '22' >"${fixture_state}/cn-entry-ssh-port"
+    health_safe_state() { printf '%s\n' "${fixture_state}"; }
+    health_regular_root_file() { return 0; }
+    valid_ipv4() { return 0; }
+    valid_port() { return 0; }
+    systemctl() { return 0; }
+    ss() { printf '%s\n' 'LISTEN 0 128 127.0.0.1:3128 0.0.0.0:*'; }
+    curl() { return 0; }
+    local_ipv4_exists() { return 0; }
+    ip() { return 0; }
+    ssh-keyscan() { return 0; }
+    grep() { return 0; }
+
+    rc=0
+    health >/dev/null 2>&1 || rc=$?
+    assert_eq 0 "${rc}" '国外出口全绿时没有返回 0' || return 1
+
+    health_regular_root_file() { return 1; }
+    rc=0
+    health >/dev/null 2>&1 || rc=$?
+    assert_eq 1 "${rc}" '国外出口出现异常时没有返回 1' || return 1
+)
+
 test_repair_verifies_tunnel_host_key_options() (
     local case_dir fixture_state exec_line output rc
     case_dir=$(mktemp -d "${TMPDIR:-/tmp}/po0-repair-tunnel.XXXXXXXX")
@@ -1625,6 +1728,7 @@ main() {
     run_case '检查结果不依赖终端列宽并按职责分组' test_readable_layout_contract
     run_case '公网连接的检查、状态与修复使用通用措辞' test_public_connection_path_uses_generic_copy
     run_case '安全修复的用户确认闸门实跑验证' test_safe_repair_confirmation_at_runtime
+    run_case '两端健康检查的返回码实跑覆盖' test_health_exit_codes_are_runtime_covered
     run_case '安全修复校验隧道单元的主机密钥参数' test_repair_verifies_tunnel_host_key_options
     run_case '自动修复严格限制在确认后的自有核心服务' test_safe_repair_boundary
     run_case '服务修复失败会恢复原运行与启用状态' test_service_repair_rollback
