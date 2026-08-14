@@ -1170,10 +1170,15 @@ test_unfinalized_install_can_begin_rollback() (
     printf '%s\n' "${fixture_state}" >"${ACTIVE_FILE}"
     refresh_marker=${case_dir}/refresh-called
 
-    function_body=$(sed -n '/^rollback_services() {/,/^}/p' "${PROJECT_DIR}/cn-entry-role.sh")
-    [[ -n ${function_body} ]] || { fail '未能提取 Agent 回滚函数'; return 1; }
-    eval "${function_body}"
+    for function_name in acquire_state_mutation_lock rollback_services; do
+        function_body=$(sed -n "/^${function_name}() {/,/^}/p" \
+            "${PROJECT_DIR}/cn-entry-role.sh")
+        [[ -n ${function_body} ]] \
+            || { fail "未能提取 ${function_name}"; return 1; }
+        eval "${function_body}"
+    done
 
+    CN_ENTRY_LOCK_WAIT_SECONDS=30
     require_root() { :; }
     active_state() { printf '%s\n' "${fixture_state}"; }
     refresh_helper_from_state() {
@@ -1216,12 +1221,14 @@ test_tunnel_home_cleanup_is_safely_retryable() (
     : >"${fail_cleanup_marker}"
 
     for function_name in \
-        record_tunnel_user_uid read_recorded_tunnel_user_uid rollback_finalize; do
+        acquire_state_mutation_lock record_tunnel_user_uid \
+        read_recorded_tunnel_user_uid rollback_finalize; do
         function_body=$(sed -n "/^${function_name}() {/,/^}/p" "${PROJECT_DIR}/cn-entry-role.sh")
         [[ -n ${function_body} ]] || { fail "未能提取 ${function_name}"; return 1; }
         eval "${function_body}"
     done
 
+    CN_ENTRY_LOCK_WAIT_SECONDS=30
     require_root() { :; }
     active_state() { printf '%s\n' "${fixture_state}"; }
     flock() { :; }
@@ -1312,7 +1319,8 @@ test_status_uses_current_embedded_role() {
     validator_body=$(sed -n '/^installed_cn_entry_role_is_current() {/,/^}/p' "${SETUP_SOURCE}")
     assert_contains "${function_body}" 'select_current_cn_entry_role status_remote status_remote_temporary' \
         '状态检查没有安全选择当前脚本对应的国内入口组件'
-    assert_contains "${function_body}" "ssh_cn_entry \"'\${status_remote}' '\${CN_ENTRY_CMD_STATUS}'\"" \
+    assert_contains "${function_body}" \
+        "ssh_cn_entry_component \"\${CN_ENTRY_TIMEOUT_STATUS}\" read-only '状态检查'" \
         '状态检查没有调用当前脚本内嵌的国内入口组件'
     assert_contains "${selector_body}" 'upload_temporary_cn_entry_role "${path_var}"' \
         '已安装组件不一致时不会回退到当前内嵌组件' || return 1
@@ -1678,6 +1686,7 @@ test_concurrent_install_failure_never_uses_unclaimed_rollback() (
             *) return 0 ;;
         esac
     }
+    ssh_cn_entry_component() { shift 3; ssh_cn_entry "$@"; }
 
     set +e
     output=$(install_core 2>&1)
@@ -2021,6 +2030,123 @@ test_operation_lock_serializes_and_rejects_unsafe_path() (
     [[ ! -s ${action_log} ]] || { fail '操作锁异常时仍执行了远端操作'; return 1; }
 )
 
+test_remote_component_timeout_is_bounded_and_releases_operation_lock() (
+    set -Eeuo pipefail
+    local output rc timeout_log=${WORK_ROOT}/component-timeout.log
+    load_harness 2.5.17
+    OPERATION_LOCK_DIR=${CASE_DIR}/operation-lock
+    OPERATION_LOCK_FILE=${OPERATION_LOCK_DIR}/operation.lock
+    CN_ENTRY_CONTROL_PATH=${CASE_DIR}/control/socket
+    CN_ENTRY_TARGET=root@192.0.2.10
+    CN_ENTRY_SSH_PORT=2222
+    EXIT_PRIVATE_IP=192.0.2.20
+    ADMIN_KEY=${CASE_DIR}/admin-key
+    ADMIN_KNOWN_HOSTS=${CASE_DIR}/known-hosts
+    : >"${timeout_log}"
+
+    prepare_cn_entry_control_dir() { :; }
+    cleanup_cn_entry_session() { :; }
+    start_cn_entry_session() { :; }
+    ssh() { printf '%s\n' UNEXPECTED_SSH >>"${timeout_log}"; return 0; }
+    timeout() { printf '%s\n' "$*" >>"${timeout_log}"; return 124; }
+    read_only_action() {
+        ssh_cn_entry_component 30 read-only '状态检查' \
+            "'/usr/local/libexec/po0-unlock-cn-entry' status"
+    }
+    mutating_action() {
+        ssh_cn_entry_component 120 mutating '安装准备' \
+            "'/usr/local/libexec/po0-unlock-cn-entry' prepare fixture fixture"
+    }
+
+    set +e
+    output=$(run_cn_entry_operation read_only_action 2>&1)
+    rc=$?
+    set -e
+    [[ ${rc} -eq 124 ]] \
+        || { fail "只读组件超时没有保留 124 返回码（实际 ${rc}）"; return 1; }
+    assert_contains "${output}" '本次只读组件调用未修改国内入口' \
+        '只读组件超时没有明确说明入口侧未修改' || return 1
+    assert_contains "$(<"${timeout_log}")" '--foreground --kill-after=5s 30s ssh' \
+        '只读组件没有使用保持前台的 30 秒调用上限' || return 1
+    assert_not_contains "$(<"${timeout_log}")" UNEXPECTED_SSH \
+        '超时夹具错误执行了 SSH 命令' || return 1
+    assert_contains "$(<"${TEST_FLOCK_LOG}")" '-u 7' \
+        '只读组件超时后没有释放国外出口操作锁' || return 1
+
+    : >"${timeout_log}"
+    : >"${TEST_FLOCK_LOG}"
+    set +e
+    output=$(run_cn_entry_operation mutating_action 2>&1)
+    rc=$?
+    set -e
+    [[ ${rc} -eq 124 ]] \
+        || { fail "修改型组件超时没有保留 124 返回码（实际 ${rc}）"; return 1; }
+    assert_contains "${output}" '可能已部分修改国内入口' \
+        '修改型组件超时没有说明可能存在部分修改' || return 1
+    assert_contains "${output}" '完整回滚' \
+        '修改型组件超时没有给出完整回滚指引' || return 1
+    assert_contains "$(<"${timeout_log}")" '--foreground --kill-after=5s 120s ssh' \
+        '修改型组件没有使用保持前台的 120 秒调用上限' || return 1
+    assert_contains "$(<"${TEST_FLOCK_LOG}")" '-u 7' \
+        '修改型组件超时后没有释放国外出口操作锁' || return 1
+)
+
+test_cn_entry_lock_timeout_is_bounded_and_preserves_config() (
+    set -Eeuo pipefail
+    local function_body output rc role_source lock_log=${WORK_ROOT}/entry-lock-timeout.log
+    local state=${WORK_ROOT}/entry-lock-state
+    mkdir -p "${state}"
+    APT_CONF=${state}/apt.conf
+    PROFILE_CONF=${state}/profile.sh
+    HELPER=${state}/helper
+    printf '%s\n' apt-original >"${APT_CONF}"
+    printf '%s\n' profile-original >"${PROFILE_CONF}"
+    printf '%s\n' helper-original >"${HELPER}"
+    CN_ENTRY_LOCK_WAIT_SECONDS=30
+    HTTP_PROXY_URL=http://127.0.0.1:13128
+    SOCKS_PROXY_URL=socks5h://127.0.0.1:19080
+    : >"${lock_log}"
+
+    function_body=$(sed -n '/^acquire_state_mutation_lock() {/,/^}/p' \
+        "${PROJECT_DIR}/cn-entry-role.sh")
+    [[ -n ${function_body} ]] \
+        || { fail '未能提取国内入口有界写锁助手'; return 1; }
+    eval "${function_body}"
+    function_body=$(sed -n '/^write_proxy_files() (/,/^)/p' \
+        "${PROJECT_DIR}/cn-entry-role.sh")
+    [[ -n ${function_body} ]] \
+        || { fail '未能提取国内入口代理写入函数'; return 1; }
+    eval "${function_body}"
+
+    valid_ipv4() { :; }
+    flock() { printf '%s\n' "$*" >>"${lock_log}"; return 1; }
+    die() { printf '%s\n' "$*" >&2; exit 1; }
+
+    set +e
+    output=$(write_proxy_files "${state}" 192.0.2.10 192.0.2.20 2>&1)
+    rc=$?
+    set -e
+    [[ ${rc} -ne 0 ]] || { fail '国内入口写锁超时后仍报告成功'; return 1; }
+    assert_contains "$(<"${lock_log}")" '-w 30 9' \
+        '国内入口写锁没有使用 30 秒等待上限' || return 1
+    assert_contains "${output}" '不会在无锁状态下继续修改' \
+        '国内入口写锁超时提示不明确' || return 1
+    assert_eq apt-original "$(<"${APT_CONF}")" \
+        '写锁超时后改变了 APT 配置' || return 1
+    assert_eq profile-original "$(<"${PROFILE_CONF}")" \
+        '写锁超时后改变了登录代理配置' || return 1
+    assert_eq helper-original "$(<"${HELPER}")" \
+        '写锁超时后改变了国内入口助手' || return 1
+    [[ ! -e ${state}/cn-entry-private-ip && ! -e ${state}/overseas-exit-private-ip ]] \
+        || { fail '写锁超时后写入了连接地址记录'; return 1; }
+
+    role_source=$(sed -n '1,$p' "${PROJECT_DIR}/cn-entry-role.sh")
+    [[ $(grep -Fc 'flock -x 9' <<<"${role_source}" || true) -eq 0 ]] \
+        || { fail '国内入口仍存在无上限的阻塞写锁'; return 1; }
+    [[ $(grep -Fc 'acquire_state_mutation_lock "${state}"' <<<"${role_source}" || true) -eq 6 ]] \
+        || { fail '六处国内入口写锁没有全部接入统一有界助手'; return 1; }
+)
+
 test_current_cn_entry_role_reuse_and_reconfigure_progress() (
     local selected= temporary= upload_calls=0 output log=${WORK_ROOT}/current-role.log
     local reconfigure_body
@@ -2070,6 +2196,7 @@ test_current_cn_entry_role_reuse_and_reconfigure_progress() (
     preflight() { printf '%s\n' PREFLIGHT >>"${log}"; }
     upload_temporary_cn_entry_role() { printf '%s\n' UPLOAD >>"${log}"; }
     ssh_cn_entry() { printf 'SSH:%s\n' "$*" >>"${log}"; }
+    ssh_cn_entry_component() { shift 3; ssh_cn_entry "$@"; }
     run_exit_role() { printf 'EXIT:%s\n' "$*" >>"${log}"; }
     status_all_loaded reuse-installed >/dev/null
     output=$(<"${log}")
@@ -2253,6 +2380,7 @@ test_reconfigure_transaction_cross_phase_consistency() (
             *) return 2 ;;
         esac
     }
+    ssh_cn_entry_component() { shift 3; ssh_cn_entry "$@"; }
     run_exit_role() {
         [[ ${1:-} == reconfigure ]] || return 2
         printf '%s\n' TUNNEL_COMMITTED >>"${call_log}"
@@ -2652,6 +2780,8 @@ main() {
     run_test '无可信主机密钥时拒绝建立国内入口会话' test_cn_entry_session_requires_trusted_host_key_file
     run_test '国内入口 SSH 会话有限重试、复用与清理' test_cn_entry_session_retries_and_reuses_transport
     run_test '主控操作互斥锁串行化并拒绝异常路径' test_operation_lock_serializes_and_rejects_unsafe_path
+    run_test '远程组件调用超时有界并释放操作锁' test_remote_component_timeout_is_bounded_and_releases_operation_lock
+    run_test '国内入口写锁等待有界且超时零写入' test_cn_entry_lock_timeout_is_bounded_and_preserves_config
     run_test '当前国内入口组件复用与连接更新分阶段耗时' test_current_cn_entry_role_reuse_and_reconfigure_progress
     run_test '国内入口正式组件拒绝符号链接与异常硬链接' test_cn_entry_upload_rejects_unsafe_existing_target
     run_test '连接更新配置事务失败回滚' test_reconfigure_config_transaction

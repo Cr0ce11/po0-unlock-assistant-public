@@ -63,9 +63,7 @@ refresh() {
 refresh_helper_from_state() (
     local state cn_entry_private_ip exit_private_ip no_proxy
     state=$(active_state)
-    command -v flock >/dev/null || die '系统缺少 flock，无法安全更新服务代理助手。'
-    exec 9>"${state}/service-proxy.lock"
-    flock -x 9
+    acquire_state_mutation_lock "${state}" '服务代理助手更新'
     confirm_state_open "${state}" || die '安装状态正在关闭或已经变化，拒绝更新服务代理助手。'
     [[ -r ${state}/cn-entry-private-ip && -r ${state}/overseas-exit-private-ip ]] \
         || die '状态目录缺少两端连接地址，无法更新服务代理助手。'

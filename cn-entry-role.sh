@@ -15,10 +15,24 @@ PROFILE_CONF=/etc/profile.d/90-po0-unlock-proxy.sh
 HELPER=/usr/local/bin/po0-cn-entry
 HTTP_PROXY_URL=http://127.0.0.1:13128
 SOCKS_PROXY_URL=socks5h://127.0.0.1:19080
+CN_ENTRY_LOCK_WAIT_SECONDS=30
 
 log() { printf '[国内入口] %s\n' "$*"; }
 die() { printf '[国内入口] 错误：%s\n' "$*" >&2; exit 1; }
 require_root() { [[ ${EUID} -eq 0 ]] || die '必须使用 root 运行。'; }
+
+acquire_state_mutation_lock() {
+    local state=$1 purpose=${2:-配置操作}
+    [[ ${CN_ENTRY_LOCK_WAIT_SECONDS} =~ ^[1-9][0-9]*$ ]] \
+        || die '国内入口写锁等待上限无效。'
+    command -v flock >/dev/null \
+        || die '系统缺少 flock，无法安全修改配置。'
+    exec 9>"${state}/service-proxy.lock" \
+        || die "无法打开国内入口写锁，已停止${purpose}。"
+    if ! flock -w "${CN_ENTRY_LOCK_WAIT_SECONDS}" 9; then
+        die "另一个国内入口配置操作持续占用写锁；等待 ${CN_ENTRY_LOCK_WAIT_SECONDS} 秒后已停止${purpose}，不会在无锁状态下继续修改。若这是完整回滚，请在写锁释放后重新运行完整回滚。"
+    fi
+}
 
 valid_ipv4() {
     local ip=$1 part
@@ -1633,10 +1647,7 @@ managed_dropin_owned() {
 
 acquire_service_lock() {
     local state=$1
-    command -v flock >/dev/null \
-        || { echo '系统缺少 flock，无法安全修改服务配置。' >&2; return 1; }
-    exec 9>"${state}/service-proxy.lock"
-    flock -x 9
+    acquire_state_mutation_lock "${state}" '服务配置操作'
 }
 
 confirm_helper_state_open() {
@@ -2321,9 +2332,7 @@ write_proxy_files() (
     local no_proxy config_tmp= profile_tmp=
     valid_ipv4 "${cn_entry_private_ip}" || die '国内入口连接 IPv4 地址格式无效。'
     valid_ipv4 "${exit_private_ip}" || die '国外出口源 IPv4 地址格式无效。'
-    command -v flock >/dev/null || die '系统缺少 flock，无法安全写入代理配置。'
-    exec 9>"${state}/service-proxy.lock"
-    flock -x 9
+    acquire_state_mutation_lock "${state}" '代理配置写入'
     confirm_state_open "${state}" || die '安装状态正在关闭或已经变化，拒绝写入代理配置。'
 
     cleanup_proxy_candidates() {
@@ -2432,9 +2441,7 @@ refresh() {
 refresh_helper_from_state() (
     local state cn_entry_private_ip exit_private_ip no_proxy
     state=$(active_state)
-    command -v flock >/dev/null || die '系统缺少 flock，无法安全更新服务代理助手。'
-    exec 9>"${state}/service-proxy.lock"
-    flock -x 9
+    acquire_state_mutation_lock "${state}" '服务代理助手更新'
     confirm_state_open "${state}" || die '安装状态正在关闭或已经变化，拒绝更新服务代理助手。'
     [[ -r ${state}/cn-entry-private-ip && -r ${state}/overseas-exit-private-ip ]] \
         || die '状态目录缺少两端连接地址，无法更新服务代理助手。'
@@ -2991,9 +2998,7 @@ rollback_services() {
     [[ ! -L ${closing} ]] || die '安装状态的 closing 标记异常，完整回滚已暂停。'
     if [[ -e ${closing} ]]; then
         [[ -f ${closing} ]] || die '安装状态的 closing 标记不是普通文件。'
-        command -v flock >/dev/null || die '系统缺少 flock，无法安全继续回滚。'
-        exec 9>"${state}/service-proxy.lock"
-        flock -x 9
+        acquire_state_mutation_lock "${state}" 'Agent 回滚状态复核'
         [[ -r ${ACTIVE_FILE} ]] || die 'ACTIVE 状态已经变化，完整回滚已暂停。'
         current_state=$(<"${ACTIVE_FILE}")
         [[ ${current_state} == "${state}" ]] || die 'ACTIVE 状态已经切换，完整回滚已暂停。'
@@ -3019,9 +3024,7 @@ rollback_services() {
         (( failures == 0 )) \
             || die "仍有 ${failures} 个托管服务未安全回滚；核心隧道与 ACTIVE 状态已保留。"
     fi
-    command -v flock >/dev/null || die '系统缺少 flock，无法安全封存回滚状态。'
-    exec 9>"${state}/service-proxy.lock"
-    flock -x 9
+    acquire_state_mutation_lock "${state}" 'Agent 回滚状态封存'
     [[ -r ${ACTIVE_FILE} ]] || die 'ACTIVE 状态已经变化，完整回滚已暂停。'
     current_state=$(<"${ACTIVE_FILE}")
     [[ ${current_state} == "${state}" ]] || die 'ACTIVE 状态已经切换，完整回滚已暂停。'
@@ -3065,9 +3068,7 @@ rollback_finalize() {
     local tunnel_uid= home_owner uid_recorded=
     require_root
     state=$(active_state)
-    command -v flock >/dev/null || die '系统缺少 flock，无法安全完成回滚。'
-    exec 9>"${state}/service-proxy.lock"
-    flock -x 9
+    acquire_state_mutation_lock "${state}" '最终回滚清理'
     [[ -r ${ACTIVE_FILE} ]] || die 'ACTIVE 状态已经变化，拒绝继续最终清理。'
     current_state=$(<"${ACTIVE_FILE}")
     [[ ${current_state} == "${state}" ]] || die 'ACTIVE 状态已经切换，拒绝继续最终清理。'

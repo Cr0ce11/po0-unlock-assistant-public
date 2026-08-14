@@ -46,6 +46,16 @@ CN_ENTRY_CMD_ROLLBACK_SERVICES_CLAIMED=rollback-services-claimed
 CN_ENTRY_CMD_ROLLBACK_FINALIZE_CLAIMED=rollback-finalize-claimed
 CN_ENTRY_ACTIVE_FILE=/var/lib/po0-unlock/ACTIVE
 CN_ENTRY_OCCUPIED_RC=73
+# 单次组件调用按工作量设置独立上限：轻量只读检查 15–30 秒，包含网络
+# 检查的健康检查 90 秒，单次配置阶段 120 秒，可能逐项重启 Agent 的阶段 300 秒。
+CN_ENTRY_TIMEOUT_CLAIM_STATUS=15
+CN_ENTRY_TIMEOUT_STATUS=30
+CN_ENTRY_TIMEOUT_HEALTH=90
+CN_ENTRY_TIMEOUT_PREPARE=120
+CN_ENTRY_TIMEOUT_FINALIZE=120
+CN_ENTRY_TIMEOUT_REFRESH=300
+CN_ENTRY_TIMEOUT_ROLLBACK_SERVICES=300
+CN_ENTRY_TIMEOUT_ROLLBACK_FINALIZE=120
 EXIT_CMD_STATUS=status
 EXIT_CMD_HEALTH=health
 EXIT_CMD_REPAIR=repair
@@ -996,10 +1006,24 @@ PROFILE_CONF=/etc/profile.d/90-po0-unlock-proxy.sh
 HELPER=/usr/local/bin/po0-cn-entry
 HTTP_PROXY_URL=http://127.0.0.1:13128
 SOCKS_PROXY_URL=socks5h://127.0.0.1:19080
+CN_ENTRY_LOCK_WAIT_SECONDS=30
 
 log() { printf '[国内入口] %s\n' "$*"; }
 die() { printf '[国内入口] 错误：%s\n' "$*" >&2; exit 1; }
 require_root() { [[ ${EUID} -eq 0 ]] || die '必须使用 root 运行。'; }
+
+acquire_state_mutation_lock() {
+    local state=$1 purpose=${2:-配置操作}
+    [[ ${CN_ENTRY_LOCK_WAIT_SECONDS} =~ ^[1-9][0-9]*$ ]] \
+        || die '国内入口写锁等待上限无效。'
+    command -v flock >/dev/null \
+        || die '系统缺少 flock，无法安全修改配置。'
+    exec 9>"${state}/service-proxy.lock" \
+        || die "无法打开国内入口写锁，已停止${purpose}。"
+    if ! flock -w "${CN_ENTRY_LOCK_WAIT_SECONDS}" 9; then
+        die "另一个国内入口配置操作持续占用写锁；等待 ${CN_ENTRY_LOCK_WAIT_SECONDS} 秒后已停止${purpose}，不会在无锁状态下继续修改。若这是完整回滚，请在写锁释放后重新运行完整回滚。"
+    fi
+}
 
 valid_ipv4() {
     local ip=$1 part
@@ -2614,10 +2638,7 @@ managed_dropin_owned() {
 
 acquire_service_lock() {
     local state=$1
-    command -v flock >/dev/null \
-        || { echo '系统缺少 flock，无法安全修改服务配置。' >&2; return 1; }
-    exec 9>"${state}/service-proxy.lock"
-    flock -x 9
+    acquire_state_mutation_lock "${state}" '服务配置操作'
 }
 
 confirm_helper_state_open() {
@@ -3302,9 +3323,7 @@ write_proxy_files() (
     local no_proxy config_tmp= profile_tmp=
     valid_ipv4 "${cn_entry_private_ip}" || die '国内入口连接 IPv4 地址格式无效。'
     valid_ipv4 "${exit_private_ip}" || die '国外出口源 IPv4 地址格式无效。'
-    command -v flock >/dev/null || die '系统缺少 flock，无法安全写入代理配置。'
-    exec 9>"${state}/service-proxy.lock"
-    flock -x 9
+    acquire_state_mutation_lock "${state}" '代理配置写入'
     confirm_state_open "${state}" || die '安装状态正在关闭或已经变化，拒绝写入代理配置。'
 
     cleanup_proxy_candidates() {
@@ -3413,9 +3432,7 @@ refresh() {
 refresh_helper_from_state() (
     local state cn_entry_private_ip exit_private_ip no_proxy
     state=$(active_state)
-    command -v flock >/dev/null || die '系统缺少 flock，无法安全更新服务代理助手。'
-    exec 9>"${state}/service-proxy.lock"
-    flock -x 9
+    acquire_state_mutation_lock "${state}" '服务代理助手更新'
     confirm_state_open "${state}" || die '安装状态正在关闭或已经变化，拒绝更新服务代理助手。'
     [[ -r ${state}/cn-entry-private-ip && -r ${state}/overseas-exit-private-ip ]] \
         || die '状态目录缺少两端连接地址，无法更新服务代理助手。'
@@ -3972,9 +3989,7 @@ rollback_services() {
     [[ ! -L ${closing} ]] || die '安装状态的 closing 标记异常，完整回滚已暂停。'
     if [[ -e ${closing} ]]; then
         [[ -f ${closing} ]] || die '安装状态的 closing 标记不是普通文件。'
-        command -v flock >/dev/null || die '系统缺少 flock，无法安全继续回滚。'
-        exec 9>"${state}/service-proxy.lock"
-        flock -x 9
+        acquire_state_mutation_lock "${state}" 'Agent 回滚状态复核'
         [[ -r ${ACTIVE_FILE} ]] || die 'ACTIVE 状态已经变化，完整回滚已暂停。'
         current_state=$(<"${ACTIVE_FILE}")
         [[ ${current_state} == "${state}" ]] || die 'ACTIVE 状态已经切换，完整回滚已暂停。'
@@ -4000,9 +4015,7 @@ rollback_services() {
         (( failures == 0 )) \
             || die "仍有 ${failures} 个托管服务未安全回滚；核心隧道与 ACTIVE 状态已保留。"
     fi
-    command -v flock >/dev/null || die '系统缺少 flock，无法安全封存回滚状态。'
-    exec 9>"${state}/service-proxy.lock"
-    flock -x 9
+    acquire_state_mutation_lock "${state}" 'Agent 回滚状态封存'
     [[ -r ${ACTIVE_FILE} ]] || die 'ACTIVE 状态已经变化，完整回滚已暂停。'
     current_state=$(<"${ACTIVE_FILE}")
     [[ ${current_state} == "${state}" ]] || die 'ACTIVE 状态已经切换，完整回滚已暂停。'
@@ -4046,9 +4059,7 @@ rollback_finalize() {
     local tunnel_uid= home_owner uid_recorded=
     require_root
     state=$(active_state)
-    command -v flock >/dev/null || die '系统缺少 flock，无法安全完成回滚。'
-    exec 9>"${state}/service-proxy.lock"
-    flock -x 9
+    acquire_state_mutation_lock "${state}" '最终回滚清理'
     [[ -r ${ACTIVE_FILE} ]] || die 'ACTIVE 状态已经变化，拒绝继续最终清理。'
     current_state=$(<"${ACTIVE_FILE}")
     [[ ${current_state} == "${state}" ]] || die 'ACTIVE 状态已经切换，拒绝继续最终清理。'
@@ -4179,7 +4190,7 @@ __PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
     exit_actual=$(sha256sum "${exit_new}" | awk '{print $1}')
     cn_entry_actual=$(sha256sum "${cn_entry_new}" | awk '{print $1}')
     [[ ${exit_actual} == 'ae6c05228b91f087725d8363349fa97f79a3b4751000da8104ab146b0f97c79f' ]] || die '国外出口内置组件哈希校验失败。'
-    [[ ${cn_entry_actual} == '79088b7900ba23c368f9045e087c12e58ec75957bd7f59bd1da8b74158ebd4ce' ]] || die '国内入口内置组件哈希校验失败。'
+    [[ ${cn_entry_actual} == '2458a8ae29e7f8b102317d511e43d8701442fc1975f4cd010a9719a675e6a3b9' ]] || die '国内入口内置组件哈希校验失败。'
     /bin/bash -n "${exit_new}" || die '国外出口内置组件语法检查失败。'
     /bin/bash -n "${cn_entry_new}" || die '国内入口内置组件语法检查失败。'
     mv "${exit_new}" "${EXIT_ROLE}"
@@ -4210,7 +4221,7 @@ bundle_self_test() {
     printf 'Po0 单文件版本=%s\n' '2.5.17'
     printf 'Po0 单文件版本类型=%s\n' "${SCRIPT_EDITION_LABEL}"
     printf 'overseas-exit-role SHA-256=%s\n' 'ae6c05228b91f087725d8363349fa97f79a3b4751000da8104ab146b0f97c79f'
-    printf 'cn-entry-role SHA-256=%s\n' '79088b7900ba23c368f9045e087c12e58ec75957bd7f59bd1da8b74158ebd4ce'
+    printf 'cn-entry-role SHA-256=%s\n' '2458a8ae29e7f8b102317d511e43d8701442fc1975f4cd010a9719a675e6a3b9'
     printf '%s\n'         "scan-agents -> cn-entry:${CN_ENTRY_CMD_SCAN}"         "rollback[1] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_SERVICES}"         "rollback[2] -> overseas-exit:${EXIT_CMD_ROLLBACK}"         "rollback[3] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_FINALIZE}"         "status -> cn-entry:${CN_ENTRY_CMD_STATUS}"         "status -> overseas-exit:${EXIT_CMD_STATUS}"         "health -> cn-entry:${CN_ENTRY_CMD_HEALTH}"         "health -> overseas-exit:${EXIT_CMD_HEALTH}"         "repair -> overseas-exit:${EXIT_CMD_REPAIR}"
     printf '%s\n' 'SELF_TEST=PASS'
 }
@@ -4767,14 +4778,68 @@ start_cn_entry_session() {
     return 255
 }
 
-ssh_cn_entry() {
+ssh_cn_entry_command() {
+    local timeout_seconds=$1
+    shift
     start_cn_entry_session || return $?
-    ssh -S "${CN_ENTRY_CONTROL_PATH}" -o ControlMaster=no \
+    if (( timeout_seconds == 0 )); then
+        ssh -S "${CN_ENTRY_CONTROL_PATH}" -o ControlMaster=no \
+            -o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes \
+            -o BindAddress="${EXIT_PRIVATE_IP}" -i "${ADMIN_KEY}" \
+            -o GlobalKnownHostsFile=/dev/null \
+            -o UserKnownHostsFile="${ADMIN_KNOWN_HOSTS}" -o StrictHostKeyChecking=yes \
+            -p "${CN_ENTRY_SSH_PORT}" "${CN_ENTRY_TARGET}" "$@"
+        return
+    fi
+    timeout --foreground --kill-after=5s "${timeout_seconds}s" ssh \
+        -S "${CN_ENTRY_CONTROL_PATH}" -o ControlMaster=no \
         -o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes \
         -o BindAddress="${EXIT_PRIVATE_IP}" -i "${ADMIN_KEY}" \
         -o GlobalKnownHostsFile=/dev/null \
         -o UserKnownHostsFile="${ADMIN_KNOWN_HOSTS}" -o StrictHostKeyChecking=yes \
         -p "${CN_ENTRY_SSH_PORT}" "${CN_ENTRY_TARGET}" "$@"
+}
+
+ssh_cn_entry() {
+    ssh_cn_entry_command 0 "$@"
+}
+
+ssh_cn_entry_component() {
+    local timeout_seconds=${1:-} risk=${2:-} label=${3:-} rc
+    shift 3 || {
+        printf '%s\n' '[Po0 解锁助手] 错误：国内入口组件调用参数不完整。' >&2
+        return 2
+    }
+    [[ ${timeout_seconds} =~ ^[1-9][0-9]*$ && -n ${label} && $# -gt 0 ]] || {
+        printf '%s\n' '[Po0 解锁助手] 错误：国内入口组件调用参数无效。' >&2
+        return 2
+    }
+    case "${risk}" in
+        read-only|mutating) ;;
+        *)
+            printf '%s\n' '[Po0 解锁助手] 错误：国内入口组件调用风险类型无效。' >&2
+            return 2
+            ;;
+    esac
+    command -v timeout >/dev/null 2>&1 || {
+        printf '%s\n' '[Po0 解锁助手] 错误：国外出口缺少 timeout，拒绝执行无界国内入口组件调用。' >&2
+        return 127
+    }
+    if ssh_cn_entry_command "${timeout_seconds}" "$@"; then
+        return 0
+    else
+        rc=$?
+    fi
+    if (( rc == 124 || rc == 137 )); then
+        if [[ ${risk} == read-only ]]; then
+            printf '[Po0 解锁助手] 错误：国内入口%s超过 %s 秒；本次只读组件调用未修改国内入口。\n' \
+                "${label}" "${timeout_seconds}" >&2
+        else
+            printf '[Po0 解锁助手] 错误：国内入口%s超过 %s 秒；该命令可能已部分修改国内入口，请运行完整回滚，确认两端状态后再重试。\n' \
+                "${label}" "${timeout_seconds}" >&2
+        fi
+    fi
+    return "${rc}"
 }
 
 ssh_cn_entry_tty() {
@@ -5496,11 +5561,13 @@ install_core() {
         trap - ERR
         printf '[Po0 解锁助手] 安装中断，开始回滚已经完成的阶段。\n' >&2
         if [[ ${cn_entry_prepared} == yes ]]; then
-            ssh_cn_entry "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_ROLLBACK_SERVICES_CLAIMED}' '${install_claim}'" || true
+            ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_ROLLBACK_SERVICES}" mutating 'Agent 回滚阶段' \
+                "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_ROLLBACK_SERVICES_CLAIMED}' '${install_claim}'" || true
         fi
         if [[ ${exit_prepared} == yes ]] && ! run_exit_role "${EXIT_CMD_ROLLBACK}"; then exit_stopped=no; fi
         if [[ ${cn_entry_prepared} == yes && ${exit_stopped} == yes ]]; then
-            if ! ssh_cn_entry "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_ROLLBACK_FINALIZE_CLAIMED}' '${install_claim}'"; then
+            if ! ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_ROLLBACK_FINALIZE}" mutating '最终回滚阶段' \
+                "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_ROLLBACK_FINALIZE_CLAIMED}' '${install_claim}'"; then
                 printf '[Po0 解锁助手] 国内入口最终清理未完成；请修正提示的问题后重新运行本助手并选择完整回滚。\n' >&2
             fi
         elif [[ ${cn_entry_prepared} == yes ]]; then
@@ -5517,11 +5584,13 @@ install_core() {
     [[ -n ${public_key_b64} ]] || die '未取得国外出口隧道公钥。'
 
     log '准备国内入口受限隧道账户。'
-    if ssh_cn_entry "'${CN_ENTRY_REMOTE}' prepare '${public_key_b64}' '${install_claim}'"; then
+    if ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_PREPARE}" mutating '安装准备' \
+        "'${CN_ENTRY_REMOTE}' prepare '${public_key_b64}' '${install_claim}'"; then
         cn_entry_prepared=yes
     else
         prepare_rc=$?
-        if ssh_cn_entry "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_CLAIM_STATUS}' '${install_claim}'" \
+        if ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_CLAIM_STATUS}" read-only '安装事务确认' \
+            "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_CLAIM_STATUS}' '${install_claim}'" \
             >/dev/null 2>&1; then
             cn_entry_prepared=yes
         fi
@@ -5534,7 +5603,8 @@ install_core() {
     run_exit_role start "${host_fingerprint}" "${CN_ENTRY_PRIVATE_IP}" "${CN_ENTRY_SSH_PORT}" "${EXIT_PRIVATE_IP}"
 
     log '验证出口并启用国内入口 APT 与登录 shell 代理。'
-    ssh_cn_entry "'${CN_ENTRY_REMOTE}' finalize '${CN_ENTRY_PRIVATE_IP}' '${EXIT_PRIVATE_IP}'"
+    ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_FINALIZE}" mutating '安装收尾' \
+        "'${CN_ENTRY_REMOTE}' finalize '${CN_ENTRY_PRIVATE_IP}' '${EXIT_PRIVATE_IP}'"
     ssh_cn_entry 'apt-get update'
 
     trap - ERR
@@ -5571,7 +5641,8 @@ status_all_loaded() (
     esac
     printf '%s\n' "[连接路径] 国外出口 ${EXIT_PRIVATE_IP} -> 国内入口 ${CN_ENTRY_PRIVATE_IP}:${CN_ENTRY_SSH_PORT}"
     printf '%s\n' '===== 国内入口 ====='
-    ssh_cn_entry "'${status_remote}' '${CN_ENTRY_CMD_STATUS}'"
+    ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_STATUS}" read-only '状态检查' \
+        "'${status_remote}' '${CN_ENTRY_CMD_STATUS}'"
     printf '%s\n' '===== 国外出口 ====='
     run_exit_role "${EXIT_CMD_STATUS}"
 )
@@ -5623,7 +5694,8 @@ health_check_loaded() (
         select_current_cn_entry_role health_remote health_remote_temporary
         printf '    [完成] 检查准备：耗时 %d 秒\n' "$((SECONDS - phase_started))"
         phase_started=${SECONDS}
-        if ssh_cn_entry "'${health_remote}' '${CN_ENTRY_CMD_HEALTH}'"; then
+        if ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_HEALTH}" read-only '健康检查' \
+            "'${health_remote}' '${CN_ENTRY_CMD_HEALTH}'"; then
             cn_rc=0
         else
             cn_rc=$?
@@ -6083,7 +6155,8 @@ reconfigure_core() {
 
     phase_started=${SECONDS}
     log '阶段 3/4：验证代理出口并刷新托管 Agent。'
-    ssh_cn_entry "'${CN_ENTRY_REMOTE}' refresh '${CN_ENTRY_PRIVATE_IP}' '${EXIT_PRIVATE_IP}'"
+    ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_REFRESH}" mutating '代理与 Agent 刷新' \
+        "'${CN_ENTRY_REMOTE}' refresh '${CN_ENTRY_PRIVATE_IP}' '${EXIT_PRIVATE_IP}'"
     log "阶段 3/4 完成（耗时 $((SECONDS - phase_started)) 秒）。"
 
     phase_started=${SECONDS}
@@ -7249,7 +7322,8 @@ rollback_all() {
     case "${cn_entry_state}" in ACTIVE|NONE) ;; *) die '国内入口返回了无法识别的回滚状态。' ;; esac
 
     if [[ ${cn_entry_state} == ACTIVE ]]; then
-        ssh_cn_entry "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_ROLLBACK_SERVICES}'"
+        ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_ROLLBACK_SERVICES}" mutating 'Agent 回滚阶段' \
+            "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_ROLLBACK_SERVICES}'"
     else
         log '国内入口已无 ACTIVE 状态，跳过 Agent 回滚阶段。'
     fi
@@ -7259,7 +7333,8 @@ rollback_all() {
         log '国外出口已无 ACTIVE 状态，跳过国外出口隧道回滚并继续完成国内入口清理。'
     fi
     if [[ ${cn_entry_state} == ACTIVE ]]; then
-        ssh_cn_entry "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_ROLLBACK_FINALIZE}'"
+        ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_ROLLBACK_FINALIZE}" mutating '最终回滚阶段' \
+            "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_ROLLBACK_FINALIZE}'"
     fi
     ssh_cn_entry "rm -f '${CN_ENTRY_REMOTE}'"
     log '两端均已回滚。备份状态目录仍保留。'
