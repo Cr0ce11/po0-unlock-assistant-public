@@ -105,15 +105,21 @@ fi
 # 控制目录被删除、操作锁被提前释放。
 PO0_EXIT_TRAP_OWNER=
 
+# 结果写进全局变量而不是打印出来：$( ) 命令替换本身就是子 shell，
+# 在 bash 4 以上取到的 BASHPID 与 BASH_SUBSHELL 是替换子 shell 的值，
+# 两次调用永远对不上，归属判断会失效。
+PO0_EXIT_TRAP_SCOPE=
+
 po0_exit_trap_scope() {
-    printf '%s.%s' "${BASHPID:-$$}" "${BASH_SUBSHELL}"
+    PO0_EXIT_TRAP_SCOPE="${BASHPID:-$$}.${BASH_SUBSHELL}"
 }
 
 po0_claim_exit_trap() {
+    po0_exit_trap_scope
     # 该变量只被单文件构建器注入的 install_runtime_exit_trap 读取，
     # 静态分析在 setup.sh 内看不到使用点。
     # shellcheck disable=SC2034
-    PO0_EXIT_TRAP_OWNER=$(po0_exit_trap_scope)
+    PO0_EXIT_TRAP_OWNER=${PO0_EXIT_TRAP_SCOPE}
 }
 
 log() { printf '%s[Po0 解锁助手]%s %s\n' "${C_GREEN}" "${C_RESET}" "$*"; }
@@ -165,8 +171,9 @@ install_runtime_exit_trap() {
     # bash 在 ( ) 子 shell 里会用 trap -p 显示父 shell 的陷阱，但它在子 shell 内并不生效。
     # 只有归属标记与当前 shell 层级一致时，才说明这确实是本层自己装的陷阱、可以串接；
     # 否则串接会让外层清理在子 shell 退出时提前执行（关闭 SSH 主连接、释放操作锁）。
+    po0_exit_trap_scope
     if [[ -z ${existing} ]] \
-        || [[ ${PO0_EXIT_TRAP_OWNER:-} != "$(po0_exit_trap_scope)" ]]; then
+        || [[ ${PO0_EXIT_TRAP_OWNER:-} != "${PO0_EXIT_TRAP_SCOPE}" ]]; then
         trap runtime_exit_cleanup EXIT
         trap 'exit 130' INT
         trap 'exit 143' TERM
