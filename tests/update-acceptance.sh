@@ -323,6 +323,47 @@ test_build_and_bundle_self_test() {
     assert_eq "${first_hash}" "${second_hash}" '相同源码和版本未能确定性构建'
 }
 
+# 释放内置组件不得覆盖调用方已经装好的 EXIT 陷阱：安装、回滚、重配置和远端操作
+# 都靠各自的 EXIT 陷阱回滚事务、清理 SSH 控制会话，被覆盖后这些清理不会执行。
+test_materialize_roles_preserves_caller_exit_trap() {
+    local tree=${WORK_ROOT}/trap-tree lib=${WORK_ROOT}/bundle-library.sh
+    local driver=${WORK_ROOT}/trap-driver.sh marker=${WORK_ROOT}/outer-trap.marker
+    local dirfile=${WORK_ROOT}/runtime-dir.path rc=0 runtime_dir
+    mkdir -p "${tree}/tools" "${tree}/src/cn-entry-role"
+    cp "${PROJECT_DIR}/setup.sh" "${PROJECT_DIR}/overseas-exit-role.sh" \
+        "${PROJECT_DIR}/cn-entry-role.sh" "${tree}/"
+    cp "${BUILD_SOURCE}" "${CN_ENTRY_BUILD_SOURCE}" "${tree}/tools/"
+    cp "${PROJECT_DIR}"/src/cn-entry-role/*.sh.inc "${tree}/src/cn-entry-role/"
+    /bin/bash "${tree}/tools/build-single-file.sh" 1.1.0 >/dev/null
+    awk '/^ASSUME_YES=no$/ { exit } { print }' "${tree}/po0-unlock.sh" >"${lib}"
+    /bin/bash -n "${lib}"
+
+    {
+        printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' 'SCRIPT_VERSION=1.1.0'
+        printf '%s\n' 'library=$1' 'marker=$2' 'dirfile=$3'
+        printf '%s\n' '# shellcheck disable=SC1090' 'source "${library}"'
+        printf '%s\n' 'cleanup_outer() {' '    local rc=$?' \
+            '    printf "outer-ran rc=%s\n" "${rc}" >>"${marker}"' '    exit "${rc}"' '}'
+        printf '%s\n' 'trap cleanup_outer EXIT' 'materialize_roles' \
+            'printf "%s\n" "${RUNTIME_DIR}" >"${dirfile}"' 'exit 7'
+    } >"${driver}"
+    : >"${marker}"
+    set +e
+    /bin/bash "${driver}" "${lib}" "${marker}" "${dirfile}" >/dev/null 2>&1
+    rc=$?
+    set -e
+
+    assert_eq 7 "${rc}" '释放内置组件后退出码没有原样传出' || return 1
+    grep -Fq 'outer-ran rc=7' "${marker}" \
+        || fail '释放内置组件覆盖了调用方的 EXIT 陷阱，外层清理没有执行'
+    runtime_dir=$(<"${dirfile}")
+    [[ -n ${runtime_dir} ]] || fail '未能取得内置组件临时目录'
+    if [[ -e ${runtime_dir} ]]; then
+        rm -rf -- "${runtime_dir}"
+        fail '串接外层陷阱后没有清理内置组件临时目录'
+    fi
+}
+
 test_single_public_edition_contract() {
     local source edition_count marker_count obsolete
     source=$(sed -n '1,$p' "${SETUP_SOURCE}")
@@ -2970,6 +3011,7 @@ main() {
         || { printf '%s\n' '找不到项目源码。' >&2; exit 1; }
     make_library
     run_test '构建、自检与确定性' test_build_and_bundle_self_test
+    run_test '释放内置组件不覆盖调用方的 EXIT 陷阱' test_materialize_roles_preserves_caller_exit_trap
     run_test '仓库只保留唯一公开版' test_single_public_edition_contract
     run_test '用户可见产物品牌禁词' test_user_visible_branding_terms
     run_test '活动源码不含 v1 旧运行名称' test_legacy_runtime_identifiers_absent

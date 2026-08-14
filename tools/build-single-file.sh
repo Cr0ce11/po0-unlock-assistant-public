@@ -78,6 +78,38 @@ runtime_exit_cleanup() {
     exit "${rc}"
 }
 
+# 当前 shell 已经装了 EXIT 陷阱时，不能直接覆盖：安装、回滚、重配置和各类远端
+# 操作都靠自己的 EXIT 陷阱回滚事务与清理 SSH 控制会话。改为串接：先清理内置组件，
+# 再把退出码还原成原值并调用原处理函数。
+runtime_chain_exit_cleanup() {
+    local rc=$? handler=$1
+    cleanup_runtime "${rc}" || true
+    ( exit "${rc}" )
+    "${handler}"
+    exit "${rc}"
+}
+
+install_runtime_exit_trap() {
+    local existing handler
+    existing=$(trap -p EXIT)
+    if [[ -z ${existing} ]]; then
+        trap runtime_exit_cleanup EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        trap 'exit 129' HUP
+        return 0
+    fi
+    handler=${existing#trap -- \'}
+    handler=${handler%\' EXIT}
+    if [[ ${handler} =~ ^[a-z_][a-z0-9_]*$ ]] && declare -F "${handler}" >/dev/null; then
+        trap "runtime_chain_exit_cleanup ${handler}" EXIT
+        return 0
+    fi
+    # 无法安全串接时保留外层陷阱：宁可留下临时目录，也不能让事务回滚失效。
+    printf '警告：已有退出处理无法安全串接，内置组件临时目录将保留：%s\n' \
+        "${RUNTIME_DIR:-未知}" >&2
+}
+
 materialize_roles() {
     local exit_new cn_entry_new exit_actual cn_entry_actual
     if [[ -n ${RUNTIME_DIR:-} && -r ${EXIT_ROLE:-} && -r ${CN_ENTRY_ROLE_LOCAL:-} ]]; then
@@ -91,10 +123,7 @@ materialize_roles() {
     CN_ENTRY_ROLE_LOCAL=${RUNTIME_DIR}/cn-entry-role.sh
     exit_new=${EXIT_ROLE}.new
     cn_entry_new=${CN_ENTRY_ROLE_LOCAL}.new
-    trap runtime_exit_cleanup EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    trap 'exit 129' HUP
+    install_runtime_exit_trap
 
     cat >"${exit_new}" <<'__PO0_OVERSEAS_EXIT_ROLE_783424F8_PAYLOAD__'
 RUNTIME_HEAD
