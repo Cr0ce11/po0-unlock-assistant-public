@@ -279,7 +279,8 @@ test_report_generation_flow() (
     cleanup() { rm -rf -- "${sandbox}"; }
     trap cleanup EXIT
 
-    for function_name in sanitize_diagnostic_stream diagnostic_report; do
+    # diagnostic_report 现在会先声明 EXIT 陷阱归属，夹具需要一并提取该辅助函数。
+    for function_name in po0_exit_trap_scope po0_claim_exit_trap sanitize_diagnostic_stream diagnostic_report; do
         if [[ ${function_name} == diagnostic_report ]]; then
             function_body=$(sed -n '/^diagnostic_report() (/,/^)/p' "${SETUP_SOURCE}")
         else

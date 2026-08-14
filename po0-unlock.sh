@@ -99,6 +99,23 @@ else
     C_BLUE= C_GREEN= C_YELLOW= C_RESET=
 fi
 
+# bash 在 ( ) 子 shell 里会用 trap -p 显示父 shell 的 EXIT 陷阱，但该陷阱在子 shell
+# 内并不生效。没有这个标记就无法区分「本层自己装的陷阱」和「继承显示出来的陷阱」，
+# 误把后者当成前者串接，会让外层清理在子 shell 退出时提前执行：SSH 主连接被关闭、
+# 控制目录被删除、操作锁被提前释放。
+PO0_EXIT_TRAP_OWNER=
+
+po0_exit_trap_scope() {
+    printf '%s.%s' "${BASHPID:-$$}" "${BASH_SUBSHELL}"
+}
+
+po0_claim_exit_trap() {
+    # 该变量只被单文件构建器注入的 install_runtime_exit_trap 读取，
+    # 静态分析在 setup.sh 内看不到使用点。
+    # shellcheck disable=SC2034
+    PO0_EXIT_TRAP_OWNER=$(po0_exit_trap_scope)
+}
+
 log() { printf '%s[Po0 解锁助手]%s %s\n' "${C_GREEN}" "${C_RESET}" "$*"; }
 die() { printf '[Po0 解锁助手] 错误：%s\n' "$*" >&2; exit 1; }
 is_root() { [[ ${EUID} -eq 0 ]]; }
@@ -145,7 +162,11 @@ runtime_chain_exit_cleanup() {
 install_runtime_exit_trap() {
     local existing handler
     existing=$(trap -p EXIT)
-    if [[ -z ${existing} ]]; then
+    # bash 在 ( ) 子 shell 里会用 trap -p 显示父 shell 的陷阱，但它在子 shell 内并不生效。
+    # 只有归属标记与当前 shell 层级一致时，才说明这确实是本层自己装的陷阱、可以串接；
+    # 否则串接会让外层清理在子 shell 退出时提前执行（关闭 SSH 主连接、释放操作锁）。
+    if [[ -z ${existing} ]] \
+        || [[ ${PO0_EXIT_TRAP_OWNER:-} != "$(po0_exit_trap_scope)" ]]; then
         trap runtime_exit_cleanup EXIT
         trap 'exit 130' INT
         trap 'exit 143' TERM
@@ -5059,6 +5080,7 @@ cleanup_cn_entry_operation() {
 run_cn_entry_operation() (
     CN_ENTRY_CONTROL_DIR=
     CN_ENTRY_CONTROL_PATH=
+    po0_claim_exit_trap
     trap cleanup_cn_entry_operation EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -5226,6 +5248,7 @@ ensure_admin_key() (
             || rm -f -- "${ADMIN_KEY_PUBLIC_CANDIDATE}"
         exit "${rc}"
     }
+    po0_claim_exit_trap
     trap cleanup_admin_key_candidate EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -5766,6 +5789,7 @@ status_all_loaded() (
             printf '警告：拒绝清理异常临时状态组件路径：%s\n' "${status_remote}" >&2
         fi
     }
+    po0_claim_exit_trap
     trap cleanup_status_remote EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -5805,6 +5829,7 @@ health_check_loaded() (
             printf '警告：拒绝清理异常临时健康检查路径：%s\n' "${health_remote}" >&2
         fi
     }
+    po0_claim_exit_trap
     trap cleanup_health_remote EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -6114,6 +6139,7 @@ diagnostic_report() (
     cleanup_diagnostic() {
         rm -f -- "${raw_file:-}" "${report_tmp:-}"
     }
+    po0_claim_exit_trap
     trap cleanup_diagnostic EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -6216,6 +6242,7 @@ scan_agent_services_inner() (
             printf '警告：拒绝清理异常临时扫描路径：%s\n' "${scan_remote}" >&2
         fi
     }
+    po0_claim_exit_trap
     trap cleanup_scan_remote EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -6245,6 +6272,7 @@ temporary='${scan_remote_temporary}'
 cleanup() {
     if test \"\${temporary}\" = yes; then rm -f -- \"\${tmp}\"; fi
 }
+po0_claim_exit_trap
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -6370,6 +6398,7 @@ guided_reconfigure() (
     show_connection_summary '更新现有隧道' no
     confirm_yes '确认按以上信息更新现有隧道吗？'
     begin_reconfigure_config_transaction
+    po0_claim_exit_trap
     trap cleanup_reconfigure_config_transaction EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -6645,6 +6674,7 @@ perform_uploaded_local_upgrade() (
         fi
         exit "${rc}"
     }
+    po0_claim_exit_trap
     trap cleanup_local_upgrade EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -7259,6 +7289,7 @@ perform_script_update() (
         esac
         exit "${rc}"
     }
+    po0_claim_exit_trap
     trap cleanup_update_transaction EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -7381,6 +7412,7 @@ perform_script_restore() (
         esac
         exit "${rc}"
     }
+    po0_claim_exit_trap
     trap cleanup_restore_transaction EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
