@@ -8,9 +8,7 @@ write_proxy_files() (
     local no_proxy config_tmp= profile_tmp=
     valid_ipv4 "${cn_entry_private_ip}" || die '国内入口连接 IPv4 地址格式无效。'
     valid_ipv4 "${exit_private_ip}" || die '国外出口源 IPv4 地址格式无效。'
-    command -v flock >/dev/null || die '系统缺少 flock，无法安全写入代理配置。'
-    exec 9>"${state}/service-proxy.lock"
-    flock -x 9
+    acquire_state_mutation_lock "${state}" '代理配置写入'
     confirm_state_open "${state}" || die '安装状态正在关闭或已经变化，拒绝写入代理配置。'
 
     cleanup_proxy_candidates() {

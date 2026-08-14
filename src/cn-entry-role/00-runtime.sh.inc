@@ -15,10 +15,24 @@ PROFILE_CONF=/etc/profile.d/90-po0-unlock-proxy.sh
 HELPER=/usr/local/bin/po0-cn-entry
 HTTP_PROXY_URL=http://127.0.0.1:13128
 SOCKS_PROXY_URL=socks5h://127.0.0.1:19080
+CN_ENTRY_LOCK_WAIT_SECONDS=30
 
 log() { printf '[国内入口] %s\n' "$*"; }
 die() { printf '[国内入口] 错误：%s\n' "$*" >&2; exit 1; }
 require_root() { [[ ${EUID} -eq 0 ]] || die '必须使用 root 运行。'; }
+
+acquire_state_mutation_lock() {
+    local state=$1 purpose=${2:-配置操作}
+    [[ ${CN_ENTRY_LOCK_WAIT_SECONDS} =~ ^[1-9][0-9]*$ ]] \
+        || die '国内入口写锁等待上限无效。'
+    command -v flock >/dev/null \
+        || die '系统缺少 flock，无法安全修改配置。'
+    exec 9>"${state}/service-proxy.lock" \
+        || die "无法打开国内入口写锁，已停止${purpose}。"
+    if ! flock -w "${CN_ENTRY_LOCK_WAIT_SECONDS}" 9; then
+        die "另一个国内入口配置操作持续占用写锁；等待 ${CN_ENTRY_LOCK_WAIT_SECONDS} 秒后已停止${purpose}，不会在无锁状态下继续修改。若这是完整回滚，请在写锁释放后重新运行完整回滚。"
+    fi
+}
 
 valid_ipv4() {
     local ip=$1 part

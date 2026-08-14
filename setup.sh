@@ -45,6 +45,16 @@ CN_ENTRY_CMD_ROLLBACK_SERVICES_CLAIMED=rollback-services-claimed
 CN_ENTRY_CMD_ROLLBACK_FINALIZE_CLAIMED=rollback-finalize-claimed
 CN_ENTRY_ACTIVE_FILE=/var/lib/po0-unlock/ACTIVE
 CN_ENTRY_OCCUPIED_RC=73
+# 单次组件调用按工作量设置独立上限：轻量只读检查 15–30 秒，包含网络
+# 检查的健康检查 90 秒，单次配置阶段 120 秒，可能逐项重启 Agent 的阶段 300 秒。
+CN_ENTRY_TIMEOUT_CLAIM_STATUS=15
+CN_ENTRY_TIMEOUT_STATUS=30
+CN_ENTRY_TIMEOUT_HEALTH=90
+CN_ENTRY_TIMEOUT_PREPARE=120
+CN_ENTRY_TIMEOUT_FINALIZE=120
+CN_ENTRY_TIMEOUT_REFRESH=300
+CN_ENTRY_TIMEOUT_ROLLBACK_SERVICES=300
+CN_ENTRY_TIMEOUT_ROLLBACK_FINALIZE=120
 EXIT_CMD_STATUS=status
 EXIT_CMD_HEALTH=health
 EXIT_CMD_REPAIR=repair
@@ -645,14 +655,68 @@ start_cn_entry_session() {
     return 255
 }
 
-ssh_cn_entry() {
+ssh_cn_entry_command() {
+    local timeout_seconds=$1
+    shift
     start_cn_entry_session || return $?
-    ssh -S "${CN_ENTRY_CONTROL_PATH}" -o ControlMaster=no \
+    if (( timeout_seconds == 0 )); then
+        ssh -S "${CN_ENTRY_CONTROL_PATH}" -o ControlMaster=no \
+            -o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes \
+            -o BindAddress="${EXIT_PRIVATE_IP}" -i "${ADMIN_KEY}" \
+            -o GlobalKnownHostsFile=/dev/null \
+            -o UserKnownHostsFile="${ADMIN_KNOWN_HOSTS}" -o StrictHostKeyChecking=yes \
+            -p "${CN_ENTRY_SSH_PORT}" "${CN_ENTRY_TARGET}" "$@"
+        return
+    fi
+    timeout --foreground --kill-after=5s "${timeout_seconds}s" ssh \
+        -S "${CN_ENTRY_CONTROL_PATH}" -o ControlMaster=no \
         -o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes \
         -o BindAddress="${EXIT_PRIVATE_IP}" -i "${ADMIN_KEY}" \
         -o GlobalKnownHostsFile=/dev/null \
         -o UserKnownHostsFile="${ADMIN_KNOWN_HOSTS}" -o StrictHostKeyChecking=yes \
         -p "${CN_ENTRY_SSH_PORT}" "${CN_ENTRY_TARGET}" "$@"
+}
+
+ssh_cn_entry() {
+    ssh_cn_entry_command 0 "$@"
+}
+
+ssh_cn_entry_component() {
+    local timeout_seconds=${1:-} risk=${2:-} label=${3:-} rc
+    shift 3 || {
+        printf '%s\n' '[Po0 解锁助手] 错误：国内入口组件调用参数不完整。' >&2
+        return 2
+    }
+    [[ ${timeout_seconds} =~ ^[1-9][0-9]*$ && -n ${label} && $# -gt 0 ]] || {
+        printf '%s\n' '[Po0 解锁助手] 错误：国内入口组件调用参数无效。' >&2
+        return 2
+    }
+    case "${risk}" in
+        read-only|mutating) ;;
+        *)
+            printf '%s\n' '[Po0 解锁助手] 错误：国内入口组件调用风险类型无效。' >&2
+            return 2
+            ;;
+    esac
+    command -v timeout >/dev/null 2>&1 || {
+        printf '%s\n' '[Po0 解锁助手] 错误：国外出口缺少 timeout，拒绝执行无界国内入口组件调用。' >&2
+        return 127
+    }
+    if ssh_cn_entry_command "${timeout_seconds}" "$@"; then
+        return 0
+    else
+        rc=$?
+    fi
+    if (( rc == 124 || rc == 137 )); then
+        if [[ ${risk} == read-only ]]; then
+            printf '[Po0 解锁助手] 错误：国内入口%s超过 %s 秒；本次只读组件调用未修改国内入口。\n' \
+                "${label}" "${timeout_seconds}" >&2
+        else
+            printf '[Po0 解锁助手] 错误：国内入口%s超过 %s 秒；该命令可能已部分修改国内入口，请运行完整回滚，确认两端状态后再重试。\n' \
+                "${label}" "${timeout_seconds}" >&2
+        fi
+    fi
+    return "${rc}"
 }
 
 ssh_cn_entry_tty() {
@@ -1373,11 +1437,13 @@ install_core() {
         trap - ERR
         printf '[Po0 解锁助手] 安装中断，开始回滚已经完成的阶段。\n' >&2
         if [[ ${cn_entry_prepared} == yes ]]; then
-            ssh_cn_entry "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_ROLLBACK_SERVICES_CLAIMED}' '${install_claim}'" || true
+            ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_ROLLBACK_SERVICES}" mutating 'Agent 回滚阶段' \
+                "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_ROLLBACK_SERVICES_CLAIMED}' '${install_claim}'" || true
         fi
         if [[ ${exit_prepared} == yes ]] && ! run_exit_role "${EXIT_CMD_ROLLBACK}"; then exit_stopped=no; fi
         if [[ ${cn_entry_prepared} == yes && ${exit_stopped} == yes ]]; then
-            if ! ssh_cn_entry "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_ROLLBACK_FINALIZE_CLAIMED}' '${install_claim}'"; then
+            if ! ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_ROLLBACK_FINALIZE}" mutating '最终回滚阶段' \
+                "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_ROLLBACK_FINALIZE_CLAIMED}' '${install_claim}'"; then
                 printf '[Po0 解锁助手] 国内入口最终清理未完成；请修正提示的问题后重新运行本助手并选择完整回滚。\n' >&2
             fi
         elif [[ ${cn_entry_prepared} == yes ]]; then
@@ -1394,11 +1460,13 @@ install_core() {
     [[ -n ${public_key_b64} ]] || die '未取得国外出口隧道公钥。'
 
     log '准备国内入口受限隧道账户。'
-    if ssh_cn_entry "'${CN_ENTRY_REMOTE}' prepare '${public_key_b64}' '${install_claim}'"; then
+    if ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_PREPARE}" mutating '安装准备' \
+        "'${CN_ENTRY_REMOTE}' prepare '${public_key_b64}' '${install_claim}'"; then
         cn_entry_prepared=yes
     else
         prepare_rc=$?
-        if ssh_cn_entry "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_CLAIM_STATUS}' '${install_claim}'" \
+        if ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_CLAIM_STATUS}" read-only '安装事务确认' \
+            "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_CLAIM_STATUS}' '${install_claim}'" \
             >/dev/null 2>&1; then
             cn_entry_prepared=yes
         fi
@@ -1411,7 +1479,8 @@ install_core() {
     run_exit_role start "${host_fingerprint}" "${CN_ENTRY_PRIVATE_IP}" "${CN_ENTRY_SSH_PORT}" "${EXIT_PRIVATE_IP}"
 
     log '验证出口并启用国内入口 APT 与登录 shell 代理。'
-    ssh_cn_entry "'${CN_ENTRY_REMOTE}' finalize '${CN_ENTRY_PRIVATE_IP}' '${EXIT_PRIVATE_IP}'"
+    ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_FINALIZE}" mutating '安装收尾' \
+        "'${CN_ENTRY_REMOTE}' finalize '${CN_ENTRY_PRIVATE_IP}' '${EXIT_PRIVATE_IP}'"
     ssh_cn_entry 'apt-get update'
 
     trap - ERR
@@ -1448,7 +1517,8 @@ status_all_loaded() (
     esac
     printf '%s\n' "[连接路径] 国外出口 ${EXIT_PRIVATE_IP} -> 国内入口 ${CN_ENTRY_PRIVATE_IP}:${CN_ENTRY_SSH_PORT}"
     printf '%s\n' '===== 国内入口 ====='
-    ssh_cn_entry "'${status_remote}' '${CN_ENTRY_CMD_STATUS}'"
+    ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_STATUS}" read-only '状态检查' \
+        "'${status_remote}' '${CN_ENTRY_CMD_STATUS}'"
     printf '%s\n' '===== 国外出口 ====='
     run_exit_role "${EXIT_CMD_STATUS}"
 )
@@ -1500,7 +1570,8 @@ health_check_loaded() (
         select_current_cn_entry_role health_remote health_remote_temporary
         printf '    [完成] 检查准备：耗时 %d 秒\n' "$((SECONDS - phase_started))"
         phase_started=${SECONDS}
-        if ssh_cn_entry "'${health_remote}' '${CN_ENTRY_CMD_HEALTH}'"; then
+        if ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_HEALTH}" read-only '健康检查' \
+            "'${health_remote}' '${CN_ENTRY_CMD_HEALTH}'"; then
             cn_rc=0
         else
             cn_rc=$?
@@ -1958,7 +2029,8 @@ reconfigure_core() {
 
     phase_started=${SECONDS}
     log '阶段 3/4：验证代理出口并刷新托管 Agent。'
-    ssh_cn_entry "'${CN_ENTRY_REMOTE}' refresh '${CN_ENTRY_PRIVATE_IP}' '${EXIT_PRIVATE_IP}'"
+    ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_REFRESH}" mutating '代理与 Agent 刷新' \
+        "'${CN_ENTRY_REMOTE}' refresh '${CN_ENTRY_PRIVATE_IP}' '${EXIT_PRIVATE_IP}'"
     log "阶段 3/4 完成（耗时 $((SECONDS - phase_started)) 秒）。"
 
     phase_started=${SECONDS}
@@ -3124,7 +3196,8 @@ rollback_all() {
     case "${cn_entry_state}" in ACTIVE|NONE) ;; *) die '国内入口返回了无法识别的回滚状态。' ;; esac
 
     if [[ ${cn_entry_state} == ACTIVE ]]; then
-        ssh_cn_entry "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_ROLLBACK_SERVICES}'"
+        ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_ROLLBACK_SERVICES}" mutating 'Agent 回滚阶段' \
+            "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_ROLLBACK_SERVICES}'"
     else
         log '国内入口已无 ACTIVE 状态，跳过 Agent 回滚阶段。'
     fi
@@ -3134,7 +3207,8 @@ rollback_all() {
         log '国外出口已无 ACTIVE 状态，跳过国外出口隧道回滚并继续完成国内入口清理。'
     fi
     if [[ ${cn_entry_state} == ACTIVE ]]; then
-        ssh_cn_entry "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_ROLLBACK_FINALIZE}'"
+        ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_ROLLBACK_FINALIZE}" mutating '最终回滚阶段' \
+            "'${CN_ENTRY_REMOTE}' '${CN_ENTRY_CMD_ROLLBACK_FINALIZE}'"
     fi
     ssh_cn_entry "rm -f '${CN_ENTRY_REMOTE}'"
     log '两端均已回滚。备份状态目录仍保留。'

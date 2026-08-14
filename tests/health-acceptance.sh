@@ -54,7 +54,8 @@ test_read_only_check_contract() {
         '界面没有明确说明只读边界' || return 1
     assert_contains "${setup_body}" 'run_exit_role "${EXIT_CMD_HEALTH}"' \
         '没有检查国外出口' || return 1
-    assert_contains "${setup_body}" "ssh_cn_entry \"'\${health_remote}' '\${CN_ENTRY_CMD_HEALTH}'\"" \
+    assert_contains "${setup_body}" \
+        "ssh_cn_entry_component \"\${CN_ENTRY_TIMEOUT_HEALTH}\" read-only '健康检查'" \
         '没有使用当前内嵌组件检查国内入口' || return 1
     for body in "${exit_body}" "${cn_body}"; do
         assert_not_contains "${body}" 'systemctl restart' '只读检查会重启服务' || return 1

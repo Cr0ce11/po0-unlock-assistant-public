@@ -185,9 +185,7 @@ rollback_services() {
     [[ ! -L ${closing} ]] || die '安装状态的 closing 标记异常，完整回滚已暂停。'
     if [[ -e ${closing} ]]; then
         [[ -f ${closing} ]] || die '安装状态的 closing 标记不是普通文件。'
-        command -v flock >/dev/null || die '系统缺少 flock，无法安全继续回滚。'
-        exec 9>"${state}/service-proxy.lock"
-        flock -x 9
+        acquire_state_mutation_lock "${state}" 'Agent 回滚状态复核'
         [[ -r ${ACTIVE_FILE} ]] || die 'ACTIVE 状态已经变化，完整回滚已暂停。'
         current_state=$(<"${ACTIVE_FILE}")
         [[ ${current_state} == "${state}" ]] || die 'ACTIVE 状态已经切换，完整回滚已暂停。'
@@ -213,9 +211,7 @@ rollback_services() {
         (( failures == 0 )) \
             || die "仍有 ${failures} 个托管服务未安全回滚；核心隧道与 ACTIVE 状态已保留。"
     fi
-    command -v flock >/dev/null || die '系统缺少 flock，无法安全封存回滚状态。'
-    exec 9>"${state}/service-proxy.lock"
-    flock -x 9
+    acquire_state_mutation_lock "${state}" 'Agent 回滚状态封存'
     [[ -r ${ACTIVE_FILE} ]] || die 'ACTIVE 状态已经变化，完整回滚已暂停。'
     current_state=$(<"${ACTIVE_FILE}")
     [[ ${current_state} == "${state}" ]] || die 'ACTIVE 状态已经切换，完整回滚已暂停。'
@@ -259,9 +255,7 @@ rollback_finalize() {
     local tunnel_uid= home_owner uid_recorded=
     require_root
     state=$(active_state)
-    command -v flock >/dev/null || die '系统缺少 flock，无法安全完成回滚。'
-    exec 9>"${state}/service-proxy.lock"
-    flock -x 9
+    acquire_state_mutation_lock "${state}" '最终回滚清理'
     [[ -r ${ACTIVE_FILE} ]] || die 'ACTIVE 状态已经变化，拒绝继续最终清理。'
     current_state=$(<"${ACTIVE_FILE}")
     [[ ${current_state} == "${state}" ]] || die 'ACTIVE 状态已经切换，拒绝继续最终清理。'

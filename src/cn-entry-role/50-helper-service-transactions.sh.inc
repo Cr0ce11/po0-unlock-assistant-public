@@ -168,10 +168,7 @@ managed_dropin_owned() {
 
 acquire_service_lock() {
     local state=$1
-    command -v flock >/dev/null \
-        || { echo '系统缺少 flock，无法安全修改服务配置。' >&2; return 1; }
-    exec 9>"${state}/service-proxy.lock"
-    flock -x 9
+    acquire_state_mutation_lock "${state}" '服务配置操作'
 }
 
 confirm_helper_state_open() {
