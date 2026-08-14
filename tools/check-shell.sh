@@ -5,12 +5,6 @@ TOOLS_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_DIR=${TOOLS_DIR%/tools}
 cd -- "${PROJECT_DIR}"
 
-command -v shellcheck >/dev/null 2>&1 \
-    || { printf '%s\n' '缺少 shellcheck，无法执行 Shell 静态检查。' >&2; exit 1; }
-shellcheck_version=$(shellcheck --version | sed -n 's/^version: //p')
-[[ ${shellcheck_version} == 0.11.0 ]] \
-    || { printf 'ShellCheck 版本必须是 0.11.0，当前是：%s\n' "${shellcheck_version:-未知}" >&2; exit 1; }
-
 # 生产脚本与工具。两个构建产物都在其中：po0-unlock.sh 由构建器注入约 110 行
 # 运行时代码，此前从未进入静态检查（heredoc 内的代码 ShellCheck 只当数据）。
 production=(
@@ -44,6 +38,12 @@ if [[ ${1:-} == --list ]]; then
     printf '%s\n' "${production[@]}" "${static_fixtures[@]}" "${dynamic_fixtures[@]}" | sort
     exit 0
 fi
+
+command -v shellcheck >/dev/null 2>&1 \
+    || { printf '%s\n' '缺少 shellcheck，无法执行 Shell 静态检查。' >&2; exit 1; }
+shellcheck_version=$(shellcheck --version | sed -n 's/^version: //p')
+[[ ${shellcheck_version} == 0.11.0 ]] \
+    || { printf 'ShellCheck 版本必须是 0.11.0，当前是：%s\n' "${shellcheck_version:-未知}" >&2; exit 1; }
 
 # SC1007：项目有意使用 `local name=` 对局部变量做空值初始化。
 # SC2100：带连字符的入口命令常量会被误判为算术表达式。
