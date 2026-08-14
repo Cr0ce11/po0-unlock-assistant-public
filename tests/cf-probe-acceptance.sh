@@ -579,6 +579,48 @@ FAKE_CURL
 # cf-probe 的测速目标改写发生在 drop-in 落盘之前（TX_DROPIN_MAY_EXIST 置位更晚）。
 # 补偿动作若嵌在该标志的判断里，窗口内失败就会整块跳过：目标已被改写却未进托管清单，
 # go-pending 与兼容目录残留，健康检查看不到，停用也会以「不在托管清单」拒绝清理。
+# 归属校验此前只查属主和硬链接数，不查权限位：包装脚本被放宽成人人可写后
+# 仍会被判为「属于本助手」，而它们会被注入服务 PATH 的最前面。
+test_cf_probe_compat_ownership_checks_mode() (
+    local case_dir compat nc_content rc
+    case_dir=$(mktemp -d "${TMPDIR:-/tmp}/po0-compat-mode.XXXXXXXX")
+    trap 'rm -rf -- "${case_dir}"' EXIT
+    compat=${case_dir}/po0-cf-probe-compat
+    mkdir -p -- "${compat}"
+    chmod 0755 "${compat}"
+    nc_content=$(printf '%s\n' '#!/bin/sh' \
+        '# Managed by Po0: force cf-probe to use its built-in ICMP fallback.' \
+        'exit 1')
+    printf '%s\n' "${nc_content}" >"${compat}/nc"
+    chmod 0755 "${compat}/nc"
+
+    eval "$(sed -n '/^cf_probe_compat_mode_safe() {/,/^}/p' "${CN_ENTRY_ROLE}")"
+    eval "$(sed -n '/^managed_cf_probe_compat_owned() {/,/^}/p' "${CN_ENTRY_ROLE}")"
+    eval "$(sed -n '/^managed_cf_probe_go_record() {/,/^}/p' "${CN_ENTRY_ROLE}")"
+    eval "$(sed -n '/^managed_cf_probe_go_pending() {/,/^}/p' "${CN_ENTRY_ROLE}")"
+
+    managed_cf_probe_compat_owned "${compat}" \
+        || { fail '正常权限的兼容目录被判为不属于本助手'; return 1; }
+
+    chmod 0757 "${compat}/nc"
+    rc=0
+    managed_cf_probe_compat_owned "${compat}" || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '人人可写的 nc 包装仍被判为属于本助手'; return 1; }
+    chmod 0755 "${compat}/nc"
+
+    chmod 0777 "${compat}"
+    rc=0
+    managed_cf_probe_compat_owned "${compat}" || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '人人可写的兼容目录仍被判为属于本助手'; return 1; }
+    chmod 0755 "${compat}"
+
+    # 旧部署可能是 0750 之类的更严格权限，不能被误判为异常。
+    chmod 0750 "${compat}"
+    chmod 0750 "${compat}/nc"
+    managed_cf_probe_compat_owned "${compat}" \
+        || { fail '更严格权限的旧兼容目录被误判为不属于本助手'; return 1; }
+)
+
 test_enable_rollback_compensates_before_dropin_flag() (
     local case_dir compat_dir log rc
     case_dir=$(mktemp -d "${TMPDIR:-/tmp}/po0-enable-rollback.XXXXXXXX")
@@ -714,6 +756,7 @@ main() {
     run_case 'Go Agent 首次事务中断后可自动恢复' test_go_agent_stale_first_transaction_recovery
     run_case 'Go Agent 面板动态配置覆盖可持续收敛' test_go_agent_dynamic_config_guard
     run_case '服务专用兼容文件可直连上报、失败回退并安全清理' test_wrapper_lifecycle_and_scope
+    run_case 'cf-probe 兼容文件归属校验包含权限位' test_cf_probe_compat_ownership_checks_mode
     run_case '启用事务在 drop-in 落盘前失败也会补偿 cf-probe' test_enable_rollback_compensates_before_dropin_flag
     run_case '启用、刷新、失败回滚、停用和扫描路径均已接入' test_source_lifecycle_contracts
     printf '结果：%d 通过，%d 失败\n' "${PASS_COUNT}" "${FAIL_COUNT}"

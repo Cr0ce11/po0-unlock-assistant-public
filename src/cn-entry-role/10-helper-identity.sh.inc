@@ -1,7 +1,14 @@
 
-write_helper() {
+write_helper() (
     local no_proxy=$1 tmp
-    tmp=$(mktemp /tmp/po0-cn-entry-helper.XXXXXX)
+    # 与项目其他事务一致：临时文件登记进 trap，任一步失败或收到信号都不会
+    # 在 /tmp 留下 root 属主的残留文件。
+    tmp=$(mktemp /tmp/po0-cn-entry-helper.XXXXXX) \
+        || die '无法创建国内入口管理组件临时文件。'
+    trap 'rm -f -- "${tmp}"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
     cat >"${tmp}" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail

@@ -1,7 +1,6 @@
     sed -i "s|__NO_PROXY__|${no_proxy}|g" "${tmp}"
     install -o root -g root -m 0755 "${tmp}" "${HELPER}"
-    rm -f "${tmp}"
-}
+)
 
 write_proxy_files() (
     local state=$1 cn_entry_private_ip=$2 exit_private_ip=$3

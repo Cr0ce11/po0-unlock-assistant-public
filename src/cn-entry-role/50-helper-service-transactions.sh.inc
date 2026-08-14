@@ -49,14 +49,23 @@ DROPIN
 
 helper_active_state() {
     local state
-    [[ -r /var/lib/po0-unlock/ACTIVE ]] \
+    # 与 active_state 保持同一套校验：属主、权限、链接数与状态根的直接子目录。
+    [[ -f /var/lib/po0-unlock/ACTIVE && ! -L /var/lib/po0-unlock/ACTIVE \
+        && $(stat -c '%u' /var/lib/po0-unlock/ACTIVE 2>/dev/null) == 0 \
+        && $(stat -c '%a' /var/lib/po0-unlock/ACTIVE 2>/dev/null) == 600 \
+        && $(stat -c '%h' /var/lib/po0-unlock/ACTIVE 2>/dev/null) == 1 ]] \
         || { echo '没有找到有效安装状态。' >&2; return 1; }
     state=$(</var/lib/po0-unlock/ACTIVE)
     case "${state}" in
         /var/lib/po0-unlock/*) ;;
         *) echo '安装状态路径无效。' >&2; return 1 ;;
     esac
-    [[ -d ${state} ]] || { echo '安装状态目录不存在。' >&2; return 1; }
+    [[ ${state%/*} == /var/lib/po0-unlock ]] \
+        || { echo '安装状态路径无效。' >&2; return 1; }
+    [[ -d ${state} && ! -L ${state} \
+        && $(stat -c '%u' "${state}" 2>/dev/null) == 0 \
+        && $(stat -c '%a' "${state}" 2>/dev/null) == 700 ]] \
+        || { echo '安装状态目录异常。' >&2; return 1; }
     printf '%s\n' "${state}"
 }
 

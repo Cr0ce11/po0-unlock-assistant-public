@@ -651,10 +651,22 @@ exec "${REAL_CURL}" "${original[@]}"
 WRAPPER
 }
 
+# 归属校验要证明的是"这是本助手的文件、且别人改不了它"，因此权限位不能省。
+# 旧版兼容目录的具体权限可能与当前不同，硬钉 0755 会把老部署判成不属于本助手，
+# 所以这里只要求 group/other 没有写权限。
+cf_probe_compat_mode_safe() {
+    local path=$1 mode
+    mode=$(stat -c '%a' "${path}" 2>/dev/null) || return 1
+    [[ ${mode} =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#${mode} & 8#22) == 0 ))
+}
+
 managed_cf_probe_compat_owned() {
     local directory=$1 nc_wrapper=${1}/nc curl_wrapper=${1}/curl go_record=${1}/go-record
     local go_pending=${1}/go-pending go_previous=${1}/go-record.previous expected actual extra=
     [[ -d ${directory} && ! -L ${directory} ]] || return 1
+    [[ $(stat -c '%u' "${directory}" 2>/dev/null) == 0 ]] || return 1
+    cf_probe_compat_mode_safe "${directory}" || return 1
     if [[ -e ${nc_wrapper} || -L ${nc_wrapper} ]]; then
         [[ -f ${nc_wrapper} && ! -L ${nc_wrapper} && -x ${nc_wrapper} ]] || return 1
         expected=$(printf '%s\n' \
@@ -665,6 +677,7 @@ managed_cf_probe_compat_owned() {
         [[ ${actual} == "${expected}" ]] || return 1
         [[ $(stat -c '%u' "${nc_wrapper}" 2>/dev/null) == 0 \
             && $(stat -c '%h' "${nc_wrapper}" 2>/dev/null) == 1 ]] || return 1
+        cf_probe_compat_mode_safe "${nc_wrapper}" || return 1
     else
         [[ -e ${go_record} || -L ${go_record} || -e ${go_pending} || -L ${go_pending} ]] \
             || return 1
@@ -677,6 +690,7 @@ managed_cf_probe_compat_owned() {
         [[ ${actual} == "${expected}" ]] || return 1
         [[ $(stat -c '%u' "${curl_wrapper}" 2>/dev/null) == 0 \
             && $(stat -c '%h' "${curl_wrapper}" 2>/dev/null) == 1 ]] || return 1
+        cf_probe_compat_mode_safe "${curl_wrapper}" || return 1
     fi
     if [[ -e ${go_record} || -L ${go_record} ]]; then
         managed_cf_probe_go_record "${go_record}" || return 1
