@@ -613,6 +613,16 @@ commit_tunnel_state() {
     ROLE_STATE_TX_DIR=
 }
 
+# 反向隧道单元的 ExecStart 只在这里生成，写入与校验共用同一份，避免两边漂移。
+# 其中的主机密钥参数属于安全红线：UserKnownHostsFile 与 StrictHostKeyChecking=yes
+# 必须逐字节一致，任何改动都应让安全修复拒绝接管。
+tunnel_exec_start_line() {
+    local exit_private_ip=$1 cn_entry_private_ip=$2 cn_entry_ssh_port=$3
+    printf 'ExecStart=/usr/bin/ssh -NT -b %s -i %s -o IdentitiesOnly=yes -o UserKnownHostsFile=%s -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -p %s -R 127.0.0.1:13128:127.0.0.1:3128 -R 127.0.0.1:19080 %s@%s\n' \
+        "${exit_private_ip}" "${KEY_FILE}" "${KNOWN_HOSTS}" "${cn_entry_ssh_port}" \
+        "${TUNNEL_USER}" "${cn_entry_private_ip}"
+}
+
 configure_tunnel() {
     local mode=$1 expected_fingerprint=${2:-} cn_entry_private_ip=${3:-} cn_entry_ssh_port=${4:-} exit_private_ip=${5:-}
     local state scan_tmp= unit_tmp= actual_fingerprint backup_dir configured_at
@@ -665,7 +675,7 @@ Requires=po0-unlock-exit-proxy.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/ssh -NT -b ${exit_private_ip} -i ${KEY_FILE} -o IdentitiesOnly=yes -o UserKnownHostsFile=${KNOWN_HOSTS} -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -p ${cn_entry_ssh_port} -R 127.0.0.1:13128:127.0.0.1:3128 -R 127.0.0.1:19080 ${TUNNEL_USER}@${cn_entry_private_ip}
+$(tunnel_exec_start_line "${exit_private_ip}" "${cn_entry_private_ip}" "${cn_entry_ssh_port}")
 Restart=always
 RestartSec=5
 
@@ -934,10 +944,9 @@ repair() {
         && health_regular_root_file "${TUNNEL_UNIT}" 644 \
         && health_regular_root_file "${KNOWN_HOSTS}" 600 \
         && health_regular_root_file "${KEY_FILE}" 600 \
-        && grep -Fq -- "ExecStart=/usr/bin/ssh -NT -b ${exit_ip} " "${TUNNEL_UNIT}" \
-        && grep -Fq -- "-p ${cn_port} -R 127.0.0.1:13128:127.0.0.1:3128 -R 127.0.0.1:19080 ${TUNNEL_USER}@${cn_ip}" \
-            "${TUNNEL_UNIT}" \
-        || die '反向隧道配置无法确认属于本助手，拒绝自动修复。'
+        && [[ $(grep -c '^ExecStart=' "${TUNNEL_UNIT}") -eq 1 ]] \
+        && grep -Fqx -- "$(tunnel_exec_start_line "${exit_ip}" "${cn_ip}" "${cn_port}")" "${TUNNEL_UNIT}" \
+        || die '反向隧道配置无法确认属于本助手，拒绝自动修复；如确为本助手所建，请重新执行连接更新。'
 
     systemctl is-active --quiet po0-unlock-exit-proxy.service && proxy_active=yes
     systemctl is-enabled --quiet po0-unlock-exit-proxy.service && proxy_enabled=yes
@@ -4233,7 +4242,7 @@ __PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
     chmod 0600 "${exit_new}" "${cn_entry_new}"
     exit_actual=$(sha256sum "${exit_new}" | awk '{print $1}')
     cn_entry_actual=$(sha256sum "${cn_entry_new}" | awk '{print $1}')
-    [[ ${exit_actual} == 'ae6c05228b91f087725d8363349fa97f79a3b4751000da8104ab146b0f97c79f' ]] || die '国外出口内置组件哈希校验失败。'
+    [[ ${exit_actual} == '0da23eee38deb7922074536572214020ef94947167feb5c4d284886719fa55ab' ]] || die '国外出口内置组件哈希校验失败。'
     [[ ${cn_entry_actual} == 'd332de8b97a3d0c33c2039e5e9a3771d1780acb76e5be6a2c7ada6361c7a6990' ]] || die '国内入口内置组件哈希校验失败。'
     /bin/bash -n "${exit_new}" || die '国外出口内置组件语法检查失败。'
     /bin/bash -n "${cn_entry_new}" || die '国内入口内置组件语法检查失败。'
@@ -4264,7 +4273,7 @@ bundle_self_test() {
     rm -f -- "${helper_test}"
     printf 'Po0 单文件版本=%s\n' '2.5.19'
     printf 'Po0 单文件版本类型=%s\n' "${SCRIPT_EDITION_LABEL}"
-    printf 'overseas-exit-role SHA-256=%s\n' 'ae6c05228b91f087725d8363349fa97f79a3b4751000da8104ab146b0f97c79f'
+    printf 'overseas-exit-role SHA-256=%s\n' '0da23eee38deb7922074536572214020ef94947167feb5c4d284886719fa55ab'
     printf 'cn-entry-role SHA-256=%s\n' 'd332de8b97a3d0c33c2039e5e9a3771d1780acb76e5be6a2c7ada6361c7a6990'
     printf '%s\n'         "scan-agents -> cn-entry:${CN_ENTRY_CMD_SCAN}"         "rollback[1] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_SERVICES}"         "rollback[2] -> overseas-exit:${EXIT_CMD_ROLLBACK}"         "rollback[3] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_FINALIZE}"         "status -> cn-entry:${CN_ENTRY_CMD_STATUS}"         "status -> overseas-exit:${EXIT_CMD_STATUS}"         "health -> cn-entry:${CN_ENTRY_CMD_HEALTH}"         "health -> overseas-exit:${EXIT_CMD_HEALTH}"         "repair -> overseas-exit:${EXIT_CMD_REPAIR}"
     printf '%s\n' 'SELF_TEST=PASS'

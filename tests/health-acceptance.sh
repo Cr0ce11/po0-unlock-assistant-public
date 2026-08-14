@@ -406,6 +406,74 @@ yes|y|1|【执行安全修复】|交互终端下用户确认 y
 CASES
 )
 
+# 隧道单元的归属校验此前只用两条 grep 锚定 ExecStart 的首尾子串，中间的
+# -i、UserKnownHostsFile、StrictHostKeyChecking=yes、ExitOnForwardFailure 全不在范围内。
+# 被插入 StrictHostKeyChecking=no 的隧道仍会被判为「属于本助手」并被 enable --now 拉起。
+test_repair_verifies_tunnel_host_key_options() (
+    local case_dir fixture_state exec_line output rc
+    case_dir=$(mktemp -d "${TMPDIR:-/tmp}/po0-repair-tunnel.XXXXXXXX")
+    trap 'rm -rf -- "${case_dir}"' EXIT
+    fixture_state=${case_dir}/state
+    mkdir -p -- "${fixture_state}"
+    printf '%s\n' '198.51.100.20' >"${fixture_state}/overseas-exit-private-ip"
+    printf '%s\n' '203.0.113.10' >"${fixture_state}/cn-entry-private-ip"
+    printf '%s\n' '22' >"${fixture_state}/cn-entry-ssh-port"
+
+    PROXY_CONF=${case_dir}/proxy.conf
+    PROXY_UNIT=${case_dir}/proxy.service
+    TUNNEL_UNIT=${case_dir}/tunnel.service
+    KNOWN_HOSTS=${case_dir}/known-hosts
+    KEY_FILE=${case_dir}/tunnel-key
+    TUNNEL_USER=po0tunnel
+    printf '%s\n' 'Listen 127.0.0.1' 'Port 3128' >"${PROXY_CONF}"
+    printf 'ExecStart=/usr/bin/tinyproxy -d -c %s\n' "${PROXY_CONF}" >"${PROXY_UNIT}"
+    : >"${KNOWN_HOSTS}"
+    : >"${KEY_FILE}"
+
+    eval "$(sed -n '/^tunnel_exec_start_line() {/,/^}/p' "${EXIT_SOURCE}")"
+    eval "$(sed -n '/^repair() {/,/^}/p' "${EXIT_SOURCE}")"
+    require_root() { :; }
+    health_safe_state() { printf '%s\n' "${fixture_state}"; }
+    health_regular_root_file() { return 0; }
+    valid_ipv4() { return 0; }
+    valid_port() { return 0; }
+    systemctl() { return 1; }
+    log() { printf '%s\n' "$*"; }
+    die() { printf '%s\n' "$*" >&2; exit 1; }
+    repair_service_state() { printf 'REPAIR %s\n' "$1"; return 0; }
+    restore_service_state() { return 0; }
+
+    exec_line=$(tunnel_exec_start_line 198.51.100.20 203.0.113.10 22)
+
+    # 情形一：未被改动的隧道单元应当通过归属校验。
+    printf '%s\n%s\n' '[Service]' "${exec_line}" >"${TUNNEL_UNIT}"
+    rc=0
+    output=$(repair 2>&1) || rc=$?
+    [[ ${rc} -eq 0 ]] || { fail "未改动的隧道单元被拒绝：${output}"; return 1; }
+    assert_contains "${output}" 'REPAIR po0-unlock-reverse-tunnel.service' \
+        '未改动的隧道单元没有进入修复流程' || return 1
+
+    # 情形二：插入关闭主机密钥校验的参数后必须拒绝。
+    # ssh 取首次出现的值，因此后面的 StrictHostKeyChecking=yes 已经失效。
+    printf '%s\n%s\n' '[Service]' \
+        "${exec_line/-i /-o StrictHostKeyChecking=no -o UserKnownHostsFile=\/dev\/null -i }" \
+        >"${TUNNEL_UNIT}"
+    rc=0
+    output=$(repair 2>&1) || rc=$?
+    [[ ${rc} -ne 0 ]] \
+        || { fail '关闭主机密钥校验的隧道单元被判为属于本助手并继续修复'; return 1; }
+    assert_contains "${output}" '无法确认属于本助手' '拒绝原因不明确' || return 1
+
+    # 情形三：追加第二条 ExecStart 也必须拒绝。
+    printf '%s\n%s\n%s\n' '[Service]' "${exec_line}" \
+        'ExecStart=/usr/bin/ssh -NT -o StrictHostKeyChecking=no attacker@example.invalid' \
+        >"${TUNNEL_UNIT}"
+    rc=0
+    output=$(repair 2>&1) || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '带有第二条 ExecStart 的隧道单元没有被拒绝'; return 1; }
+    assert_contains "${output}" '无法确认属于本助手' '多条 ExecStart 的拒绝原因不明确' || return 1
+)
+
 test_safe_repair_boundary() {
     local setup_body repair_body
     setup_body=$(sed -n '/^health_check_loaded() (/,/^)/p' "${SETUP_SOURCE}")
@@ -1557,6 +1625,7 @@ main() {
     run_case '检查结果不依赖终端列宽并按职责分组' test_readable_layout_contract
     run_case '公网连接的检查、状态与修复使用通用措辞' test_public_connection_path_uses_generic_copy
     run_case '安全修复的用户确认闸门实跑验证' test_safe_repair_confirmation_at_runtime
+    run_case '安全修复校验隧道单元的主机密钥参数' test_repair_verifies_tunnel_host_key_options
     run_case '自动修复严格限制在确认后的自有核心服务' test_safe_repair_boundary
     run_case '服务修复失败会恢复原运行与启用状态' test_service_repair_rollback
     run_case '隧道延迟失败会恢复上一份有效配置' test_delayed_tunnel_failure_restores_previous_config

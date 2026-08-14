@@ -432,6 +432,16 @@ commit_tunnel_state() {
     ROLE_STATE_TX_DIR=
 }
 
+# 反向隧道单元的 ExecStart 只在这里生成，写入与校验共用同一份，避免两边漂移。
+# 其中的主机密钥参数属于安全红线：UserKnownHostsFile 与 StrictHostKeyChecking=yes
+# 必须逐字节一致，任何改动都应让安全修复拒绝接管。
+tunnel_exec_start_line() {
+    local exit_private_ip=$1 cn_entry_private_ip=$2 cn_entry_ssh_port=$3
+    printf 'ExecStart=/usr/bin/ssh -NT -b %s -i %s -o IdentitiesOnly=yes -o UserKnownHostsFile=%s -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -p %s -R 127.0.0.1:13128:127.0.0.1:3128 -R 127.0.0.1:19080 %s@%s\n' \
+        "${exit_private_ip}" "${KEY_FILE}" "${KNOWN_HOSTS}" "${cn_entry_ssh_port}" \
+        "${TUNNEL_USER}" "${cn_entry_private_ip}"
+}
+
 configure_tunnel() {
     local mode=$1 expected_fingerprint=${2:-} cn_entry_private_ip=${3:-} cn_entry_ssh_port=${4:-} exit_private_ip=${5:-}
     local state scan_tmp= unit_tmp= actual_fingerprint backup_dir configured_at
@@ -484,7 +494,7 @@ Requires=po0-unlock-exit-proxy.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/ssh -NT -b ${exit_private_ip} -i ${KEY_FILE} -o IdentitiesOnly=yes -o UserKnownHostsFile=${KNOWN_HOSTS} -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -p ${cn_entry_ssh_port} -R 127.0.0.1:13128:127.0.0.1:3128 -R 127.0.0.1:19080 ${TUNNEL_USER}@${cn_entry_private_ip}
+$(tunnel_exec_start_line "${exit_private_ip}" "${cn_entry_private_ip}" "${cn_entry_ssh_port}")
 Restart=always
 RestartSec=5
 
@@ -753,10 +763,9 @@ repair() {
         && health_regular_root_file "${TUNNEL_UNIT}" 644 \
         && health_regular_root_file "${KNOWN_HOSTS}" 600 \
         && health_regular_root_file "${KEY_FILE}" 600 \
-        && grep -Fq -- "ExecStart=/usr/bin/ssh -NT -b ${exit_ip} " "${TUNNEL_UNIT}" \
-        && grep -Fq -- "-p ${cn_port} -R 127.0.0.1:13128:127.0.0.1:3128 -R 127.0.0.1:19080 ${TUNNEL_USER}@${cn_ip}" \
-            "${TUNNEL_UNIT}" \
-        || die '反向隧道配置无法确认属于本助手，拒绝自动修复。'
+        && [[ $(grep -c '^ExecStart=' "${TUNNEL_UNIT}") -eq 1 ]] \
+        && grep -Fqx -- "$(tunnel_exec_start_line "${exit_ip}" "${cn_ip}" "${cn_port}")" "${TUNNEL_UNIT}" \
+        || die '反向隧道配置无法确认属于本助手，拒绝自动修复；如确为本助手所建，请重新执行连接更新。'
 
     systemctl is-active --quiet po0-unlock-exit-proxy.service && proxy_active=yes
     systemctl is-enabled --quiet po0-unlock-exit-proxy.service && proxy_enabled=yes
