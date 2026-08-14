@@ -155,7 +155,7 @@ cf_probe_target_connectable() {
 }
 
 cf_probe_write_go_targets() {
-    local config=$1 ct=$2 cu=$3 cm=$4 bd=$5 directory tmp=
+    local config=$1 ct=$2 cu=$3 cm=$4 bd=$5 directory key tmp=
     [[ -f ${config} && ! -L ${config} ]] || return 1
     [[ $(stat -c '%u' "${config}" 2>/dev/null) == 0 \
         && $(stat -c '%a' "${config}" 2>/dev/null) == 600 \
@@ -522,7 +522,7 @@ remove_cf_probe_go_guard_units() {
 
 prepare_cf_probe_go_latency_compat() {
     local unit=$1 dropin=$2 config directory record pending previous directory_created=no had_record=no
-    local ct cu cm bd desired_ct desired_cu desired_cm desired_bd original_ct original_cu original_cm original_bd
+    local ct cu cm bd target desired_ct desired_cu desired_cm desired_bd original_ct original_cu original_cm original_bd
     config=$(cf_probe_go_config_path "${unit}") || return 1
     directory=$(cf_probe_compat_dir "${dropin}")
     record=${directory}/go-record
@@ -605,12 +605,17 @@ is_report=no
 target_index=
 target_url=
 
-for index in "${!original[@]}"; do
-    case "${original[index]}" in
-        X-Agent-Version:*) is_report=yes ;;
-        https://*) target_index=${index}; target_url=${original[index]} ;;
-    esac
-done
+po0_cf_probe_find_report_target() {
+    local index
+    for index in "${!original[@]}"; do
+        case "${original[index]}" in
+            X-Agent-Version:*) is_report=yes ;;
+            https://*) target_index=${index}; target_url=${original[index]} ;;
+        esac
+    done
+}
+po0_cf_probe_find_report_target
+unset -f po0_cf_probe_find_report_target
 
 if [[ ${is_report} == yes && -n ${target_index} ]]; then
     remainder=${target_url#https://}

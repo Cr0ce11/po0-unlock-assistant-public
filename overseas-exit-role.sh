@@ -160,7 +160,7 @@ active_state() {
 }
 
 prepare() {
-    local stamp state key_directory installed_before=no bin_installed_before=no active_before=no enabled_before=no tmp=
+    local stamp state key_directory path installed_before=no bin_installed_before=no active_before=no enabled_before=no tmp=
     require_root
     [[ ! -e ${ACTIVE_FILE} && ! -L ${ACTIVE_FILE} ]] \
         || die '已经存在安装状态或异常 ACTIVE 路径；请先运行 status 或 rollback。'

@@ -259,7 +259,7 @@ harden_tunnel_authorized_keys() {
 
 prepare() {
     local public_key_b64=${1:-} install_claim=${2:-}
-    local stamp state public_key tunnel_uid
+    local stamp state public_key tunnel_uid path
     require_root
     [[ -n ${public_key_b64} ]] || die '缺少国外出口隧道公钥。'
     valid_install_claim "${install_claim}" || die '缺少有效的安装事务标识。'
@@ -760,7 +760,7 @@ cf_probe_target_connectable() {
 }
 
 cf_probe_write_go_targets() {
-    local config=$1 ct=$2 cu=$3 cm=$4 bd=$5 directory tmp=
+    local config=$1 ct=$2 cu=$3 cm=$4 bd=$5 directory key tmp=
     [[ -f ${config} && ! -L ${config} ]] || return 1
     [[ $(stat -c '%u' "${config}" 2>/dev/null) == 0 \
         && $(stat -c '%a' "${config}" 2>/dev/null) == 600 \
@@ -1127,7 +1127,7 @@ remove_cf_probe_go_guard_units() {
 
 prepare_cf_probe_go_latency_compat() {
     local unit=$1 dropin=$2 config directory record pending previous directory_created=no had_record=no
-    local ct cu cm bd desired_ct desired_cu desired_cm desired_bd original_ct original_cu original_cm original_bd
+    local ct cu cm bd target desired_ct desired_cu desired_cm desired_bd original_ct original_cu original_cm original_bd
     config=$(cf_probe_go_config_path "${unit}") || return 1
     directory=$(cf_probe_compat_dir "${dropin}")
     record=${directory}/go-record
@@ -1210,12 +1210,17 @@ is_report=no
 target_index=
 target_url=
 
-for index in "${!original[@]}"; do
-    case "${original[index]}" in
-        X-Agent-Version:*) is_report=yes ;;
-        https://*) target_index=${index}; target_url=${original[index]} ;;
-    esac
-done
+po0_cf_probe_find_report_target() {
+    local index
+    for index in "${!original[@]}"; do
+        case "${original[index]}" in
+            X-Agent-Version:*) is_report=yes ;;
+            https://*) target_index=${index}; target_url=${original[index]} ;;
+        esac
+    done
+}
+po0_cf_probe_find_report_target
+unset -f po0_cf_probe_find_report_target
 
 if [[ ${is_report} == yes && -n ${target_index} ]]; then
     remainder=${target_url#https://}
@@ -2666,7 +2671,7 @@ manage_configured_service() {
 
 scan_services() {
     local state unit description fragment exec_data exec_path exec_name reason status selection answer index
-    local report_ip managed dependency_rc metadata_line scan_started metadata_output units_output rc
+    local report_ip managed metadata_line scan_started metadata_output units_output rc
     local -a units=() descriptions=() fragments=() exec_names=() reasons=() proxy_states=() managed_states=()
     require_root
     [[ -t 0 ]] || die '服务扫描需要交互终端。'
@@ -3056,7 +3061,7 @@ read_recorded_tunnel_user_uid() {
 }
 
 rollback_finalize() {
-    local state attempt current_state closing account_home closed_marker
+    local state attempt current_state closing account_home closed_marker path
     local tunnel_uid= home_owner uid_recorded=
     require_root
     state=$(active_state)

@@ -1308,7 +1308,7 @@ test_initial_active_state_commit_is_atomic_and_protected() (
     local source label case_dir state function_name function_body output rc residue
     for source in "${EXIT_SOURCE}" "${CN_SOURCE}"; do
         case "${source}" in
-            "${EXIT_SOURCE}") label=exit ;;
+            "${EXIT_SOURCE}") label='exit' ;;
             *) label=cn ;;
         esac
         (

@@ -259,7 +259,7 @@ harden_tunnel_authorized_keys() {
 
 prepare() {
     local public_key_b64=${1:-} install_claim=${2:-}
-    local stamp state public_key tunnel_uid
+    local stamp state public_key tunnel_uid path
     require_root
     [[ -n ${public_key_b64} ]] || die '缺少国外出口隧道公钥。'
     valid_install_claim "${install_claim}" || die '缺少有效的安装事务标识。'

@@ -83,10 +83,9 @@ if [[ -t 1 ]]; then
     C_BLUE=$'\033[1;34m'
     C_GREEN=$'\033[1;32m'
     C_YELLOW=$'\033[1;33m'
-    C_RED=$'\033[1;31m'
     C_RESET=$'\033[0m'
 else
-    C_BLUE= C_GREEN= C_YELLOW= C_RED= C_RESET=
+    C_BLUE= C_GREEN= C_YELLOW= C_RESET=
 fi
 
 log() { printf '%s[Po0 解锁助手]%s %s\n' "${C_GREEN}" "${C_RESET}" "$*"; }
@@ -3073,6 +3072,8 @@ pause_for_key() {
     local prompt=$1 ignored
     if [[ -t 0 ]]; then
         printf '%s' "${prompt}"
+        # ShellCheck SC2034：read 需要接收变量名，但暂停流程有意忽略读取值。
+        # shellcheck disable=SC2034
         IFS= read -r -s -n 1 ignored || true
         printf '\n'
     fi

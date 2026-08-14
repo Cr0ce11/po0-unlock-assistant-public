@@ -84,10 +84,9 @@ if [[ -t 1 ]]; then
     C_BLUE=$'\033[1;34m'
     C_GREEN=$'\033[1;32m'
     C_YELLOW=$'\033[1;33m'
-    C_RED=$'\033[1;31m'
     C_RESET=$'\033[0m'
 else
-    C_BLUE= C_GREEN= C_YELLOW= C_RED= C_RESET=
+    C_BLUE= C_GREEN= C_YELLOW= C_RESET=
 fi
 
 log() { printf '%s[Po0 解锁助手]%s %s\n' "${C_GREEN}" "${C_RESET}" "$*"; }
@@ -303,7 +302,7 @@ active_state() {
 }
 
 prepare() {
-    local stamp state key_directory installed_before=no bin_installed_before=no active_before=no enabled_before=no tmp=
+    local stamp state key_directory path installed_before=no bin_installed_before=no active_before=no enabled_before=no tmp=
     require_root
     [[ ! -e ${ACTIVE_FILE} && ! -L ${ACTIVE_FILE} ]] \
         || die '已经存在安装状态或异常 ACTIVE 路径；请先运行 status 或 rollback。'
@@ -1241,7 +1240,7 @@ harden_tunnel_authorized_keys() {
 
 prepare() {
     local public_key_b64=${1:-} install_claim=${2:-}
-    local stamp state public_key tunnel_uid
+    local stamp state public_key tunnel_uid path
     require_root
     [[ -n ${public_key_b64} ]] || die '缺少国外出口隧道公钥。'
     valid_install_claim "${install_claim}" || die '缺少有效的安装事务标识。'
@@ -1742,7 +1741,7 @@ cf_probe_target_connectable() {
 }
 
 cf_probe_write_go_targets() {
-    local config=$1 ct=$2 cu=$3 cm=$4 bd=$5 directory tmp=
+    local config=$1 ct=$2 cu=$3 cm=$4 bd=$5 directory key tmp=
     [[ -f ${config} && ! -L ${config} ]] || return 1
     [[ $(stat -c '%u' "${config}" 2>/dev/null) == 0 \
         && $(stat -c '%a' "${config}" 2>/dev/null) == 600 \
@@ -2109,7 +2108,7 @@ remove_cf_probe_go_guard_units() {
 
 prepare_cf_probe_go_latency_compat() {
     local unit=$1 dropin=$2 config directory record pending previous directory_created=no had_record=no
-    local ct cu cm bd desired_ct desired_cu desired_cm desired_bd original_ct original_cu original_cm original_bd
+    local ct cu cm bd target desired_ct desired_cu desired_cm desired_bd original_ct original_cu original_cm original_bd
     config=$(cf_probe_go_config_path "${unit}") || return 1
     directory=$(cf_probe_compat_dir "${dropin}")
     record=${directory}/go-record
@@ -2192,12 +2191,17 @@ is_report=no
 target_index=
 target_url=
 
-for index in "${!original[@]}"; do
-    case "${original[index]}" in
-        X-Agent-Version:*) is_report=yes ;;
-        https://*) target_index=${index}; target_url=${original[index]} ;;
-    esac
-done
+po0_cf_probe_find_report_target() {
+    local index
+    for index in "${!original[@]}"; do
+        case "${original[index]}" in
+            X-Agent-Version:*) is_report=yes ;;
+            https://*) target_index=${index}; target_url=${original[index]} ;;
+        esac
+    done
+}
+po0_cf_probe_find_report_target
+unset -f po0_cf_probe_find_report_target
 
 if [[ ${is_report} == yes && -n ${target_index} ]]; then
     remainder=${target_url#https://}
@@ -3648,7 +3652,7 @@ manage_configured_service() {
 
 scan_services() {
     local state unit description fragment exec_data exec_path exec_name reason status selection answer index
-    local report_ip managed dependency_rc metadata_line scan_started metadata_output units_output rc
+    local report_ip managed metadata_line scan_started metadata_output units_output rc
     local -a units=() descriptions=() fragments=() exec_names=() reasons=() proxy_states=() managed_states=()
     require_root
     [[ -t 0 ]] || die '服务扫描需要交互终端。'
@@ -4038,7 +4042,7 @@ read_recorded_tunnel_user_uid() {
 }
 
 rollback_finalize() {
-    local state attempt current_state closing account_home closed_marker
+    local state attempt current_state closing account_home closed_marker path
     local tunnel_uid= home_owner uid_recorded=
     require_root
     state=$(active_state)
@@ -4174,8 +4178,8 @@ __PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
     chmod 0600 "${exit_new}" "${cn_entry_new}"
     exit_actual=$(sha256sum "${exit_new}" | awk '{print $1}')
     cn_entry_actual=$(sha256sum "${cn_entry_new}" | awk '{print $1}')
-    [[ ${exit_actual} == '5dfa837d3011a65eb300f4ca72fb18bcab60692363196db2e47d2d6a6e2bbd4b' ]] || die '国外出口内置组件哈希校验失败。'
-    [[ ${cn_entry_actual} == '041e7b63b6cab2c48d49d343dcfba34d8d3bab5be309e153aa5960abdef3653f' ]] || die '国内入口内置组件哈希校验失败。'
+    [[ ${exit_actual} == 'ae6c05228b91f087725d8363349fa97f79a3b4751000da8104ab146b0f97c79f' ]] || die '国外出口内置组件哈希校验失败。'
+    [[ ${cn_entry_actual} == '79088b7900ba23c368f9045e087c12e58ec75957bd7f59bd1da8b74158ebd4ce' ]] || die '国内入口内置组件哈希校验失败。'
     /bin/bash -n "${exit_new}" || die '国外出口内置组件语法检查失败。'
     /bin/bash -n "${cn_entry_new}" || die '国内入口内置组件语法检查失败。'
     mv "${exit_new}" "${EXIT_ROLE}"
@@ -4205,8 +4209,8 @@ bundle_self_test() {
     rm -f -- "${helper_test}"
     printf 'Po0 单文件版本=%s\n' '2.5.17'
     printf 'Po0 单文件版本类型=%s\n' "${SCRIPT_EDITION_LABEL}"
-    printf 'overseas-exit-role SHA-256=%s\n' '5dfa837d3011a65eb300f4ca72fb18bcab60692363196db2e47d2d6a6e2bbd4b'
-    printf 'cn-entry-role SHA-256=%s\n' '041e7b63b6cab2c48d49d343dcfba34d8d3bab5be309e153aa5960abdef3653f'
+    printf 'overseas-exit-role SHA-256=%s\n' 'ae6c05228b91f087725d8363349fa97f79a3b4751000da8104ab146b0f97c79f'
+    printf 'cn-entry-role SHA-256=%s\n' '79088b7900ba23c368f9045e087c12e58ec75957bd7f59bd1da8b74158ebd4ce'
     printf '%s\n'         "scan-agents -> cn-entry:${CN_ENTRY_CMD_SCAN}"         "rollback[1] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_SERVICES}"         "rollback[2] -> overseas-exit:${EXIT_CMD_ROLLBACK}"         "rollback[3] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_FINALIZE}"         "status -> cn-entry:${CN_ENTRY_CMD_STATUS}"         "status -> overseas-exit:${EXIT_CMD_STATUS}"         "health -> cn-entry:${CN_ENTRY_CMD_HEALTH}"         "health -> overseas-exit:${EXIT_CMD_HEALTH}"         "repair -> overseas-exit:${EXIT_CMD_REPAIR}"
     printf '%s\n' 'SELF_TEST=PASS'
 }
@@ -7193,6 +7197,8 @@ pause_for_key() {
     local prompt=$1 ignored
     if [[ -t 0 ]]; then
         printf '%s' "${prompt}"
+        # ShellCheck SC2034：read 需要接收变量名，但暂停流程有意忽略读取值。
+        # shellcheck disable=SC2034
         IFS= read -r -s -n 1 ignored || true
         printf '\n'
     fi
