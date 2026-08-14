@@ -238,10 +238,14 @@ test_public_connection_path_uses_generic_copy() (
     ACTIVE_FILE=${case_dir}/ACTIVE
     printf '%s\n' 'Listen 127.0.0.1' 'Port 3128' >"${PROXY_CONF}"
     printf 'ExecStart=/usr/bin/tinyproxy -d -c %s\n' "${PROXY_CONF}" >"${PROXY_UNIT}"
-    : >"${TUNNEL_UNIT}"
     : >"${KNOWN_HOSTS}"
     : >"${KEY_FILE}"
     printf '%s\n' "${fixture_state}" >"${ACTIVE_FILE}"
+    # 健康检查现在会核对隧道单元的 ExecStart，夹具必须写入与模板一致的一行。
+    TUNNEL_USER=po0tunnel
+    eval "$(sed -n '/^tunnel_exec_start_line() {/,/^}/p' "${EXIT_SOURCE}")"
+    printf '%s\n%s\n' '[Service]' \
+        "$(tunnel_exec_start_line 198.51.100.20 203.0.113.10 22)" >"${TUNNEL_UNIT}"
 
     for function_body in \
         "$(sed -n '/^health_line() {/,/^}/p' "${EXIT_SOURCE}")" \
@@ -417,6 +421,69 @@ CASES
 # 此前只跑过全绿路径，把「提醒」误判成「正常」这类改动不会被任何用例发现。
 # 国外出口封存 ACTIVE 此前是裸 mv：没有 --、不查目标是否已存在、失败也不中止。
 # 回滚重跑会静默盖掉上一份封存记录；mv 失败还会带着已清理的隧道继续报告「已回滚」。
+# 健康检查此前对隧道单元只查权限：被人工插入 StrictHostKeyChecking=no 的单元
+# 也会被报成「文件完整」，而安全修复对同一份单元是拒绝接管的——结论互相矛盾。
+test_health_verifies_tunnel_exec_start() (
+    local case_dir fixture_state exec_line out rc
+    case_dir=$(mktemp -d "${TMPDIR:-/tmp}/po0-health-tunnel.XXXXXXXX")
+    trap 'rm -rf -- "${case_dir}"' EXIT
+    fixture_state=${case_dir}/state
+    mkdir -p -- "${fixture_state}"
+    printf '%s\n' '203.0.113.10' >"${fixture_state}/cn-entry-private-ip"
+    printf '%s\n' '198.51.100.20' >"${fixture_state}/overseas-exit-private-ip"
+    printf '%s\n' '22' >"${fixture_state}/cn-entry-ssh-port"
+    PROXY_CONF=${case_dir}/proxy.conf
+    PROXY_UNIT=${case_dir}/proxy.service
+    TUNNEL_UNIT=${case_dir}/tunnel.service
+    KNOWN_HOSTS=${case_dir}/known-hosts
+    KEY_FILE=${case_dir}/key
+    TUNNEL_USER=po0tunnel
+    printf '%s\n' 'Listen 127.0.0.1' 'Port 3128' >"${PROXY_CONF}"
+    printf 'ExecStart=/usr/bin/tinyproxy -d -c %s\n' "${PROXY_CONF}" >"${PROXY_UNIT}"
+    : >"${KNOWN_HOSTS}"
+    : >"${KEY_FILE}"
+
+    eval "$(sed -n '/^tunnel_exec_start_line() {/,/^}/p' "${EXIT_SOURCE}")"
+    eval "$(sed -n '/^health() (/,/^)$/p' "${EXIT_SOURCE}")"
+    require_root() { :; }
+    health_group() { :; }
+    health_line() { printf '%s %s %s\n' "$1" "$2" "$3"; }
+    health_safe_state() { printf '%s\n' "${fixture_state}"; }
+    health_regular_root_file() { return 0; }
+    valid_ipv4() { return 0; }
+    valid_port() { return 0; }
+    systemctl() { return 0; }
+    ss() { printf '%s\n' 'LISTEN 0 128 127.0.0.1:3128 0.0.0.0:*'; }
+    curl() { return 0; }
+    local_ipv4_exists() { return 0; }
+    ip() { return 0; }
+    ssh-keyscan() { return 0; }
+
+    exec_line=$(tunnel_exec_start_line 198.51.100.20 203.0.113.10 22)
+    printf '%s\n%s\n' '[Service]' "${exec_line}" >"${TUNNEL_UNIT}"
+    rc=0
+    out=$(health 2>&1) || rc=$?
+    assert_eq 0 "${rc}" '未改动的隧道单元没有通过健康检查' || return 1
+    assert_contains "${out}" '启动参数未被改动' '没有说明启动参数已核对' || return 1
+
+    # 插入关闭主机密钥校验的参数：必须报异常，并指向连接更新而不是安全修复。
+    printf '%s\n%s\n' '[Service]' \
+        "${exec_line/-i /-o StrictHostKeyChecking=no -i }" >"${TUNNEL_UNIT}"
+    rc=0
+    out=$(health 2>&1) || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '被改过启动参数的隧道单元仍被报成正常'; return 1; }
+    assert_contains "${out}" '启动参数与本助手模板不一致' '异常原因不明确' || return 1
+    assert_contains "${out}" '重新执行连接更新' '没有给出可行的处置方式' || return 1
+
+    # 连接记录缺失时不能假装通过。
+    printf '%s\n%s\n' '[Service]' "${exec_line}" >"${TUNNEL_UNIT}"
+    rm -f -- "${fixture_state}/cn-entry-ssh-port"
+    rc=0
+    out=$(health 2>&1) || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '连接记录缺失时隧道配置仍被报成正常'; return 1; }
+    assert_contains "${out}" '无法核对启动参数' '连接记录缺失的原因不明确' || return 1
+)
+
 test_overseas_rollback_seals_active_safely() (
     local case_dir fixture_state rc out
     case_dir=$(mktemp -d "${TMPDIR:-/tmp}/po0-seal-active.XXXXXXXX")
@@ -544,6 +611,15 @@ test_health_exit_codes_are_runtime_covered() (
     TUNNEL_UNIT=${case_dir}/tunnel.service
     KNOWN_HOSTS=${case_dir}/known-hosts
     KEY_FILE=${case_dir}/key
+    TUNNEL_USER=po0tunnel
+    eval "$(sed -n '/^tunnel_exec_start_line() {/,/^}/p' "${EXIT_SOURCE}")"
+    # 这一段用真实 grep 核对内容，因此代理与隧道夹具都要写入与模板一致的内容。
+    printf '%s\n%s\n' '[Service]' \
+        "$(tunnel_exec_start_line 198.51.100.20 203.0.113.10 22)" >"${TUNNEL_UNIT}"
+    printf '%s\n' 'Listen 127.0.0.1' 'Port 3128' >"${PROXY_CONF}"
+    printf 'ExecStart=/usr/bin/tinyproxy -d -c %s\n' "${PROXY_CONF}" >"${PROXY_UNIT}"
+    : >"${KNOWN_HOSTS}"
+    : >"${KEY_FILE}"
     printf '%s\n' '203.0.113.10' >"${fixture_state}/cn-entry-private-ip"
     printf '%s\n' '198.51.100.20' >"${fixture_state}/overseas-exit-private-ip"
     printf '%s\n' '22' >"${fixture_state}/cn-entry-ssh-port"
@@ -557,7 +633,8 @@ test_health_exit_codes_are_runtime_covered() (
     local_ipv4_exists() { return 0; }
     ip() { return 0; }
     ssh-keyscan() { return 0; }
-    grep() { return 0; }
+    # 国外出口这一段要真正核对隧道单元的 ExecStart，因此用真实 grep。
+    unset -f grep
 
     rc=0
     health >/dev/null 2>&1 || rc=$?
@@ -1785,6 +1862,7 @@ main() {
     run_case '检查结果不依赖终端列宽并按职责分组' test_readable_layout_contract
     run_case '公网连接的检查、状态与修复使用通用措辞' test_public_connection_path_uses_generic_copy
     run_case '安全修复的用户确认闸门实跑验证' test_safe_repair_confirmation_at_runtime
+    run_case '健康检查核对隧道单元的启动参数' test_health_verifies_tunnel_exec_start
     run_case '国外出口回滚安全封存 ACTIVE 记录' test_overseas_rollback_seals_active_safely
     run_case '两端健康检查的返回码实跑覆盖' test_health_exit_codes_are_runtime_covered
     run_case '安全修复校验隧道单元的主机密钥参数' test_repair_verifies_tunnel_host_key_options
