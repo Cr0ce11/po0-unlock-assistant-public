@@ -122,6 +122,23 @@ po0_claim_exit_trap() {
     PO0_EXIT_TRAP_OWNER=${PO0_EXIT_TRAP_SCOPE}
 }
 
+# 统一的 EXIT 陷阱安装入口：声明归属，并处理「本层此前已装了内置组件清理陷阱」
+# 的情况——直接 trap 会把它覆盖掉，导致组件临时目录无人清理。
+po0_install_exit_trap() {
+    local handler=$1 existing
+    existing=$(trap -p EXIT)
+    po0_exit_trap_scope
+    if [[ ${existing} == *runtime_exit_cleanup* \
+        && ${PO0_EXIT_TRAP_OWNER:-} == "${PO0_EXIT_TRAP_SCOPE}" ]] \
+        && declare -F cleanup_runtime >/dev/null 2>&1; then
+        cleanup_runtime 0 || true
+    fi
+    po0_claim_exit_trap
+    # 这里要的就是立即展开：handler 是调用方此刻指定的处理函数名。
+    # shellcheck disable=SC2064
+    trap "${handler}" EXIT
+}
+
 log() { printf '%s[Po0 解锁助手]%s %s\n' "${C_GREEN}" "${C_RESET}" "$*"; }
 die() { printf '[Po0 解锁助手] 错误：%s\n' "$*" >&2; exit 1; }
 is_root() { [[ ${EUID} -eq 0 ]]; }
@@ -178,6 +195,9 @@ install_runtime_exit_trap() {
         trap 'exit 130' INT
         trap 'exit 143' TERM
         trap 'exit 129' HUP
+        # 记下归属：之后本层若再安装自己的 EXIT 陷阱，需要据此判断
+        # 「要被覆盖掉的组件清理陷阱确实是本层装的」，先释放组件再换。
+        PO0_EXIT_TRAP_OWNER=${PO0_EXIT_TRAP_SCOPE}
         return 0
     fi
     handler=${existing#trap -- \'}
@@ -5087,8 +5107,7 @@ cleanup_cn_entry_operation() {
 run_cn_entry_operation() (
     CN_ENTRY_CONTROL_DIR=
     CN_ENTRY_CONTROL_PATH=
-    po0_claim_exit_trap
-    trap cleanup_cn_entry_operation EXIT
+    po0_install_exit_trap cleanup_cn_entry_operation
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap 'exit 129' HUP
@@ -5255,8 +5274,7 @@ ensure_admin_key() (
             || rm -f -- "${ADMIN_KEY_PUBLIC_CANDIDATE}"
         exit "${rc}"
     }
-    po0_claim_exit_trap
-    trap cleanup_admin_key_candidate EXIT
+    po0_install_exit_trap cleanup_admin_key_candidate
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap 'exit 129' HUP
@@ -5796,8 +5814,7 @@ status_all_loaded() (
             printf '警告：拒绝清理异常临时状态组件路径：%s\n' "${status_remote}" >&2
         fi
     }
-    po0_claim_exit_trap
-    trap cleanup_status_remote EXIT
+    po0_install_exit_trap cleanup_status_remote
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap 'exit 129' HUP
@@ -5836,8 +5853,7 @@ health_check_loaded() (
             printf '警告：拒绝清理异常临时健康检查路径：%s\n' "${health_remote}" >&2
         fi
     }
-    po0_claim_exit_trap
-    trap cleanup_health_remote EXIT
+    po0_install_exit_trap cleanup_health_remote
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap 'exit 129' HUP
@@ -6146,8 +6162,7 @@ diagnostic_report() (
     cleanup_diagnostic() {
         rm -f -- "${raw_file:-}" "${report_tmp:-}"
     }
-    po0_claim_exit_trap
-    trap cleanup_diagnostic EXIT
+    po0_install_exit_trap cleanup_diagnostic
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap 'exit 129' HUP
@@ -6249,8 +6264,7 @@ scan_agent_services_inner() (
             printf '警告：拒绝清理异常临时扫描路径：%s\n' "${scan_remote}" >&2
         fi
     }
-    po0_claim_exit_trap
-    trap cleanup_scan_remote EXIT
+    po0_install_exit_trap cleanup_scan_remote
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap 'exit 129' HUP
@@ -6279,8 +6293,7 @@ temporary='${scan_remote_temporary}'
 cleanup() {
     if test \"\${temporary}\" = yes; then rm -f -- \"\${tmp}\"; fi
 }
-po0_claim_exit_trap
-trap cleanup EXIT
+po0_install_exit_trap cleanup
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
@@ -6405,8 +6418,7 @@ guided_reconfigure() (
     show_connection_summary '更新现有隧道' no
     confirm_yes '确认按以上信息更新现有隧道吗？'
     begin_reconfigure_config_transaction
-    po0_claim_exit_trap
-    trap cleanup_reconfigure_config_transaction EXIT
+    po0_install_exit_trap cleanup_reconfigure_config_transaction
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap 'exit 129' HUP
@@ -6681,8 +6693,7 @@ perform_uploaded_local_upgrade() (
         fi
         exit "${rc}"
     }
-    po0_claim_exit_trap
-    trap cleanup_local_upgrade EXIT
+    po0_install_exit_trap cleanup_local_upgrade
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap 'exit 129' HUP
@@ -7296,8 +7307,7 @@ perform_script_update() (
         esac
         exit "${rc}"
     }
-    po0_claim_exit_trap
-    trap cleanup_update_transaction EXIT
+    po0_install_exit_trap cleanup_update_transaction
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap 'exit 129' HUP
@@ -7419,8 +7429,7 @@ perform_script_restore() (
         esac
         exit "${rc}"
     }
-    po0_claim_exit_trap
-    trap cleanup_restore_transaction EXIT
+    po0_install_exit_trap cleanup_restore_transaction
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap 'exit 129' HUP

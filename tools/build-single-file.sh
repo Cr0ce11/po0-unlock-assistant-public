@@ -102,6 +102,9 @@ install_runtime_exit_trap() {
         trap 'exit 130' INT
         trap 'exit 143' TERM
         trap 'exit 129' HUP
+        # 记下归属：之后本层若再安装自己的 EXIT 陷阱，需要据此判断
+        # 「要被覆盖掉的组件清理陷阱确实是本层装的」，先释放组件再换。
+        PO0_EXIT_TRAP_OWNER=${PO0_EXIT_TRAP_SCOPE}
         return 0
     fi
     handler=${existing#trap -- \'}

@@ -346,7 +346,7 @@ test_materialize_roles_preserves_caller_exit_trap() {
             '    printf "outer-ran rc=%s\n" "${rc}" >>"${marker}"' '    exit "${rc}"' '}'
         # 与真实调用点一致：装 EXIT 陷阱的那一层必须先声明归属，
         # 否则无法把它与「从父层继承显示出来的陷阱」区分开。
-        printf '%s\n' 'po0_claim_exit_trap' 'trap cleanup_outer EXIT' 'materialize_roles' \
+        printf '%s\n' 'po0_install_exit_trap cleanup_outer' 'materialize_roles' \
             'printf "%s\n" "${RUNTIME_DIR}" >"${dirfile}"' 'exit 7'
     } >"${driver}"
     : >"${marker}"
@@ -389,7 +389,7 @@ test_materialize_roles_ignores_inherited_exit_trap() {
         printf '%s\n' 'library=$1'
         printf '%s\n' '# shellcheck disable=SC1090' 'source "${library}"'
         printf '%s\n' 'outer_cleanup() { printf "OUTER-RAN level=%s\n" "${BASH_SUBSHELL}"; }'
-        printf '%s\n' 'po0_claim_exit_trap' 'trap outer_cleanup EXIT'
+        printf '%s\n' 'po0_install_exit_trap outer_cleanup'
         printf '%s\n' '( install_runtime_exit_trap )'
         printf '%s\n' 'printf "SUBSHELL-DONE\n"'
     } >"${driver}"
@@ -403,6 +403,49 @@ test_materialize_roles_ignores_inherited_exit_trap() {
     assert_eq 1 "${ran}" '外层清理被执行的次数不是一次（继承的陷阱被误当成本层陷阱串接）' || return 1
     assert_contains "${output}" 'OUTER-RAN level=0' '外层清理没有在安装它的那一层执行' || return 1
     assert_not_contains "${output}" 'OUTER-RAN level=1' '外层清理在子 shell 退出时被提前执行' || return 1
+}
+
+# 子 shell 先经 preflight 释放内置组件（装上组件清理陷阱），之后才安装自己的
+# EXIT 陷阱——直接 trap 会把组件清理覆盖掉，/tmp/po0-unlock.* 无人清理。
+# Agent 扫描正是这个顺序：scan_agent_services 先 preflight，再由内层装 cleanup_scan_remote。
+test_late_exit_trap_releases_runtime_components() {
+    local tree=${WORK_ROOT}/late-trap lib=${WORK_ROOT}/late-trap-library.sh
+    local driver=${WORK_ROOT}/late-trap-driver.sh dirfile=${WORK_ROOT}/late-runtime-dir
+    local output rc=0 runtime_dir
+    mkdir -p "${tree}/tools" "${tree}/src/cn-entry-role"
+    cp "${PROJECT_DIR}/setup.sh" "${PROJECT_DIR}/overseas-exit-role.sh" \
+        "${PROJECT_DIR}/cn-entry-role.sh" "${tree}/"
+    cp "${BUILD_SOURCE}" "${CN_ENTRY_BUILD_SOURCE}" "${tree}/tools/"
+    cp "${PROJECT_DIR}"/src/cn-entry-role/*.sh.inc "${tree}/src/cn-entry-role/"
+    /bin/bash "${tree}/tools/build-single-file.sh" 1.1.0 >/dev/null
+    awk '/^ASSUME_YES=no$/ { exit } { print }' "${tree}/po0-unlock.sh" >"${lib}"
+    /bin/bash -n "${lib}"
+
+    {
+        printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' 'SCRIPT_VERSION=1.1.0'
+        printf '%s\n' 'library=$1' 'dirfile=$2'
+        printf '%s\n' '# shellcheck disable=SC1090' 'source "${library}"'
+        printf '%s\n' 'late_cleanup() { printf "LATE-CLEANUP-RAN\n"; }'
+        printf '%s\n' '(' \
+            '    materialize_roles' \
+            '    printf "%s\n" "${RUNTIME_DIR}" >"${dirfile}"' \
+            '    po0_install_exit_trap late_cleanup' \
+            ')'
+    } >"${driver}"
+
+    set +e
+    output=$(/bin/bash "${driver}" "${lib}" "${dirfile}" 2>&1)
+    rc=$?
+    set -e
+    assert_eq 0 "${rc}" '后装陷阱夹具没有正常结束' || return 1
+    assert_contains "${output}" 'LATE-CLEANUP-RAN' '后装的 EXIT 陷阱没有执行' || return 1
+    runtime_dir=$(<"${dirfile}")
+    [[ -n ${runtime_dir} ]] || { fail '未能取得内置组件临时目录'; return 1; }
+    if [[ -e ${runtime_dir} ]]; then
+        rm -rf -- "${runtime_dir}"
+        fail '后装 EXIT 陷阱覆盖了组件清理，内置组件临时目录残留'
+        return 1
+    fi
 }
 
 test_single_public_edition_contract() {
@@ -3203,6 +3246,7 @@ main() {
     run_test '构建、自检与确定性' test_build_and_bundle_self_test
     run_test '释放内置组件不覆盖调用方的 EXIT 陷阱' test_materialize_roles_preserves_caller_exit_trap
     run_test '释放内置组件不串接继承来的 EXIT 陷阱' test_materialize_roles_ignores_inherited_exit_trap
+    run_test '后装 EXIT 陷阱前先释放内置组件' test_late_exit_trap_releases_runtime_components
     run_test '仓库只保留唯一公开版' test_single_public_edition_contract
     run_test '用户可见产物品牌禁词' test_user_visible_branding_terms
     run_test '活动源码不含 v1 旧运行名称' test_legacy_runtime_identifiers_absent
