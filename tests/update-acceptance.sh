@@ -1029,6 +1029,114 @@ test_pointer_failure_never_replaces_target() {
     assert_no_transaction_residue 'po0-unlock.sh.restore'
 }
 
+# 指针写成功、随后的原子替换失败时，上一版恢复点必须原样保留。
+# 否则本次新建的备份会顶掉真正的恢复点，"恢复上一版助手"此后永远回答"无需撤销"。
+test_replacement_failure_keeps_previous_restore_point() {
+    local old new newer rc output_file pointer_after_update backups_after_update
+    load_harness 1.0.0
+    old=${CASE_DIR}/old.sh
+    new=${CASE_DIR}/new.sh
+    newer=${CASE_DIR}/newer.sh
+    write_fixture_script "${old}" 1.0.0 good replace-fail-old
+    write_fixture_script "${new}" 1.1.0 good replace-fail-new
+    write_fixture_script "${newer}" 1.2.0 good replace-fail-newer
+    cp -p "${old}" "${SCRIPT_PATH}"
+    chmod 0700 "${SCRIPT_PATH}"
+    TEST_ASSET_FILE=${new}
+    TEST_RELEASE_JSON=$(make_release_json 1.1.0 "$(sha256_file "${new}")")
+    set +e
+    perform_script_update >/dev/null 2>&1
+    rc=$?
+    set -e
+    assert_eq 20 "${rc}" '夹具未能先完成一次成功更新' || return 1
+    SCRIPT_VERSION=1.1.0
+    pointer_after_update=$(<"${UPDATE_LAST_BACKUP}")
+    backups_after_update=$(find "${UPDATE_BACKUP_DIR}" -type f | wc -l | tr -d ' ')
+
+    # 只让针对目标脚本的原子替换失败；其余 mv（含指针还原）仍走夹具的可移植实现。
+    eval "$(declare -f mv | sed '1s/^mv /harness_mv /')"
+    mv() {
+        local last=${*: -1}
+        if [[ ${last} == "${SCRIPT_PATH}" ]]; then
+            case "$*" in
+                *po0-unlock.sh.update.*|*po0-unlock.sh.restore.*) return 1 ;;
+            esac
+        fi
+        harness_mv "$@"
+    }
+    TEST_ASSET_FILE=${newer}
+    TEST_RELEASE_JSON=$(make_release_json 1.2.0 "$(sha256_file "${newer}")")
+    output_file=${CASE_DIR}/replace-failure.out
+    set +e
+    perform_script_update >"${output_file}" 2>&1
+    rc=$?
+    set -e
+    [[ ${rc} -ne 0 && ${rc} -ne 20 ]] || fail '原子替换失败时更新没有停止'
+    assert_contains "$(<"${output_file}")" '原子替换失败' '原子替换失败的提示不明确'
+    assert_file_eq "${new}" "${SCRIPT_PATH}" '原子替换失败后目标脚本被改动'
+    assert_eq "${pointer_after_update}" "$(<"${UPDATE_LAST_BACKUP}")" \
+        '原子替换失败后上一版恢复点被本次新建的备份顶掉' || return 1
+    assert_eq "${backups_after_update}" "$(find "${UPDATE_BACKUP_DIR}" -type f | wc -l | tr -d ' ')" \
+        '原子替换失败后留下了无人引用的孤儿备份' || return 1
+    assert_no_transaction_residue 'po0-unlock.sh.update'
+
+    # 恢复点必须仍然可用：此时撤销应当把脚本退回 1.0.0。
+    eval "$(declare -f harness_mv | sed '1s/^harness_mv /mv /')"
+    set +e
+    perform_script_restore >/dev/null 2>&1
+    rc=$?
+    set -e
+    assert_eq 20 "${rc}" '原子替换失败后恢复上一版不再可用' || return 1
+    assert_file_eq "${old}" "${SCRIPT_PATH}" '恢复上一版没有退回到更新前的版本'
+
+    # 撤销路径同样不能在替换失败后顶掉恢复点。
+    load_harness 1.0.0
+    old=${CASE_DIR}/old.sh
+    new=${CASE_DIR}/new.sh
+    write_fixture_script "${old}" 1.0.0 good restore-fail-old
+    write_fixture_script "${new}" 1.1.0 good restore-fail-new
+    cp -p "${old}" "${SCRIPT_PATH}"
+    chmod 0700 "${SCRIPT_PATH}"
+    TEST_ASSET_FILE=${new}
+    TEST_RELEASE_JSON=$(make_release_json 1.1.0 "$(sha256_file "${new}")")
+    set +e
+    perform_script_update >/dev/null 2>&1
+    rc=$?
+    set -e
+    assert_eq 20 "${rc}" '撤销夹具未能先完成一次成功更新' || return 1
+    SCRIPT_VERSION=1.1.0
+    pointer_after_update=$(<"${UPDATE_LAST_BACKUP}")
+    backups_after_update=$(find "${UPDATE_BACKUP_DIR}" -type f | wc -l | tr -d ' ')
+    eval "$(declare -f mv | sed '1s/^mv /harness_mv /')"
+    mv() {
+        local last=${*: -1}
+        if [[ ${last} == "${SCRIPT_PATH}" ]]; then
+            case "$*" in *po0-unlock.sh.restore.*) return 1 ;; esac
+        fi
+        harness_mv "$@"
+    }
+    output_file=${CASE_DIR}/restore-replace-failure.out
+    set +e
+    perform_script_restore >"${output_file}" 2>&1
+    rc=$?
+    set -e
+    eval "$(declare -f harness_mv | sed '1s/^harness_mv /mv /')"
+    [[ ${rc} -ne 0 && ${rc} -ne 20 ]] || fail '撤销的替换失败时没有停止'
+    assert_file_eq "${new}" "${SCRIPT_PATH}" '撤销替换失败后目标脚本被改动'
+    assert_eq "${pointer_after_update}" "$(<"${UPDATE_LAST_BACKUP}")" \
+        '撤销替换失败后上一版恢复点被顶掉' || return 1
+    assert_eq "${backups_after_update}" "$(find "${UPDATE_BACKUP_DIR}" -type f | wc -l | tr -d ' ')" \
+        '撤销替换失败后留下了无人引用的孤儿备份' || return 1
+    assert_no_transaction_residue 'po0-unlock.sh.restore'
+
+    set +e
+    perform_script_restore >/dev/null 2>&1
+    rc=$?
+    set -e
+    assert_eq 20 "${rc}" '撤销替换失败后恢复上一版不再可用' || return 1
+    assert_file_eq "${old}" "${SCRIPT_PATH}" '重试撤销没有退回到更新前的版本'
+}
+
 test_restore_confirmation_change_is_rejected() {
     local old new changed output rc backup_count_before backup_count_after
     load_harness 1.0.0
@@ -2912,6 +3020,7 @@ main() {
     run_test '有效更新、备份、原子替换与恢复' test_valid_update_backup_and_restore
     run_test '撤销到 v2.3 时同步恢复旧配置位置' test_restore_pre_24_script_and_config_together
     run_test '备份指针写失败不替换更新/恢复目标' test_pointer_failure_never_replaces_target
+    run_test '原子替换失败后上一版恢复点仍然可用' test_replacement_failure_keeps_previous_restore_point
     run_test '恢复确认期间目标变化拒绝' test_restore_confirmation_change_is_rejected
     run_test '0777 目标脚本拒绝' test_world_writable_target_is_rejected
     run_test '主菜单与脚本管理菜单 0 无副作用' test_zero_paths_have_no_side_effects
