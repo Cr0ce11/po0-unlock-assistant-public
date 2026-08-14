@@ -2526,6 +2526,68 @@ test_ssh_port_is_normalized() (
     [[ ${rc} -ne 0 ]] || { fail '端口 0 没有被拒绝'; return 1; }
 )
 
+# 安装时会拒绝已被其他国外出口占用的入口，但「更新连接配置」此前一律用 allow-active，
+# 把这道检查整个跳过——一台出口机因此可以指向另一套已部署的入口。而菜单里的完整回滚
+# 发的是不带归属标识的拆除命令（出口侧从不持久化安装事务标识，后续会话拿不出来），
+# 于是就能拆掉不属于自己的部署。这里堵住那条唯一的可达路径。
+test_reconfigure_refuses_claimed_entry() (
+    set -Eeuo pipefail
+    local case_dir body log rc output
+    load_harness 2.5.22
+    case_dir=${CASE_DIR}
+    log=${case_dir}/authorize.log
+    : >"${log}"
+
+    # 纯判定函数：同机沿用 allow-active，换机改为 require-unclaimed。
+    assert_eq allow-active "$(reconfigure_entry_policy 10.0.0.10 10.0.0.10)" \
+        '指向同一台入口时不应改变占用策略' || return 1
+    assert_eq require-unclaimed "$(reconfigure_entry_policy 10.0.0.10 10.0.0.20)" \
+        '换到另一台入口时没有按新装处理' || return 1
+    assert_eq require-unclaimed "$(reconfigure_entry_policy '' 10.0.0.20)" \
+        '缺少旧地址时没有采用更严格的策略' || return 1
+
+    # 真实流程：把 guided_reconfigure 里硬编码的状态路径换成夹具目录后实跑，
+    # 断言它把正确的策略传给 authorize。
+    mkdir -p -- "${case_dir}/state"
+    : >"${case_dir}/state/ACTIVE"
+    body=$(sed -n '/^guided_reconfigure() (/,/^)$/p' "${LIBRARY}")
+    [[ -n ${body} ]] || { fail '未能提取连接更新流程'; return 1; }
+    body=${body//\/var\/lib\/po0-unlock/${case_dir}/state}
+    eval "${body}"
+
+    CONFIG_FILE=${case_dir}/hosts.conf
+    printf '%s\n' 'CN_ENTRY_SSH_USER=root' 'CN_ENTRY_PRIVATE_IP=10.0.0.10' \
+        'CN_ENTRY_SSH_PORT=22' >"${CONFIG_FILE}"
+    chmod 0600 "${CONFIG_FILE}"
+    require_root() { :; }
+    ui_header() { :; }
+    ui_step() { :; }
+    validate_managed_config_file() { :; }
+    show_connection_summary() { :; }
+    confirm_yes() { :; }
+    begin_reconfigure_config_transaction() { :; }
+    write_config_file() { :; }
+    reconfigure_core() { :; }
+    log() { :; }
+    authorize() { printf '%s\n' "$2" >>"${log}"; }
+
+    # 情形一：地址不变 → 沿用 allow-active
+    configure() { CN_ENTRY_PRIVATE_IP=10.0.0.10; }
+    rc=0
+    output=$( (guided_reconfigure) 2>&1 ) || rc=$?
+    assert_eq 0 "${rc}" "同机重配失败：${output}" || return 1
+    assert_eq allow-active "$(<"${log}")" '同机重配没有沿用 allow-active' || return 1
+
+    # 情形二：换到另一台入口 → require-unclaimed
+    : >"${log}"
+    configure() { CN_ENTRY_PRIVATE_IP=10.0.0.20; }
+    rc=0
+    output=$( (guided_reconfigure) 2>&1 ) || rc=$?
+    assert_eq 0 "${rc}" '换机重配失败' || return 1
+    assert_eq require-unclaimed "$(<"${log}")" \
+        '换到另一台入口时仍跳过了占用检查' || return 1
+)
+
 test_management_ssh_uses_keepalive() {
     local master_body authorize_body
     master_body=$(sed -n '/^start_cn_entry_session() {/,/^}/p' "${SETUP_SOURCE}")
@@ -3318,6 +3380,7 @@ main() {
     run_test '国内入口状态目录守卫拒绝异常路径' test_cn_entry_active_state_guards_paths
     run_test 'write_helper 失败后不留临时文件' test_write_helper_cleans_temp_on_failure
     run_test '国内入口 SSH 端口归一化去掉前导零' test_ssh_port_is_normalized
+    run_test '换入口时的连接更新拒绝已被占用的入口' test_reconfigure_refuses_claimed_entry
     run_test '管理 SSH 连接启用保活' test_management_ssh_uses_keepalive
     run_test '远程组件调用超时有界并释放操作锁' test_remote_component_timeout_is_bounded_and_releases_operation_lock
     run_test '国内入口写锁等待有界且超时零写入' test_cn_entry_lock_timeout_is_bounded_and_preserves_config

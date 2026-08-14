@@ -1261,6 +1261,18 @@ authorize_admin_key_once() {
         "set -eu; ${occupied_guard}; umask 077; install -d -m 0700 \"\$HOME/.ssh\"; touch \"\$HOME/.ssh/authorized_keys\"; key=\$(printf '%s' '${public_key_b64}' | base64 -d); grep -Fqx -- \"\$key\" \"\$HOME/.ssh/authorized_keys\" || printf '\\n%s\\n' \"\$key\" >>\"\$HOME/.ssh/authorized_keys\"; chmod 0600 \"\$HOME/.ssh/authorized_keys\""
 }
 
+# 更新连接配置时的入口占用策略：指向同一台入口时沿用 allow-active——自己已有的
+# ACTIVE 不该拒绝自己；换到另一台入口则按新装处理，拒绝已被其他出口占用的机器。
+# 只比较地址：同一台机器换 SSH 端口是合法操作，不应被当成换机器。
+reconfigure_entry_policy() {
+    local previous=${1:-} current=${2:-}
+    if [[ -n ${previous} && ${current} == "${previous}" ]]; then
+        printf '%s\n' allow-active
+        return 0
+    fi
+    printf '%s\n' require-unclaimed
+}
+
 authorize() {
     local config_mode=${1:-load} entry_policy=${2:-require-unclaimed}
     local public_key_b64 authorize_rc
@@ -1285,7 +1297,7 @@ authorize() {
         authorize_rc=$?
         if [[ ${entry_policy} == require-unclaimed \
             && ${authorize_rc} -eq ${CN_ENTRY_OCCUPIED_RC} ]]; then
-            die '国内入口已经部署 Po0；为避免影响现有出口，未添加本机管理密钥。请改用独立的国内入口测试机。'
+            die '国内入口已经部署 Po0；为避免影响现有出口，未添加本机管理密钥。若确实要改用这台入口，请先在其上完成完整回滚；否则请改用独立的国内入口测试机。'
         fi
         recover_admin_known_hosts_after_reinstall \
             || die '国内入口专用密钥授权失败；若服务器刚重装，请核对新指纹后重试。'
@@ -2155,10 +2167,16 @@ guided_install() {
 }
 
 guided_reconfigure() (
+    local previous_entry_ip= entry_policy
     require_root
     ui_header
     [[ -r /var/lib/po0-unlock/ACTIVE ]] \
         || die '尚未检测到有效安装，请从主菜单选择“一键安装”。'
+    if [[ -e ${CONFIG_FILE} || -L ${CONFIG_FILE} ]]; then
+        validate_managed_config_file "${CONFIG_FILE}" '当前连接配置'
+        read_config_file "${CONFIG_FILE}"
+        previous_entry_ip=${CN_ENTRY_PRIVATE_IP}
+    fi
     ui_step '第 1/3 步' '更新国内入口连接信息并重新识别国外出口源地址'
     configure yes no
     show_connection_summary '更新现有隧道' no
@@ -2171,7 +2189,11 @@ guided_reconfigure() (
     write_config_file
 
     ui_step '第 2/3 步' '验证或重新授权国内入口 SSH'
-    authorize current allow-active
+    entry_policy=$(reconfigure_entry_policy "${previous_entry_ip}" "${CN_ENTRY_PRIVATE_IP}")
+    if [[ ${entry_policy} == require-unclaimed ]]; then
+        log '检测到更换国内入口；将按新装处理，拒绝已被其他国外出口占用的入口。'
+    fi
+    authorize current "${entry_policy}"
 
     ui_step '第 3/3 步' '更新隧道并验证代理出口'
     reconfigure_core current
