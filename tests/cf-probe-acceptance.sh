@@ -576,6 +576,58 @@ FAKE_CURL
     [[ ! -e ${directory} ]] || { fail '停用后兼容目录仍残留'; return 1; }
 }
 
+# cf-probe 的测速目标改写发生在 drop-in 落盘之前（TX_DROPIN_MAY_EXIST 置位更晚）。
+# 补偿动作若嵌在该标志的判断里，窗口内失败就会整块跳过：目标已被改写却未进托管清单，
+# go-pending 与兼容目录残留，健康检查看不到，停用也会以「不在托管清单」拒绝清理。
+test_enable_rollback_compensates_before_dropin_flag() (
+    local case_dir compat_dir log rc
+    case_dir=$(mktemp -d "${TMPDIR:-/tmp}/po0-enable-rollback.XXXXXXXX")
+    trap 'rm -rf -- "${case_dir}"' EXIT
+    compat_dir=${case_dir}/po0-cf-probe-compat
+    log=${case_dir}/compensation.log
+    mkdir -p -- "${compat_dir}"
+    : >"${compat_dir}/go-pending"
+    : >"${log}"
+
+    eval "$(sed -n '/^enable_transaction_cleanup() {/,/^}/p' "${CN_ENTRY_ROLE}")"
+    rollback_cf_probe_go_latency_compat() { printf 'ROLLBACK_TARGETS\n' >>"${log}"; }
+    remove_cf_probe_latency_compat() { printf 'REMOVE_COMPAT\n' >>"${log}"; }
+    remove_cf_probe_direct_report_compat() { printf 'REMOVE_CURL_COMPAT\n' >>"${log}"; }
+    remove_cf_probe_go_guard_units() { :; }
+    remove_komari_identity_guard() { :; }
+    remove_managed_unit() { :; }
+    restart_and_verify_running() { :; }
+    systemctl() { :; }
+
+    # 失败发生在 TX_DROPIN_MAY_EXIST 置位之前：这是本用例要守住的窗口。
+    TX_COMMITTED=no
+    TX_UNIT=demo-agent.service
+    TX_STATE=${case_dir}/state
+    TX_DROPIN_DIR=${case_dir}/dropin
+    TX_DROPIN_FILE=${TX_DROPIN_DIR}/90-po0-unlock-proxy.conf
+    TX_DROPIN_MAY_EXIST=no
+    TX_COMPAT_DIR=${compat_dir}
+    TX_COMPAT_CREATED=yes
+    TX_COMPAT_CURL_CREATED=no
+    TX_CF_GUARD_CREATED=no
+    TX_KOMARI_IDENTITY_CREATED=no
+    TX_ORIGINAL_RUNNING=no
+    TX_LIST_MAY_CHANGE=no
+    rc=0
+    ( enable_transaction_cleanup 1 ) >/dev/null 2>&1 || rc=$?
+
+    grep -Fxq ROLLBACK_TARGETS "${log}" \
+        || { fail 'drop-in 落盘前失败没有恢复 cf-probe 本轮测速目标'; return 1; }
+    grep -Fxq REMOVE_COMPAT "${log}" \
+        || { fail 'drop-in 落盘前失败没有清理本次创建的 cf-probe 兼容文件'; return 1; }
+
+    # 事务已提交时不得执行任何补偿。
+    : >"${log}"
+    TX_COMMITTED=yes
+    ( enable_transaction_cleanup 0 ) >/dev/null 2>&1 || true
+    [[ ! -s ${log} ]] || { fail '事务已提交仍执行了回滚补偿'; return 1; }
+)
+
 test_source_lifecycle_contracts() {
     local source helper_case disable_body scan_body configured_body
     source=$(sed -n '1,$p' "${CN_ENTRY_ROLE}")
@@ -662,6 +714,7 @@ main() {
     run_case 'Go Agent 首次事务中断后可自动恢复' test_go_agent_stale_first_transaction_recovery
     run_case 'Go Agent 面板动态配置覆盖可持续收敛' test_go_agent_dynamic_config_guard
     run_case '服务专用兼容文件可直连上报、失败回退并安全清理' test_wrapper_lifecycle_and_scope
+    run_case '启用事务在 drop-in 落盘前失败也会补偿 cf-probe' test_enable_rollback_compensates_before_dropin_flag
     run_case '启用、刷新、失败回滚、停用和扫描路径均已接入' test_source_lifecycle_contracts
     printf '结果：%d 通过，%d 失败\n' "${PASS_COUNT}" "${FAIL_COUNT}"
     (( FAIL_COUNT == 0 ))
