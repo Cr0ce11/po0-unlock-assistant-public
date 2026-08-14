@@ -160,45 +160,114 @@ bundle_self_test() {
 RUNTIME_TAIL
 }
 
+assert_build_pattern_count() {
+    local pattern=$1 expected=$2 actual=$3
+    [[ ${actual} == "${expected}" ]] || {
+        printf '单文件构建匹配计数异常：%s，期望 %s 次，实际 %s 次。\n' \
+            "${pattern}" "${expected}" "${actual}" >&2
+        exit 1
+    }
+}
+
+assert_candidate_line_count() {
+    local pattern=$1 expected=$2 actual
+    actual=$(grep -Fxc -- "${pattern}" "${candidate}" || true)
+    [[ ${actual} == "${expected}" ]] || {
+        printf '单文件构建语义校验失败：%s，期望 %s 次，实际 %s 次。\n' \
+            "${pattern}" "${expected}" "${actual}" >&2
+        exit 1
+    }
+}
+
+assert_candidate_function_materialization() {
+    local function_name=$1 opening=$2 closing=$3 body actual
+    body=$(awk -v start="${function_name}() ${opening}" -v finish="${closing}" '
+        $0 == start {
+            starts++
+            active=1
+        }
+        active { print }
+        active && $0 == finish {
+            active=0
+            finishes++
+        }
+        END {
+            if (starts != 1 || finishes != 1 || active) exit 1
+        }
+    ' "${candidate}") || {
+        printf '单文件构建语义校验失败：无法唯一识别 %s 函数体。\n' \
+            "${function_name}" >&2
+        exit 1
+    }
+    actual=$(grep -Fxc -- '    materialize_roles' <<<"${body}" || true)
+    [[ ${actual} == 1 ]] || {
+        printf '单文件构建语义校验失败：%s 函数中的 materialize_roles 期望 1 次，实际 %s 次。\n' \
+            "${function_name}" "${actual}" >&2
+        exit 1
+    }
+}
+
 in_preflight=no
 in_health_check=no
 in_diagnostic_report=no
 source_ref='${SCRIPT_DIR}/cn-entry-role.sh'
 bundle_ref='${CN_ENTRY_ROLE_LOCAL}'
+match_runtime_comment=0
+match_script_version=0
+match_edition_label=0
+match_exit_role=0
+match_cn_entry_role=0
+match_require_root_definition=0
+match_preflight_start=0
+match_health_check_start=0
+match_diagnostic_report_start=0
+match_require_root_call=0
+match_usage_authorize=0
+match_help_branch=0
 while IFS= read -r line || [[ -n ${line} ]]; do
     case "${line}" in
         '# 本脚本必须在国外出口 VPS 上以 root 运行。')
+            match_runtime_comment=$((match_runtime_comment + 1))
             printf '%s\n' "${line}"
             ;;
         'SCRIPT_VERSION=${SCRIPT_VERSION:-dev}')
+            match_script_version=$((match_script_version + 1))
             printf 'SCRIPT_VERSION=%q\n' "${SCRIPT_VERSION}"
             ;;
         'SCRIPT_EDITION_LABEL=公开版')
+            match_edition_label=$((match_edition_label + 1))
             printf '%s\n' 'SCRIPT_EDITION_LABEL=公开版'
             ;;
         'EXIT_ROLE=${SCRIPT_DIR}/overseas-exit-role.sh')
+            match_exit_role=$((match_exit_role + 1))
             printf '%s\n' 'RUNTIME_DIR=' 'EXIT_ROLE='
             ;;
         'CN_ENTRY_ROLE_LOCAL=${SCRIPT_DIR}/cn-entry-role.sh')
+            match_cn_entry_role=$((match_cn_entry_role + 1))
             printf '%s\n' 'CN_ENTRY_ROLE_LOCAL='
             ;;
         'require_root() '*)
+            match_require_root_definition=$((match_require_root_definition + 1))
             printf '%s\n' "${line}"
             emit_runtime_support
             ;;
         'preflight() {')
+            match_preflight_start=$((match_preflight_start + 1))
             in_preflight=yes
             printf '%s\n' "${line}"
             ;;
         'health_check() (')
+            match_health_check_start=$((match_health_check_start + 1))
             in_health_check=yes
             printf '%s\n' "${line}"
             ;;
         'diagnostic_report() (')
+            match_diagnostic_report_start=$((match_diagnostic_report_start + 1))
             in_diagnostic_report=yes
             printf '%s\n' "${line}"
             ;;
         '    require_root')
+            match_require_root_call=$((match_require_root_call + 1))
             printf '%s\n' "${line}"
             if [[ ${in_preflight} == yes ]]; then
                 printf '%s\n' '    materialize_roles'
@@ -212,10 +281,12 @@ while IFS= read -r line || [[ -n ${line} ]]; do
             fi
             ;;
         '  ./${PROGRAM_NAME} authorize')
+            match_usage_authorize=$((match_usage_authorize + 1))
             printf '%s\n' "${line}"
             printf '%s\n' '  ./${PROGRAM_NAME} self-test'
             ;;
         '    help|-h|--help) usage ;;')
+            match_help_branch=$((match_help_branch + 1))
             printf '%s\n' '    self-test) bundle_self_test ;;'
             printf '%s\n' '    __extract-role) extract_embedded_role "${2:-}" ;;'
             printf '%s\n' "${line}"
@@ -227,8 +298,29 @@ while IFS= read -r line || [[ -n ${line} ]]; do
     esac
 done <"${SETUP_SOURCE}" >"${candidate}"
 
+assert_build_pattern_count '# 本脚本必须在国外出口 VPS 上以 root 运行。' 1 "${match_runtime_comment}"
+assert_build_pattern_count 'SCRIPT_VERSION=${SCRIPT_VERSION:-dev}' 1 "${match_script_version}"
+assert_build_pattern_count 'SCRIPT_EDITION_LABEL=公开版' 1 "${match_edition_label}"
+assert_build_pattern_count 'EXIT_ROLE=${SCRIPT_DIR}/overseas-exit-role.sh' 1 "${match_exit_role}"
+assert_build_pattern_count 'CN_ENTRY_ROLE_LOCAL=${SCRIPT_DIR}/cn-entry-role.sh' 1 "${match_cn_entry_role}"
+assert_build_pattern_count 'require_root() *' 1 "${match_require_root_definition}"
+assert_build_pattern_count 'preflight() {' 1 "${match_preflight_start}"
+assert_build_pattern_count 'health_check() (' 1 "${match_health_check_start}"
+assert_build_pattern_count 'diagnostic_report() (' 1 "${match_diagnostic_report_start}"
+assert_build_pattern_count '    require_root' 11 "${match_require_root_call}"
+assert_build_pattern_count '  ./${PROGRAM_NAME} authorize' 1 "${match_usage_authorize}"
+assert_build_pattern_count '    help|-h|--help) usage ;;' 1 "${match_help_branch}"
+
 chmod 0700 "${candidate}"
 /bin/bash -n "${candidate}"
+assert_candidate_function_materialization preflight '{' '}'
+assert_candidate_function_materialization health_check '(' ')'
+assert_candidate_function_materialization diagnostic_report '(' ')'
+assert_candidate_line_count 'RUNTIME_DIR=' 1
+assert_candidate_line_count 'EXIT_ROLE=' 1
+assert_candidate_line_count 'CN_ENTRY_ROLE_LOCAL=' 1
+assert_candidate_line_count '    self-test) bundle_self_test ;;' 1
+assert_candidate_line_count '    __extract-role) extract_embedded_role "${2:-}" ;;' 1
 /bin/bash "${candidate}" self-test >/dev/null
 /bin/bash "${candidate}" __extract-role overseas-exit | cmp -s - "${EXIT_SOURCE}"
 /bin/bash "${candidate}" __extract-role cn-entry | cmp -s - "${CN_ENTRY_SOURCE}"
