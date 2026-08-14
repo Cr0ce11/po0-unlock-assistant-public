@@ -96,15 +96,63 @@ test_managed_backups_keep_latest_ten_and_preserve_legacy() (
     done
 )
 
+test_unmodified_source_build_succeeds() (
+    new_build_case
+    local output
+    output=$(run_build 2>&1) \
+        || fail '未改动的源码树无法正常构建'
+    [[ ${output} == *'单文件生成物未变化'* ]] \
+        || fail '未改动的源码树没有生成预期单文件'
+)
+
+test_changed_preflight_signature_is_rejected() (
+    new_build_case
+    local output rc=0 rewritten=${CASE_PROJECT}/setup.sh.rewritten
+    awk '
+        $0 == "preflight() {" {
+            print "preflight() ("
+            in_preflight=1
+            opening_replaced++
+            next
+        }
+        in_preflight && $0 == "}" {
+            print ")"
+            in_preflight=0
+            closing_replaced++
+            next
+        }
+        { print }
+        END {
+            if (in_preflight || opening_replaced != 1 || closing_replaced != 1) exit 42
+        }
+    ' "${CASE_PROJECT}/setup.sh" >"${rewritten}" \
+        || fail '测试夹具无法唯一改写 preflight 函数形式'
+    mv -- "${rewritten}" "${CASE_PROJECT}/setup.sh"
+
+    output=$(run_build 2>&1) || rc=$?
+    [[ ${rc} -ne 0 ]] \
+        || fail 'preflight 函数签名变化后构建器仍然静默成功'
+    [[ ${output} == *'单文件构建匹配计数异常：preflight() {，期望 1 次，实际 0 次。'* ]] \
+        || fail '构建拒绝时没有准确报告 preflight() { 匹配计数'
+)
+
 run_test() {
     local name=$1
     "${name}"
     printf 'PASS: %s\n' "${name}"
 }
 
+run_case() {
+    local label=$1 name=$2
+    "${name}"
+    printf 'PASS: %s\n' "${label}"
+}
+
 main() {
     run_test test_identical_rebuild_creates_no_backup
     run_test test_managed_backups_keep_latest_ten_and_preserve_legacy
+    run_case '未改动源码树仍可正常构建' test_unmodified_source_build_succeeds
+    run_case 'preflight 函数形式变化会被明确拒绝' test_changed_preflight_signature_is_rejected
     printf '%s\n' 'PASS: 单文件构建备份保留验收测试通过'
 }
 
