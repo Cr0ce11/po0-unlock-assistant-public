@@ -263,21 +263,26 @@ disable_transaction_cleanup() {
                 restore_cf_probe_go_managed_targets "${TX_COMPAT_DIR}" \
                     || echo '严重警告：无法重新应用 cf-probe 安全测速目标，请立即检查。' >&2
             fi
-            install -d -m 0755 "${TX_DROPIN_DIR}"
-            if [[ -f ${TX_BACKUP:-} ]] && mv "${TX_BACKUP}" "${TX_DROPIN_FILE}"; then
-                restored=yes
+            if [[ ${TX_DROPIN_WAS_MISSING:-no} == yes ]]; then
+                # 代理文件在事务开始前就已经不存在，回滚不需要也不应该重建它。
+                echo "${TX_UNIT} 的代理配置原本就不存在，回滚未重建任何文件。" >&2
             else
-                echo "严重警告：无法恢复 ${TX_DROPIN_FILE}；备份保留在 ${TX_BACKUP:-未知位置}。" >&2
-            fi
-            if [[ ${restored} == yes ]] && systemctl daemon-reload; then reload_ok=yes; fi
-            if [[ ${TX_ORIGINAL_RUNNING:-no} == yes ]]; then
-                if [[ ${reload_ok} == yes ]] && restart_and_verify_running "${TX_UNIT}"; then
-                    echo "已恢复 ${TX_UNIT} 的代理配置和 active/running 状态。" >&2
+                install -d -m 0755 "${TX_DROPIN_DIR}"
+                if [[ -f ${TX_BACKUP:-} ]] && mv "${TX_BACKUP}" "${TX_DROPIN_FILE}"; then
+                    restored=yes
                 else
-                    echo "严重警告：${TX_UNIT} 的代理配置已尝试恢复，但服务未恢复为 active/running。" >&2
+                    echo "严重警告：无法恢复 ${TX_DROPIN_FILE}；备份保留在 ${TX_BACKUP:-未知位置}。" >&2
                 fi
-            elif [[ ${restored} == yes ]]; then
-                echo "已恢复 ${TX_UNIT} 的代理配置，并保持原停止状态。" >&2
+                if [[ ${restored} == yes ]] && systemctl daemon-reload; then reload_ok=yes; fi
+                if [[ ${TX_ORIGINAL_RUNNING:-no} == yes ]]; then
+                    if [[ ${reload_ok} == yes ]] && restart_and_verify_running "${TX_UNIT}"; then
+                        echo "已恢复 ${TX_UNIT} 的代理配置和 active/running 状态。" >&2
+                    else
+                        echo "严重警告：${TX_UNIT} 的代理配置已尝试恢复，但服务未恢复为 active/running。" >&2
+                    fi
+                elif [[ ${restored} == yes ]]; then
+                    echo "已恢复 ${TX_UNIT} 的代理配置，并保持原停止状态。" >&2
+                fi
             fi
         fi
         if [[ ${TX_CF_GUARD_REMOVED:-no} == yes \

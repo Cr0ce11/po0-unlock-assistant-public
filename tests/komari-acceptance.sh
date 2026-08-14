@@ -788,6 +788,100 @@ test_agent_scan_cancel_skips_proxy_probe_and_batches_metadata() (
         'systemd 服务列表超时没有显示明确结论' || return 1
 )
 
+# 托管清单里的条目只能由 disable-service 的成功路径注销。若代理文件被外部删除
+# （人工清理、Agent 重装、apt purge），此前该命令直接拒绝，导致完整回滚永久停在
+# 这个单元上，产品内也没有别的注销入口。这里实跑 disable-service 分支验证三种情形。
+po0_disable_service_fixture() {
+    local case_dir=$1 systemd_root=$2 branch
+    branch=$(sed -n '/^    disable-service)/,/^        ;;/p' "${CN_ENTRY_ROLE}")
+    [[ -n ${branch} ]] || return 1
+    # 只把硬编码的 systemd 根目录换成夹具目录，其余逻辑原样保留。
+    branch=${branch//\/etc\/systemd\/system/${systemd_root}}
+    branch=${branch#*disable-service)}
+    branch=${branch%;;}
+    {
+        printf '%s\n' "MANAGED_MARKER='# Managed by Po0 Unlock; do not edit manually.'"
+        sed -n '/^managed_dropin_owned() {/,/^}/p' "${CN_ENTRY_ROLE}"
+        sed -n '/^disable_transaction_cleanup() {/,/^}/p' "${CN_ENTRY_ROLE}"
+        printf '%s\n' \
+            'usage() { echo usage >&2; }' \
+            'valid_helper_service_unit() { [[ $1 == *.service ]]; }' \
+            "helper_active_state() { printf '%s\\n' \"${case_dir}/state\"; }" \
+            'acquire_service_lock() { :; }' \
+            'confirm_helper_state_open() { :; }' \
+            "cf_probe_compat_dir() { printf '%s\\n' \"\$1/po0-cf-probe-compat\"; }" \
+            'managed_cf_probe_compat_owned() { :; }' \
+            "komari_identity_compat_dir() { printf '%s\\n' \"\$1/po0-komari-identity\"; }" \
+            'managed_komari_identity_owned() { :; }' \
+            'service_is_running() { return 1; }' \
+            'cf_probe_go_guard_units_present() { return 1; }' \
+            'remove_cf_probe_go_guard_units() { :; }' \
+            'systemctl() { :; }' \
+            'restore_cf_probe_go_original_targets() { :; }' \
+            'restore_cf_probe_go_managed_targets() { :; }' \
+            'prepare_cf_probe_go_guard_units() { :; }' \
+            'restart_and_verify_running() { :; }' \
+            'is_komari_service() { return 1; }' \
+            'remove_legacy_komari_latency_compat() { :; }' \
+            'remove_cf_probe_latency_compat() { :; }' \
+            'remove_komari_identity_guard() { :; }' \
+            "ensure_managed_unit() { printf '%s\\n' \"\$2\" >>\"\$1/managed-services\"; }"
+        printf 'run_disable_service() {\n    set -- disable-service "$1"\n%s\n}\n' "${branch}"
+    } >"${case_dir}/fixture.sh"
+    /bin/bash -n "${case_dir}/fixture.sh"
+}
+
+test_disable_service_handles_externally_removed_dropin() (
+    local case_dir systemd_root state dropin_dir dropin_file rc out
+    case_dir=$(mktemp -d "${TEMP_BASE}/po0-missing-dropin.XXXXXXXX")
+    trap 'rm -rf -- "${case_dir}"' EXIT
+    systemd_root=${case_dir}/systemd
+    state=${case_dir}/state
+    dropin_dir=${systemd_root}/demo-agent.service.d
+    dropin_file=${dropin_dir}/90-po0-unlock-proxy.conf
+    mkdir -p -- "${systemd_root}" "${state}" "${dropin_dir}"
+    po0_disable_service_fixture "${case_dir}" "${systemd_root}" \
+        || { fail '未能构造 disable-service 夹具'; return 1; }
+
+    # 情形一：代理文件存在且属于本助手，正常移除并注销。
+    printf '%s\n' 'demo-agent.service' 'other-agent.service' >"${state}/managed-services"
+    printf '%s\n' '# Managed by Po0 Unlock; do not edit manually.' '[Service]' >"${dropin_file}"
+    rc=0
+    out=$(/bin/bash -c "source '${case_dir}/fixture.sh'; run_disable_service demo-agent.service" 2>&1) || rc=$?
+    [[ ${rc} -eq 0 ]] || { fail "正常移除失败：rc=${rc}｜${out}"; return 1; }
+    grep -Fxq 'other-agent.service' "${state}/managed-services" \
+        || { fail '正常移除误删了其他托管记录'; return 1; }
+    ! grep -Fxq 'demo-agent.service' "${state}/managed-services" \
+        || { fail '正常移除后托管记录仍在'; return 1; }
+    [[ ! -e ${dropin_file} ]] || { fail '正常移除后代理文件仍在'; return 1; }
+
+    # 情形二：代理文件已被外部删除，必须按已移除处理并注销记录。
+    mkdir -p -- "${dropin_dir}"
+    printf '%s\n' 'demo-agent.service' 'other-agent.service' >"${state}/managed-services"
+    rc=0
+    out=$(/bin/bash -c "source '${case_dir}/fixture.sh'; run_disable_service demo-agent.service" 2>&1) || rc=$?
+    [[ ${rc} -eq 0 ]] \
+        || { fail "代理文件缺失时 disable-service 仍然失败：rc=${rc}｜${out}"; return 1; }
+    ! grep -Fxq 'demo-agent.service' "${state}/managed-services" \
+        || { fail '代理文件缺失时没有注销托管记录，完整回滚仍会卡住'; return 1; }
+    grep -Fxq 'other-agent.service' "${state}/managed-services" \
+        || { fail '代理文件缺失的处理误删了其他托管记录'; return 1; }
+    grep -Fq '已不存在' <<<"${out}" || { fail '没有说明代理文件已不存在'; return 1; }
+    [[ ! -e ${dropin_file} ]] || { fail '代理文件缺失的处理反而重建了文件'; return 1; }
+
+    # 情形三：代理文件存在但已被人工修改，必须继续拒绝。
+    mkdir -p -- "${dropin_dir}"
+    printf '%s\n' 'demo-agent.service' >"${state}/managed-services"
+    printf '%s\n' '# hand edited' '[Service]' >"${dropin_file}"
+    rc=0
+    out=$(/bin/bash -c "source '${case_dir}/fixture.sh'; run_disable_service demo-agent.service" 2>&1) || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '人工修改过的代理文件被自动删除'; return 1; }
+    grep -Fxq 'demo-agent.service' "${state}/managed-services" \
+        || { fail '拒绝删除时不应注销托管记录'; return 1; }
+    [[ -f ${dropin_file} ]] || { fail '拒绝删除时不应动代理文件'; return 1; }
+    grep -Fq '已被人工修改' <<<"${out}" || { fail '拒绝原因不明确'; return 1; }
+)
+
 test_managed_agent_action_menu_can_refresh_or_disable() (
     set -Eeuo pipefail
     local function_body output actions rc
@@ -886,6 +980,7 @@ main() {
     run_case 'ICMP 指引、旧方案清理与完整回滚均已接入' test_install_and_lifecycle_contracts
     run_case 'Agent 扫描取消不探测代理且批量读取元数据' test_agent_scan_cancel_skips_proxy_probe_and_batches_metadata
     run_case '已配置 Agent 可从扫描入口检查更新或安全撤销' test_managed_agent_action_menu_can_refresh_or_disable
+    run_case '代理文件被外部删除后仍可注销托管记录' test_disable_service_handles_externally_removed_dropin
     printf '结果：%d 通过，%d 失败\n' "${PASS_COUNT}" "${FAIL_COUNT}"
     (( FAIL_COUNT == 0 ))
 }
