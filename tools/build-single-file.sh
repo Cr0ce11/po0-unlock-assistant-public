@@ -92,11 +92,19 @@ runtime_chain_exit_cleanup() {
 install_runtime_exit_trap() {
     local existing handler
     existing=$(trap -p EXIT)
-    if [[ -z ${existing} ]]; then
+    # bash 在 ( ) 子 shell 里会用 trap -p 显示父 shell 的陷阱，但它在子 shell 内并不生效。
+    # 只有归属标记与当前 shell 层级一致时，才说明这确实是本层自己装的陷阱、可以串接；
+    # 否则串接会让外层清理在子 shell 退出时提前执行（关闭 SSH 主连接、释放操作锁）。
+    po0_exit_trap_scope
+    if [[ -z ${existing} ]] \
+        || [[ ${PO0_EXIT_TRAP_OWNER:-} != "${PO0_EXIT_TRAP_SCOPE}" ]]; then
         trap runtime_exit_cleanup EXIT
         trap 'exit 130' INT
         trap 'exit 143' TERM
         trap 'exit 129' HUP
+        # 记下归属：之后本层若再安装自己的 EXIT 陷阱，需要据此判断
+        # 「要被覆盖掉的组件清理陷阱确实是本层装的」，先释放组件再换。
+        PO0_EXIT_TRAP_OWNER=${PO0_EXIT_TRAP_SCOPE}
         return 0
     fi
     handler=${existing#trap -- \'}
