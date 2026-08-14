@@ -15,6 +15,7 @@
 | 工作副本状态 | 无未提交改动；`cn-entry-role.sh` 与 `po0-unlock.sh` 与源码的确定性构建结果一致 |
 | 生产环境 | 本次交接没有登录或修改任何服务器 |
 | 已知未解决缺陷 | 无已登记项 |
+| 交接基线正式记录 | [PR #6](https://github.com/DTB201/po0-unlock-assistant-public/pull/6)；本仓库未启用 GitHub Issue，交接记录以本文件和该 PR 为准 |
 
 ### 维护期约束
 

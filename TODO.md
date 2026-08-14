@@ -8,7 +8,7 @@
 
 | 编号 | 优先级 | 状态 | 正式记录 | 事项 | 完成条件 |
 |---|---|---|---|---|---|
-| GOV-001 | P1 | 完成 | 本文件与 [`PROJECT.md`](PROJECT.md)、[`docs/HANDOVER.md`](docs/HANDOVER.md) | 建立项目状态、待办与维护交接基线 | 三份长期文档与 v2.5.18、公开 CI 和 Release 事实一致；不改变运行代码、生成物或服务器行为，本地验收清单与公开 CI 全部通过 |
+| GOV-001 | P1 | 完成 | [PR #6](https://github.com/DTB201/po0-unlock-assistant-public/pull/6) | 建立项目状态、待办与维护交接基线 | 三份长期文档与 v2.5.18、公开 CI 和 Release 事实一致；不改变运行代码、生成物或服务器行为，本地验收清单与公开 CI 全部通过 |
 | HAND-001 | P1 | 进行中 | [`docs/HANDOVER.md`](docs/HANDOVER.md) | Claude Code 临时维护期（2026-08-14 起） | 交回 Codex 时在 `docs/HANDOVER.md` 追加交接结束小节，记录期间合并的 PR、发布的版本、未完成事项、回退方式、交回时的 `main` 提交与开放项，并同步更新 `PROJECT.md` 的维护执行方 |
 | GOV-002 | P2 | 待决定 | 项目所有者决定 | 是否启用 GitHub Issue 作为需求与缺陷的登记入口 | 所有者作出决定；若启用，同步调整 `PROJECT.md`、本文件和协作说明，改由 Issue 承载需求与优先级 |
 | GOV-003 | P3 | 暂缓 | 项目所有者决定 | 是否授予开源许可 | 当前明确不授予；未经所有者明确决定，不新增 `LICENSE`、不在文档中宣称开源或暗示已授权复制、修改、再发布及商业使用 |
