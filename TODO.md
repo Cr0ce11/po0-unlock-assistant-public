@@ -15,13 +15,40 @@
 | OPS-001 | P2 | 暂缓 | 项目所有者决定（2026-08-14） | v2.5.18 的专门真机验证 | 当前不安排临时验证机；项目所有者在日后实际使用中验证。若使用中发现问题，按缺陷单独立项并优先处理；若今后决定恢复专门验证，先记录授权方式、检查项和失败恢复路径，且不把地址、端口或凭据写入仓库 |
 | SEC-001 | P1 | 暂缓 | 项目所有者决定（2026-08-14） | 处置改名后被释放的旧账号名 `DTB201` | GitHub 账号改名后旧名可被任何人重新注册；一旦被他人注册，v2.5.18 及更早版本内置的旧更新地址会指向他人仓库。项目所有者已知悉该风险，判断本项目为个人自用、影响可接受，决定当前不注册占位账号。若今后有他人使用本项目，应重新评估 |
 | REL-002 | P1 | 完成 | v2.5.19 Release | 发布包含新更新地址的正式版 | v2.5.19 已发布；标签与脚本内版本一致，两个 Release 附件的 GitHub digest 与本地 SHA-256 逐一核对通过 |
+| BUG-001 | P1 | 待办 | 本文件（2026-08-14 审查） | 更新与撤销更新的恢复点指针先于脚本替换落盘，失败后不回滚 | `setup.sh:2994`、`setup.sh:3083` 先写 `UPDATE_LAST_BACKUP` 再替换目标，`setup.sh:2921-2929`、`setup.sh:3024-3029` 的清理不还原指针。照 `setup.sh:2448-2460`、`setup.sh:2341-2360` 已有写法补快照与回滚，修正 `setup.sh:3000` 文案，并补验收：指针写成功但替换失败后旧恢复点仍可用 |
+| BUG-002 | P1 | 待办 | 本文件（2026-08-14 审查） | 构建注入的 `materialize_roles` 无条件覆盖外层 EXIT 陷阱 | `tools/build-single-file.sh:94`（注入点 `:269-282`）无条件 `trap ... EXIT`，导致 `guided_reconfigure`（`setup.sh:2106`）的配置事务回滚陷阱和 `cleanup_cn_entry_operation`（`setup.sh:800-810`）被替换：重配置中途失败不还原旧配置，安装/回滚结束后 SSH 控制会话不主动关闭。改为仅在当前无 EXIT 陷阱时安装，或由既有清理函数顺带调用；补验收断言操作结束后控制目录已清理 |
+| BUG-003 | P1 | 待办 | 本文件（2026-08-14 审查） | 无终端输入时 `prompt_required_value` 无限空转并占死操作锁 | `setup.sh:835` 未检查 `read` 退出码，调用点在命令替换子 shell 内（`setup.sh:847`、`setup.sh:871`）使 `set -e` 失效；stdin 为 EOF 时死循环刷 stderr 并一直持有 `/run/po0-unlock/operation.lock`。`read ... || die`，`prompt_value`（`setup.sh:828`）同样传出失败，`configure`（`setup.sh:858`）补 `[[ -t 0 ]]` 守卫；补验收：stdin 为 `/dev/null` 时应快速失败 |
+| QA-001 | P1 | 待办 | 本文件（2026-08-14 审查） | 「安全修复须先经用户确认」与两端 `health()` 返回码零运行时覆盖 | `tests/health-acceptance.sh:314` 只比较源码文本行号先后，`:262` 只跑过全绿路径。变异验证：把 `setup.sh:1605` 的拒绝分支改成空操作后，8 套 136 项验收仍全绿。仿 `tests/health-acceptance.sh:218-308` 的夹具手法补运行时用例，断言 `allow_repair=no`／非 TTY／回答 n／EOF 四种情况下 `EXIT_CMD_REPAIR` 调用次数为 0，并覆盖 `health()` 的 0／2／1 三种退出码 |
+| BUG-004 | P2 | 待办 | 本文件（2026-08-14 审查） | 托管 drop-in 被外部删除后完整回滚永久卡死且产品内无自救入口 | `src/cn-entry-role/95-role-status-rollback.sh.inc:206-212` 遍历托管清单调用 `disable-service`，任一失败即 `die`；`70-helper-command-dispatch.sh.inc:405-406` 要求 `managed_dropin_owned`，而 `50-helper-service-transactions.sh.inc:164` 第一句就是 `[[ -f ${file} ]] || return 1`。清单条目只能由 `disable-service` 成功路径移除，扫描菜单把该单元标为 `托管记录异常`（`90-role-agent-management.sh.inc:283`）且 `managed=no`，被 `:322-323` 拒绝处理。`health` 会报「国外出口配置缺失或已被修改」但不提供修复。需要一条明确路径：drop-in 已不存在且清单有记录时按已移除处理并清理条目；配运行时验收 |
+| SEC-002 | P2 | 待办 | 本文件（2026-08-14 审查） | `repair` 的隧道单元归属校验跳过全部主机密钥参数 | `overseas-exit-role.sh:756-757` 用两条 `grep -Fq` 只锚定 ExecStart 首尾子串，`-i`、`UserKnownHostsFile`、`StrictHostKeyChecking=yes`、`ExitOnForwardFailure` 均不在校验范围，且与同文件 `:747` 对代理单元的整行精确匹配不一致。被人工加入 `StrictHostKeyChecking=no` 的隧道仍会被判为「属于本助手」并 `systemctl enable --now`。改用模板重建整行并 `grep -Fqx` 精确比对、确认只有一条 ExecStart；补验收：篡改主机密钥参数后 `repair` 必须拒绝 |
+| OPS-002 | P2 | 待办 | 本文件（2026-08-14 审查） | 管理 SSH 通道无保活，修改型远程调用远端不设上限 | `setup.sh:662-677` 只有 `ConnectTimeout=10`，缺 `ServerAliveInterval`（反向隧道在 `overseas-exit-role.sh:487` 是配了的），链路黑洞时最长等 TCP keepalive 约 2 小时且全程占锁；`setup.sh:671` 的修改型调用只在本地包 `timeout`，远端无上限，超时重试可能撞上孤儿进程。给管理调用统一加 `ServerAliveInterval=15 ServerAliveCountMax=4`，并参照 `setup.sh:1985-1987` 把上限压到远端 |
+| QA-002 | P2 | 待办 | 本文件（2026-08-14 审查） | 三处运行时行为只靠源码字符串 grep 验证 | `tests/komari-acceptance.sh:631`、`tests/cf-probe-acceptance.sh:592`、`tests/komari-acceptance.sh:452` 违反 `AGENTS.md:15`。判别力可量化：`TX_KOMARI_IDENTITY_CREATED` 在产物中出现 6 次，删掉两处真实赋值仍剩 4 次、断言照样通过；CI 两个作业都装了 jq，`10-helper-identity.sh.inc:166-186` 的 python3 分支与「两者都没有」分支从未执行。可拆三个小任务，分别实跑失败事务并断言清理、以 PATH 变体覆盖 jq／python3／都没有三种情形 |
+| BUG-005 | P2 | 待办 | 本文件（2026-08-14 审查） | `enable-service` 的 cf-probe 回滚被错误嵌在 drop-in 判断内 | `src/cn-entry-role/50-helper-service-transactions.sh.inc:220-235` 把 go-pending 回滚与 `TX_COMPAT_CREATED` 清理放在 `TX_DROPIN_MAY_EXIST == yes` 块内，而改写动作在 `70-helper-command-dispatch.sh.inc:129` 就已执行、标志到 `:155` 才置位。窗口内失败会跳过整块补偿，留下未进托管清单的测速目标改动与 go-pending 残留。按同文件 `:314-330` 的正确写法把补偿提到顶层 |
+| SEC-003 | P3 | 待办 | 本文件（2026-08-14 审查） | cf-probe 兼容包装脚本的归属校验漏掉权限位 | `src/cn-entry-role/20-helper-cf-probe.sh.inc:657`（兼容目录连属主都不查）、`:666-667`、`:678-679` 只校验属主与硬链接数，与同文件 `:202-204`、`:430-432`、`:442-443` 的同族守卫不一致；这两个包装脚本会被注入服务 PATH 最前面。补权限校验，注意旧版兼容目录可能权限不同，建议校验「group/other 无写位」而非硬钉 0755 |
+| BUG-006 | P3 | 待办 | 本文件（2026-08-14 审查） | 国内入口 `active_state()` 缺属主、权限与符号链接守卫 | `src/cn-entry-role/00-runtime.sh.inc:144-151` 只做 `-r` 与前缀判断且 `-d` 会跟随符号链接，同职责的 `overseas-exit-role.sh:148`、`95-role-status-rollback.sh.inc:36`、`setup.sh:1698` 都有完整校验。复用 `managed_root_file_safe`／`managed_root_directory_safe`，并把前缀判断收紧为 `${state%/*} == ${STATE_ROOT}` 以排除 `..` 穿越；`helper_active_state()` 同步修正 |
+| BUG-007 | P3 | 待办 | 本文件（2026-08-14 审查） | `write_helper` 的 `/tmp` 临时文件没有清理兜底 | `src/cn-entry-role/10-helper-identity.sh.inc:4` 的 `mktemp` 未登记进任何 trap，脚本头是 `set -Eeuo pipefail`，任一步失败或收到信号都会留下 root 属主残留文件且无人上报；项目其他事务一律有 trap 兜底。改为子 shell 加 `trap 'rm -f -- "${tmp}"' EXIT INT TERM HUP`，并给 `mktemp` 补 `|| die` |
+| BUG-008 | P3 | 待办 | 本文件（2026-08-14 审查） | `reconcile-cf-probe` 拿不到写锁时静默当成功退出 | `src/cn-entry-role/70-helper-command-dispatch.sh.inc:56` 是 `flock -n 9 || exit 0`。该分支由 `.path` 守卫触发，静默放弃后面板的新配置版本号已被接受、`.path` 不再触发，安全测速目标可能长期不恢复。改为 `flock -w "${CN_ENTRY_LOCK_WAIT_SECONDS}" 9`，等不到则非零退出并写日志 |
+| BUG-009 | P3 | 待办 | 本文件（2026-08-14 审查） | 端口允许前导零导致重装后的指纹替换向导永不触发 | `setup.sh:140-142` 的 `valid_port` 放行 `022` 并原样写盘，而 ssh 与 ssh-keyscan 会归一成 22；`setup.sh:1032` 用字符串比较判默认端口，于是 `ssh-keygen -F` 查不到记录，`setup.sh:1108-1110` 直接 `return 1`，重装后的指纹替换向导永远不出现。校验通过后统一 `$((10#...))` 归一，并补前导零端口的验收用例 |
+| BUG-010 | P3 | 待办 | 本文件（2026-08-14 审查） | 国外出口封存 ACTIVE 缺少国内入口同一步骤已有的防护 | `overseas-exit-role.sh:823` 是裸 `mv "${ACTIVE_FILE}" "${state}/ACTIVE.closed"`：无 `--`、无目标预存在检查、无符号链接检查、无 `|| die`，而等价步骤 `95-role-status-rollback.sh.inc:332-336` 是三重加固的。回滚重跑会静默覆盖上一份封存记录；`mv` 失败还会带着已删除的隧道单元继续打印「已回滚」。对齐国内入口写法并补「`ACTIVE.closed` 已存在时拒绝覆盖」验收 |
+| BUG-011 | P3 | 待办 | 本文件（2026-08-14 审查） | Komari 展示 IP 菜单输错一个字符会把已成功的配置报成扫描失败 | `src/cn-entry-role/90-role-agent-management.sh.inc:161` 无效选项走 `die`，直接结束整个组件进程，而同文件 `:213` 处理同类输入用的是 `return 1`。该调用发生在代理已启用、ENABLE 已入日志、单元已进托管清单之后（`:338-348`），用户会看到与实际状态矛盾的「扫描未完成」，若据此执行完整回滚会白拆一套已生效配置。对齐 `:213` 写法，并在 `:348` 区分返回值 |
+| QA-003 | P3 | 待办 | 本文件（2026-08-14 审查） | ShellCheck 门禁漏掉发布产物且测试套件按文件名硬编码 | `tools/check-shell.sh:16-20` 的清单包含 `cn-entry-role.sh` 却漏了 `po0-unlock.sh`，而 `tools/build-single-file.sh:51-161` 注入的约 110 行运行时代码以 heredoc 形式存在、ShellCheck 只当数据（实测加入后当前零告警）；`:22-36` 又把 9 个测试脚本硬编码，而注册守卫与 CI 对同一批文件是通配发现的，新增套件不会自动进入静态检查。补 `po0-unlock.sh`，并把测试段改为通配发现 |
+| SEC-004 | P3 | 待决定 | 本文件（2026-08-14 审查） | 归属校验只覆盖安装会话，菜单完整回滚无标识可用 | `setup.sh:3199-3200`、`:3210-3211` 发的是裸 `rollback-services`／`rollback-finalize`，国内入口对应分支（`95-role-status-rollback.sh.inc:352-378`）没有 `active_install_claim_matches` 闸门。经核实这不是简单漏用：`install_claim` 由 `setup.sh:1432` 现场生成、只在本次安装会话内使用，出口侧从不持久化，因此后续会话没有标识可传。可达前提是「更新连接配置」走 `authorize current allow-active`（`setup.sh:2113`）而 `allow-active` 把占用检查置空（`setup.sh:1191`），使一台出口机得以指向另一套已部署的入口。修法需要出口侧在安装时持久化标识并处理历史部署无标识的兼容，属设计级改动，先定方案再实施 |
+| DOC-001 | P3 | 待办 | 本文件（2026-08-14 审查） | `PROJECT.md` 称 CI 跑「九套验收测试」，实际八套 | `.github/workflows/ci-release.yml` 在注册检查之外执行 8 个套件，`tests/check-acceptance-registration.sh` 也输出「8 个套件、136 项」。改为「八套」或写成「`tests/*-acceptance.sh` 全部套件」以免今后再漂移 |
 | REL-001 | — | 完成 | [PR #5](https://github.com/Cr0ce11/po0-unlock-assistant-public/pull/5) | 准备并发布 v2.5.18 | 版本号、生成物、标签与 Release 一致；本地验收清单、公开 CI 与两个 Release 附件摘要核对全部通过 |
 | FIX-001 | — | 完成 | [PR #1](https://github.com/Cr0ce11/po0-unlock-assistant-public/pull/1)、[PR #2](https://github.com/Cr0ce11/po0-unlock-assistant-public/pull/2)、[PR #3](https://github.com/Cr0ce11/po0-unlock-assistant-public/pull/3)、[PR #4](https://github.com/Cr0ce11/po0-unlock-assistant-public/pull/4) | v2.5.18 的四项修复与门禁加固 | 同行 IPv4 脱敏、单文件构建语义门禁、ShellCheck 基线与变量作用域、远程组件与入口写锁超时保护均已合并并随 v2.5.18 发布，详见 `CHANGELOG.md` |
 
 ## 当前最值得继续的顺序
 
-1. 维持交接期约束：规则只在 `AGENTS.md`，不新增代理专属规则文件，不引入 Codex 受限沙箱无法执行的必需流程（HAND-001）。
-2. 以真实使用中发现的缺陷驱动维护；当前没有已登记的未解决缺陷。
-3. 等待项目所有者对 GOV-002 与 GOV-003 的决定，在此之前维持现状；SEC-001 按所有者决定维持暂缓。
+1. 按 BUG-001、BUG-002、BUG-003、QA-001 的顺序处理 2026-08-14 全项目审查确认的 P1 项，每项独立一个小而单一的 PR 并配验收测试。
+2. 再处理 P2 项：BUG-004、SEC-002、OPS-002、QA-002、BUG-005。
+3. P3 项按顺手程度清理；SEC-004 需要先定方案再实施。
+4. 维持交接期约束：规则只在 `AGENTS.md`，不新增代理专属规则文件，不引入 Codex 受限沙箱无法执行的必需流程（HAND-001）。
+5. 等待项目所有者对 GOV-002 与 GOV-003 的决定，在此之前维持现状；SEC-001 按所有者决定维持暂缓。
+
+## 2026-08-14 全项目审查
+
+本轮由多代理并行审查九个维度（更新器、SSH 与主机密钥、文件系统守卫、事务与锁、Bash 正确性、国内入口模块、构建与 CI、测试质量、文档一致性），每条发现再由独立复核者尝试证伪：初步 36 条，证伪 12 条，确认 22 条，合并同源后形成上表的 BUG-001 至 BUG-011、SEC-002 至 SEC-004、OPS-002、QA-001 至 QA-003、DOC-001。
+
+结论：没有任何一条是外部可利用的漏洞，也没有必须立即处理的项。绝大多数属于「同一份代码库里已有正确写法、某条路径漏了」的一致性缺口或回归防护缺失。审查全过程只读，未修改代码，未连接任何服务器。
 
 任何需要登录服务器、修改 SSH、操作生产环境或改变公开仓库设置的事项必须独立执行，先记录回退方式并取得明确授权。
