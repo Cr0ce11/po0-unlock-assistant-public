@@ -100,7 +100,7 @@ cmp -s <(bash po0-unlock.sh __extract-role cn-entry) cn-entry-role.sh
 
 ## 公开仓库边界
 
-- 本仓库从 v2.5.17 起以干净初始历史公开；不得把原私有仓库的 `.git`、旧标签、Release、Issue、Pull Request、Actions 日志或未审计分支复制到公开仓库。原仓库保持私有归档，不重写或删除。
+- 本仓库从 v2.5.17 起以干净初始历史公开；原私有仓库与本地冷归档已按项目所有者授权删除。不得从其他副本把旧 `.git`、标签、Release、Issue、Pull Request、Actions 日志或未审计分支重新复制到公开仓库，也不得把这些已删除材料描述为当前恢复来源。
 - 所有准备推送的文件、历史和 Release 附件都必须扫描凭据、生产地址、主机记录、诊断报告、备份和个人信息；测试仅使用明确无效的占位数据。
 - 本仓库当前只公开可读，未授予开源许可。未经项目所有者明确决定，不得新增 `LICENSE`、在文档中宣称“开源”，或暗示复制、修改、再发布及商业使用已获授权。
 - GitHub Actions 默认权限必须保持 `contents: read`，只有标签发布作业可以声明 `contents: write`；所有第三方 Action 固定到完整提交 SHA，不使用浮动标签。公开 Pull Request 工作流不得读取仓库 Secret。
