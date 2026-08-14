@@ -1,6 +1,8 @@
 # Po0-Unlock 项目执行规则
 
-本项目是运行于生产 VPS 的安全关键工具。任何 AI 会话在修改本仓库前，必须先阅读并遵守本文件；与通用习惯冲突时，以本文件为准。
+本项目是运行于生产 VPS 的安全关键工具。任何 AI 会话在修改本仓库前，必须先阅读并遵守本文件；与通用习惯冲突时，以本文件为准。本文件是本项目规则的唯一来源，对所有执行代理一致生效；不得新增代理专属的规则文件或目录。
+
+接手会话的阅读顺序：本文件 → [`PROJECT.md`](PROJECT.md)（当前版本、环境、发布形态与维护执行方）→ [`TODO.md`](TODO.md)（可执行事项与状态）→ [`docs/HANDOVER.md`](docs/HANDOVER.md)（维护交接基线与约束）。
 
 ## 运行位置边界
 
@@ -85,7 +87,7 @@ cmp -s <(bash po0-unlock.sh __extract-role cn-entry) cn-entry-role.sh
 ## 源码与产物边界
 
 - 可直接编辑的程序逻辑源码包括：`setup.sh`、`overseas-exit-role.sh`、`src/cn-entry-role/*.sh.inc`、`tools/` 和 `tests/`。
-- `CHANGELOG.md`、`README.md`、`使用说明.md`、`.github/workflows/`、`AGENTS.md` 及其他工程配置，只能在当前任务确实涉及对应内容时修改；不得顺带整理或改写。
+- `CHANGELOG.md`、`README.md`、`使用说明.md`、`PROJECT.md`、`TODO.md`、`docs/`、`.github/workflows/`、`AGENTS.md` 及其他工程配置，只能在当前任务确实涉及对应内容时修改；不得顺带整理或改写。
 - 严禁手工编辑生成产物：`cn-entry-role.sh` 与 `po0-unlock.sh` 只能分别由 `tools/build-cn-entry-role.sh` 和 `tools/build-single-file.sh` 生成。
 - 修改国内入口模块后，必须运行 `bash tools/build-cn-entry-role.sh` 重新生成产物，并确认 `bash tools/build-cn-entry-role.sh --check` 通过。
 - 修改任何会进入单文件的源码后，必须使用当前版本号重新生成 `po0-unlock.sh`，并执行本地验收清单中的确定性重建检查。
@@ -110,4 +112,5 @@ cmp -s <(bash po0-unlock.sh __extract-role cn-entry) cn-entry-role.sh
 
 - 版本号使用严格语义化 `x.y.z`；发布标签必须等于 `po0-unlock.sh` 内声明的版本。
 - 每次行为改动同步更新 `CHANGELOG.md`（写清"相对上一正式版变了什么"），涉及用户可见行为时同步更新 `README.md` 与 `使用说明.md`。
+- 最新正式版、仓库形态、CI 覆盖环境、发布形态、生产环境状态或维护执行方发生变化时，在同一个 Pull Request 中更新 `PROJECT.md`；事项与状态变化更新 `TODO.md`；维护方交接更新 `docs/HANDOVER.md`。长期结论不得只留在聊天或某个代理的本地记忆中。
 - 完成后向用户用平实中文汇报：改了什么、为什么、跑了哪些验证、结果如何；不确定或未验证的事项必须如实说明。
