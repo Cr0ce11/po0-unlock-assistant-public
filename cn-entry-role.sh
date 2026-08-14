@@ -1742,21 +1742,26 @@ disable_transaction_cleanup() {
                 restore_cf_probe_go_managed_targets "${TX_COMPAT_DIR}" \
                     || echo '严重警告：无法重新应用 cf-probe 安全测速目标，请立即检查。' >&2
             fi
-            install -d -m 0755 "${TX_DROPIN_DIR}"
-            if [[ -f ${TX_BACKUP:-} ]] && mv "${TX_BACKUP}" "${TX_DROPIN_FILE}"; then
-                restored=yes
+            if [[ ${TX_DROPIN_WAS_MISSING:-no} == yes ]]; then
+                # 代理文件在事务开始前就已经不存在，回滚不需要也不应该重建它。
+                echo "${TX_UNIT} 的代理配置原本就不存在，回滚未重建任何文件。" >&2
             else
-                echo "严重警告：无法恢复 ${TX_DROPIN_FILE}；备份保留在 ${TX_BACKUP:-未知位置}。" >&2
-            fi
-            if [[ ${restored} == yes ]] && systemctl daemon-reload; then reload_ok=yes; fi
-            if [[ ${TX_ORIGINAL_RUNNING:-no} == yes ]]; then
-                if [[ ${reload_ok} == yes ]] && restart_and_verify_running "${TX_UNIT}"; then
-                    echo "已恢复 ${TX_UNIT} 的代理配置和 active/running 状态。" >&2
+                install -d -m 0755 "${TX_DROPIN_DIR}"
+                if [[ -f ${TX_BACKUP:-} ]] && mv "${TX_BACKUP}" "${TX_DROPIN_FILE}"; then
+                    restored=yes
                 else
-                    echo "严重警告：${TX_UNIT} 的代理配置已尝试恢复，但服务未恢复为 active/running。" >&2
+                    echo "严重警告：无法恢复 ${TX_DROPIN_FILE}；备份保留在 ${TX_BACKUP:-未知位置}。" >&2
                 fi
-            elif [[ ${restored} == yes ]]; then
-                echo "已恢复 ${TX_UNIT} 的代理配置，并保持原停止状态。" >&2
+                if [[ ${restored} == yes ]] && systemctl daemon-reload; then reload_ok=yes; fi
+                if [[ ${TX_ORIGINAL_RUNNING:-no} == yes ]]; then
+                    if [[ ${reload_ok} == yes ]] && restart_and_verify_running "${TX_UNIT}"; then
+                        echo "已恢复 ${TX_UNIT} 的代理配置和 active/running 状态。" >&2
+                    else
+                        echo "严重警告：${TX_UNIT} 的代理配置已尝试恢复，但服务未恢复为 active/running。" >&2
+                    fi
+                elif [[ ${restored} == yes ]]; then
+                    echo "已恢复 ${TX_UNIT} 的代理配置，并保持原停止状态。" >&2
+                fi
             fi
         fi
         if [[ ${TX_CF_GUARD_REMOVED:-no} == yes \
@@ -2234,8 +2239,17 @@ case "${1:-}" in
         dropin_file="${dropin}/90-po0-unlock-proxy.conf"
         [[ -f ${state}/managed-services ]] && grep -Fxq -- "${unit}" "${state}/managed-services" \
             || { echo '该服务不在本助手的托管清单中，拒绝删除配置。' >&2; exit 1; }
-        managed_dropin_owned "${dropin_file}" \
-            || { echo '代理文件不存在或已被人工修改，拒绝自动删除。' >&2; exit 1; }
+        dropin_missing=no
+        if [[ -e ${dropin_file} || -L ${dropin_file} ]]; then
+            managed_dropin_owned "${dropin_file}" \
+                || { echo '代理文件已被人工修改，拒绝自动删除。' >&2; exit 1; }
+        else
+            # 代理文件被外部删除（人工清理、Agent 重装、apt purge）后，本助手没有
+            # 可撤销的配置。若继续拒绝，托管记录就再也无法通过产品注销，完整回滚
+            # 会永久停在这个单元上。此处按已移除处理，继续清理残留并注销记录。
+            dropin_missing=yes
+            echo "提醒：${unit} 的国外出口配置文件已不存在，按已移除处理并注销托管记录。"
+        fi
         compat_dir=$(cf_probe_compat_dir "${dropin}")
         if [[ -e ${compat_dir} || -L ${compat_dir} ]]; then
             managed_cf_probe_compat_owned "${compat_dir}" \
@@ -2250,7 +2264,7 @@ case "${1:-}" in
         service_is_running "${unit}" && original_running=yes
         backup=$(mktemp "${state}/.proxy-dropin.XXXXXX")
         managed_tmp=$(mktemp "${state}/.managed-services.XXXXXX")
-        cp -p "${dropin_file}" "${backup}"
+        [[ ${dropin_missing} == yes ]] || cp -p "${dropin_file}" "${backup}"
         grep -Fvx -- "${unit}" "${state}/managed-services" >"${managed_tmp}" || true
         chmod 0600 "${managed_tmp}"
 
@@ -2266,6 +2280,7 @@ case "${1:-}" in
         TX_CF_GO_TARGETS_RESTORED=no
         TX_CF_GUARD_REMOVED=no
         TX_DROPIN_MAY_BE_REMOVED=no
+        TX_DROPIN_WAS_MISSING=${dropin_missing}
         TX_LIST_MAY_CHANGE=no
         trap 'disable_transaction_cleanup "$?"' EXIT
         trap 'exit 130' INT
