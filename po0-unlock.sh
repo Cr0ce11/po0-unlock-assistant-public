@@ -4820,6 +4820,7 @@ start_cn_entry_session() {
             -o UserKnownHostsFile="${ADMIN_KNOWN_HOSTS}" -o StrictHostKeyChecking=yes \
             -o ControlMaster=yes -o ControlPath="${CN_ENTRY_CONTROL_PATH}" \
             -o ControlPersist=600 \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
             -p "${CN_ENTRY_SSH_PORT}" "${CN_ENTRY_TARGET}"; then
             return 0
         fi
@@ -4860,6 +4861,14 @@ ssh_cn_entry() {
     ssh_cn_entry_command 0 "$@"
 }
 
+# 把任意字符串包成远端 shell 可安全解析的单引号字面量；只用 POSIX 语法，
+# 不依赖远端登录 shell 是 bash。
+shell_single_quote() {
+    local value=$1
+    value=${value//\'/\'\\\'\'}
+    printf "'%s'" "${value}"
+}
+
 ssh_cn_entry_component() {
     local timeout_seconds=${1:-} risk=${2:-} label=${3:-} rc
     shift 3 || {
@@ -4881,7 +4890,10 @@ ssh_cn_entry_component() {
         printf '%s\n' '[Po0 解锁助手] 错误：国外出口缺少 timeout，拒绝执行无界国内入口组件调用。' >&2
         return 127
     }
-    if ssh_cn_entry_command "${timeout_seconds}" "$@"; then
+    # 上限同时压到远端：只在本地包 timeout 时，超时后本地 ssh 被杀而远端仍在跑，
+    # 用户按提示立刻重试就可能撞上尚未退出的孤儿进程。远端先到期，本地留 15 秒余量兜底。
+    if ssh_cn_entry_command "$((timeout_seconds + 15))" \
+        "command -v timeout >/dev/null 2>&1 || { printf '%s\n' '国内入口缺少 timeout，拒绝执行无界组件调用。' >&2; exit 124; }; timeout --foreground --kill-after=5s ${timeout_seconds}s /bin/bash -c $(shell_single_quote "$*")"; then
         return 0
     else
         rc=$?
@@ -5375,6 +5387,7 @@ authorize_admin_key_once() {
         *) die '国内入口授权占用策略无效。' ;;
     esac
     ssh -o BatchMode=no -o ConnectTimeout=15 -o IdentitiesOnly=yes \
+        -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
         -o GlobalKnownHostsFile=/dev/null \
         -o UserKnownHostsFile="${ADMIN_KNOWN_HOSTS}" -o StrictHostKeyChecking=ask \
         -o BindAddress="${EXIT_PRIVATE_IP}" \

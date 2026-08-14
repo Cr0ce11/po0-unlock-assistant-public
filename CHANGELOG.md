@@ -4,6 +4,9 @@
 
 ## 未发布
 
+- 国内入口管理连接启用保活：控制主连接与首次授权连接加入 `ServerAliveInterval=15`、`ServerAliveCountMax=4`。此前链路被黑洞（NAT 表项过期、运营商丢包）时要等 TCP keepalive 约两小时才返回，这期间 `/run/po0-unlock/operation.lock` 一直被占，其他 Po0 操作全被「另一个操作正在进行」挡掉。反向隧道单元本来就配了保活，管理通道现在与之一致。
+- 国内入口组件调用的时间上限同时压到远端：远端按原上限执行 `timeout`，本地保留 15 秒兜底余量。此前只在国外出口这一侧包 `timeout`，超时后本地 ssh 被杀而远端命令仍在运行，用户按提示立即重试可能撞上尚未退出的孤儿进程。超时提示与只读/修改型的语义区分保持不变。
+
 - 修正启用 Agent 代理的事务补偿位置。cf-probe 的测速目标改写和兼容文件创建都发生在 drop-in 落盘之前，而对应的回滚此前嵌在「drop-in 可能已存在」的判断里；这段窗口内失败（例如同一单元同时命中 Komari 身份守卫且守卫失败）会整块跳过补偿，留下已被改写却未进托管清单的测速目标和 go-pending 残留，健康检查看不到、停用也会以「不在托管清单」拒绝清理。现在补偿提到顶层，与刷新事务的写法一致。
 
 - 收紧安全修复对反向隧道单元的归属校验。此前只用两条子串匹配锚定 `ExecStart` 的首尾，中间的 `-i`、`UserKnownHostsFile`、`StrictHostKeyChecking=yes`、`ExitOnForwardFailure=yes` 全不在校验范围内：被插入 `StrictHostKeyChecking=no` 的隧道仍会被判为「属于本助手」并 `systemctl enable --now` 拉起。现在 `ExecStart` 由与写入时同一份模板重建后逐行精确比对，并要求单元中只有一条 `ExecStart`。注意：若隧道单元由更早版本生成、参数与当前模板不同，安全修复会明确拒绝并提示重新执行连接更新，不会静默接管。
