@@ -4948,14 +4948,18 @@ confirm() {
 
 prompt_value() {
     local label=$1 current=$2 result
-    read -r -p "${label} [${current}]：" result
+    # read 读到 EOF 会返回非零且不置值；此时必须失败退出，不能静默沿用默认值。
+    # 收到不带换行的末行时 read 同样返回非零，但 result 已有内容，仍按正常输入处理。
+    read -r -p "${label} [${current}]：" result || [[ -n ${result} ]] \
+        || die "${label}未读取到输入，已停止。"
     printf '%s\n' "${result:-${current}}"
 }
 
 prompt_required_value() {
     local label=$1 result
     while [[ -z ${result:-} ]]; do
-        read -r -p "${label}（必须填写）：" result
+        read -r -p "${label}（必须填写）：" result || [[ -n ${result} ]] \
+            || die "${label}未读取到输入，已停止。"
         [[ -n ${result} ]] || printf '%s不能为空，请重新输入。\n' "${label}" >&2
     done
     printf '%s\n' "${result}"

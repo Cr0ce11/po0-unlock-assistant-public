@@ -82,6 +82,26 @@ make_library() {
     /bin/bash -n "${LIBRARY}"
 }
 
+# 有界执行外部命令：macOS 上没有 GNU timeout，且本套件的 timeout 桩会直接放行，
+# 因此用后台进程加轮询自行限时。超时返回 124，与 GNU timeout 一致。
+run_bounded() {
+    local seconds=$1 output_file=$2
+    shift 2
+    local pid ticks=0 limit=$((seconds * 10))
+    "$@" >"${output_file}" 2>&1 &
+    pid=$!
+    while kill -0 "${pid}" 2>/dev/null; do
+        if (( ticks >= limit )); then
+            kill -9 "${pid}" 2>/dev/null || true
+            wait "${pid}" 2>/dev/null || true
+            return 124
+        fi
+        sleep 0.1
+        ticks=$((ticks + 1))
+    done
+    wait "${pid}"
+}
+
 portable_stat() {
     local format=${2:-} file=${3:-}
     [[ ${1:-} == -c ]] || { /usr/bin/stat "$@"; return; }
@@ -564,6 +584,46 @@ test_anonymous_public_requests_have_no_credentials() (
         'https://github.com/Cr0ce11/po0-unlock-assistant/releases/download/v1.1.0/po0-unlock-v2.sh' \
         "${candidate}" >/dev/null 2>&1 \
         || fail '匿名下载接受了非公开更新仓库'
+)
+
+# stdin 已经是 EOF 时（cron、systemd、CI、`< /dev/null`），提示函数必须立即失败退出。
+# 否则 prompt_required_value 会无限空转刷 stderr，并一直占住 /run/po0-unlock/operation.lock。
+test_prompt_eof_fails_instead_of_looping() (
+    local script out rc=0
+    load_harness 1.0.0
+    script=${CASE_DIR}/prompt-eof.sh
+    out=${CASE_DIR}/prompt-eof.out
+    # 复现真实调用点：prompt_cn_entry_public_ip（setup.sh:845、setup.sh:847）把命令替换
+    # 放在 `|| return 1` 列表里，errexit 在该子 shell 内被抑制，read 失败不再终止脚本。
+    {
+        printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' 'SCRIPT_VERSION=1.0.0'
+        printf '%s\n' '# shellcheck disable=SC1090'
+        printf '%s\n' 'source "$1"' 'rc=0' 'value=$("$2" "$3" "${4:-}") || rc=$?'
+        printf '%s\n' 'printf "%s\\n" "${value}"' 'exit "${rc}"'
+    } >"${script}"
+
+    rc=0
+    run_bounded 5 "${out}" /bin/bash "${script}" "${LIBRARY}" \
+        prompt_required_value '国内入口连接 IPv4' </dev/null || rc=$?
+    [[ ${rc} != 124 ]] || fail 'prompt_required_value 读到 EOF 后没有退出，仍在空转'
+    assert_eq 1 "${rc}" 'prompt_required_value 读到 EOF 应以失败退出' || return 1
+    grep -Fq '未读取到输入' "${out}" || fail 'prompt_required_value 没有说明失败原因'
+
+    rc=0
+    run_bounded 5 "${out}" /bin/bash "${script}" "${LIBRARY}" \
+        prompt_value '国内入口 SSH 端口' 22 </dev/null || rc=$?
+    [[ ${rc} != 124 ]] || fail 'prompt_value 读到 EOF 后没有退出'
+    assert_eq 1 "${rc}" 'prompt_value 读到 EOF 应以失败退出而不是静默沿用默认值' || return 1
+    grep -Fq '未读取到输入' "${out}" || fail 'prompt_value 没有说明失败原因'
+
+    # 有正常输入时行为不变：末行不带换行也要按有效输入处理。
+    rc=0
+    printf '203.0.113.10' >"${CASE_DIR}/prompt-input"
+    run_bounded 5 "${out}" /bin/bash -c \
+        '/bin/bash "$1" "$2" prompt_required_value "国内入口连接 IPv4" <"$3"' \
+        _ "${script}" "${LIBRARY}" "${CASE_DIR}/prompt-input" || rc=$?
+    assert_eq 0 "${rc}" '末行不带换行的有效输入被误判为读取失败' || return 1
+    grep -Fxq 203.0.113.10 "${out}" || fail '有效输入没有被原样返回'
 )
 
 # 项目所有者的 GitHub 账号从 DTB201 改名为 Cr0ce11 后，旧账号名可被任何人重新注册。
@@ -2844,6 +2904,7 @@ main() {
     run_test '最新版无操作与自动降级拒绝' test_latest_noop_and_downgrade_refusal
     run_test '公开 Release 请求与下载保持匿名' test_anonymous_public_requests_have_no_credentials
     run_test '更新器拒绝改名前账号下的旧仓库地址' test_updater_rejects_previous_owner_repository
+    run_test 'stdin 为 EOF 时提示输入立即失败而不空转' test_prompt_eof_fails_instead_of_looping
     run_test '公开 Release 候选强制校验公开版类型' test_public_candidate_edition_gate
     run_test '历史私有版与分享版可由高版本公开版接管并恢复' test_legacy_editions_to_public_manual_takeover_and_restore
     run_test '同版本跨版本类型不替换已安装脚本' test_same_version_cross_edition_does_not_replace
