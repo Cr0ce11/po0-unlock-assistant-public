@@ -2674,7 +2674,9 @@ manage_komari_report_ipv4() {
                 "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${unit}" \
                 >>"${state}/service-proxy-actions.log"
             ;;
-        *) die '选择无效，请重新运行扫描。' ;;
+        # 这里只是展示 IP 的装饰性菜单，此时代理已启用、单元已进托管清单。
+        # 用 die 会结束整个组件进程，让出口侧把「已经成功的配置」报成扫描失败。
+        *) printf '%s\n' '选择无效，未做修改。' >&2; return 1 ;;
     esac
 }
 
@@ -2861,7 +2863,9 @@ scan_services() {
     if [[ ${reasons[index]} == *Komari* ]]; then
         printf '%s\n' 'Komari 还可以单独指定面板展示的 国内入口公网 IPv4。'
         printf '%s\n' '延迟任务请在 Komari 面板选择 ICMP，以显示国内入口的真实网络延迟。'
-        manage_komari_report_ipv4 "${unit}" "${state}"
+        # 展示 IP 只影响面板显示，选择无效或取消都不该让整次配置被判为失败。
+        manage_komari_report_ipv4 "${unit}" "${state}" \
+            || printf '%s\n' '面板展示 IPv4 未做修改；国外出口配置已经生效。' >&2
     fi
     printf '%s\n' '以后安装新的 Agent，可从 Po0 解锁助手再次扫描。'
 }

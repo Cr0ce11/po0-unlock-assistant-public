@@ -2373,6 +2373,32 @@ test_write_helper_cleans_temp_on_failure() (
         || { fail "write_helper 失败后留下了临时文件：$(<"${recorded}")"; return 1; }
 )
 
+# 端口带前导零时 ssh 与 ssh-keyscan 会归一成十进制，而 known_hosts 的键若保留
+# 022，ssh-keygen -F 就永远查不到记录，重装后的指纹替换向导不会出现。
+test_ssh_port_is_normalized() (
+    set -Eeuo pipefail
+    local rc=0
+    load_harness 2.5.19
+    CN_ENTRY_SSH_USER=root
+    CN_ENTRY_PRIVATE_IP=10.0.0.10
+    CN_ENTRY_SSH_PORT=022
+    validate_peer_config
+    assert_eq 22 "${CN_ENTRY_SSH_PORT}" '带前导零的端口没有被归一化' || return 1
+    assert_eq 10.0.0.10 "$(admin_known_hosts_host)" \
+        '默认端口在归一化后仍被当作非默认端口写进 known_hosts 键' || return 1
+
+    CN_ENTRY_SSH_PORT=02222
+    validate_peer_config
+    assert_eq 2222 "${CN_ENTRY_SSH_PORT}" '带前导零的非默认端口没有被归一化' || return 1
+    assert_eq '[10.0.0.10]:2222' "$(admin_known_hosts_host)" \
+        '非默认端口的 known_hosts 键格式错误' || return 1
+
+    CN_ENTRY_SSH_PORT=0
+    rc=0
+    ( validate_peer_config ) >/dev/null 2>&1 || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '端口 0 没有被拒绝'; return 1; }
+)
+
 test_management_ssh_uses_keepalive() {
     local master_body authorize_body
     master_body=$(sed -n '/^start_cn_entry_session() {/,/^}/p' "${SETUP_SOURCE}")
@@ -3161,6 +3187,7 @@ main() {
     run_test '主控操作互斥锁串行化并拒绝异常路径' test_operation_lock_serializes_and_rejects_unsafe_path
     run_test '国内入口状态目录守卫拒绝异常路径' test_cn_entry_active_state_guards_paths
     run_test 'write_helper 失败后不留临时文件' test_write_helper_cleans_temp_on_failure
+    run_test '国内入口 SSH 端口归一化去掉前导零' test_ssh_port_is_normalized
     run_test '管理 SSH 连接启用保活' test_management_ssh_uses_keepalive
     run_test '远程组件调用超时有界并释放操作锁' test_remote_component_timeout_is_bounded_and_releases_operation_lock
     run_test '国内入口写锁等待有界且超时零写入' test_cn_entry_lock_timeout_is_bounded_and_preserves_config
