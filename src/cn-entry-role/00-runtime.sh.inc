@@ -143,10 +143,14 @@ commit_initial_active_state() (
 
 active_state() {
     local state
-    [[ -r ${ACTIVE_FILE} ]] || die '没有找到有效安装状态。'
+    # 与 health_safe_state 和国外出口的同职责函数保持一致的属主、权限与链接校验：
+    # 没有这些校验时，被替换成符号链接的状态目录会让回滚与刷新跟随到状态根之外。
+    managed_root_file_safe "${ACTIVE_FILE}" 600 || die '没有找到有效安装状态。'
     state=$(<"${ACTIVE_FILE}")
     case "${state}" in "${STATE_ROOT}"/*) ;; *) die '安装状态路径无效。' ;; esac
-    [[ -d ${state} ]] || die "状态目录不存在：${state}"
+    # 收紧到状态根的直接子目录，排除 ../ 穿越。
+    [[ ${state%/*} == "${STATE_ROOT}" ]] || die '安装状态路径无效。'
+    managed_root_directory_safe "${state}" 700 || die "状态目录异常：${state}"
     printf '%s\n' "${state}"
 }
 

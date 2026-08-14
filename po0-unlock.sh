@@ -1172,10 +1172,14 @@ commit_initial_active_state() (
 
 active_state() {
     local state
-    [[ -r ${ACTIVE_FILE} ]] || die '没有找到有效安装状态。'
+    # 与 health_safe_state 和国外出口的同职责函数保持一致的属主、权限与链接校验：
+    # 没有这些校验时，被替换成符号链接的状态目录会让回滚与刷新跟随到状态根之外。
+    managed_root_file_safe "${ACTIVE_FILE}" 600 || die '没有找到有效安装状态。'
     state=$(<"${ACTIVE_FILE}")
     case "${state}" in "${STATE_ROOT}"/*) ;; *) die '安装状态路径无效。' ;; esac
-    [[ -d ${state} ]] || die "状态目录不存在：${state}"
+    # 收紧到状态根的直接子目录，排除 ../ 穿越。
+    [[ ${state%/*} == "${STATE_ROOT}" ]] || die '安装状态路径无效。'
+    managed_root_directory_safe "${state}" 700 || die "状态目录异常：${state}"
     printf '%s\n' "${state}"
 }
 
@@ -1350,9 +1354,16 @@ prepare() {
     log "隧道账户已准备，状态目录：${state}"
 }
 
-write_helper() {
+write_helper() (
     local no_proxy=$1 tmp
-    tmp=$(mktemp /tmp/po0-cn-entry-helper.XXXXXX)
+    # 与项目其他事务一致：临时文件登记进 trap，任一步失败或收到信号都不会
+    # 在 /tmp 留下 root 属主的残留文件。
+    tmp=$(mktemp /tmp/po0-cn-entry-helper.XXXXXX) \
+        || die '无法创建国内入口管理组件临时文件。'
+    trap 'rm -f -- "${tmp}"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
     cat >"${tmp}" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -2299,10 +2310,22 @@ exec "${REAL_CURL}" "${original[@]}"
 WRAPPER
 }
 
+# 归属校验要证明的是"这是本助手的文件、且别人改不了它"，因此权限位不能省。
+# 旧版兼容目录的具体权限可能与当前不同，硬钉 0755 会把老部署判成不属于本助手，
+# 所以这里只要求 group/other 没有写权限。
+cf_probe_compat_mode_safe() {
+    local path=$1 mode
+    mode=$(stat -c '%a' "${path}" 2>/dev/null) || return 1
+    [[ ${mode} =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#${mode} & 8#22) == 0 ))
+}
+
 managed_cf_probe_compat_owned() {
     local directory=$1 nc_wrapper=${1}/nc curl_wrapper=${1}/curl go_record=${1}/go-record
     local go_pending=${1}/go-pending go_previous=${1}/go-record.previous expected actual extra=
     [[ -d ${directory} && ! -L ${directory} ]] || return 1
+    [[ $(stat -c '%u' "${directory}" 2>/dev/null) == 0 ]] || return 1
+    cf_probe_compat_mode_safe "${directory}" || return 1
     if [[ -e ${nc_wrapper} || -L ${nc_wrapper} ]]; then
         [[ -f ${nc_wrapper} && ! -L ${nc_wrapper} && -x ${nc_wrapper} ]] || return 1
         expected=$(printf '%s\n' \
@@ -2313,6 +2336,7 @@ managed_cf_probe_compat_owned() {
         [[ ${actual} == "${expected}" ]] || return 1
         [[ $(stat -c '%u' "${nc_wrapper}" 2>/dev/null) == 0 \
             && $(stat -c '%h' "${nc_wrapper}" 2>/dev/null) == 1 ]] || return 1
+        cf_probe_compat_mode_safe "${nc_wrapper}" || return 1
     else
         [[ -e ${go_record} || -L ${go_record} || -e ${go_pending} || -L ${go_pending} ]] \
             || return 1
@@ -2325,6 +2349,7 @@ managed_cf_probe_compat_owned() {
         [[ ${actual} == "${expected}" ]] || return 1
         [[ $(stat -c '%u' "${curl_wrapper}" 2>/dev/null) == 0 \
             && $(stat -c '%h' "${curl_wrapper}" 2>/dev/null) == 1 ]] || return 1
+        cf_probe_compat_mode_safe "${curl_wrapper}" || return 1
     fi
     if [[ -e ${go_record} || -L ${go_record} ]]; then
         managed_cf_probe_go_record "${go_record}" || return 1
@@ -2557,14 +2582,23 @@ DROPIN
 
 helper_active_state() {
     local state
-    [[ -r /var/lib/po0-unlock/ACTIVE ]] \
+    # 与 active_state 保持同一套校验：属主、权限、链接数与状态根的直接子目录。
+    [[ -f /var/lib/po0-unlock/ACTIVE && ! -L /var/lib/po0-unlock/ACTIVE \
+        && $(stat -c '%u' /var/lib/po0-unlock/ACTIVE 2>/dev/null) == 0 \
+        && $(stat -c '%a' /var/lib/po0-unlock/ACTIVE 2>/dev/null) == 600 \
+        && $(stat -c '%h' /var/lib/po0-unlock/ACTIVE 2>/dev/null) == 1 ]] \
         || { echo '没有找到有效安装状态。' >&2; return 1; }
     state=$(</var/lib/po0-unlock/ACTIVE)
     case "${state}" in
         /var/lib/po0-unlock/*) ;;
         *) echo '安装状态路径无效。' >&2; return 1 ;;
     esac
-    [[ -d ${state} ]] || { echo '安装状态目录不存在。' >&2; return 1; }
+    [[ ${state%/*} == /var/lib/po0-unlock ]] \
+        || { echo '安装状态路径无效。' >&2; return 1; }
+    [[ -d ${state} && ! -L ${state} \
+        && $(stat -c '%u' "${state}" 2>/dev/null) == 0 \
+        && $(stat -c '%a' "${state}" 2>/dev/null) == 700 ]] \
+        || { echo '安装状态目录异常。' >&2; return 1; }
     printf '%s\n' "${state}"
 }
 
@@ -3371,8 +3405,7 @@ esac
 EOF
     sed -i "s|__NO_PROXY__|${no_proxy}|g" "${tmp}"
     install -o root -g root -m 0755 "${tmp}" "${HELPER}"
-    rm -f "${tmp}"
-}
+)
 
 write_proxy_files() (
     local state=$1 cn_entry_private_ip=$2 exit_private_ip=$3
@@ -4246,7 +4279,7 @@ __PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
     exit_actual=$(sha256sum "${exit_new}" | awk '{print $1}')
     cn_entry_actual=$(sha256sum "${cn_entry_new}" | awk '{print $1}')
     [[ ${exit_actual} == '0da23eee38deb7922074536572214020ef94947167feb5c4d284886719fa55ab' ]] || die '国外出口内置组件哈希校验失败。'
-    [[ ${cn_entry_actual} == '82c7db45b7bc542189062627dde7ec0a3dc145e097f0e6c03760aa3a2929509e' ]] || die '国内入口内置组件哈希校验失败。'
+    [[ ${cn_entry_actual} == 'bbb7db61348d9399804e010ab2be6b4f1507412f7128542c4a5f22414caf100f' ]] || die '国内入口内置组件哈希校验失败。'
     /bin/bash -n "${exit_new}" || die '国外出口内置组件语法检查失败。'
     /bin/bash -n "${cn_entry_new}" || die '国内入口内置组件语法检查失败。'
     mv "${exit_new}" "${EXIT_ROLE}"
@@ -4277,7 +4310,7 @@ bundle_self_test() {
     printf 'Po0 单文件版本=%s\n' '2.5.19'
     printf 'Po0 单文件版本类型=%s\n' "${SCRIPT_EDITION_LABEL}"
     printf 'overseas-exit-role SHA-256=%s\n' '0da23eee38deb7922074536572214020ef94947167feb5c4d284886719fa55ab'
-    printf 'cn-entry-role SHA-256=%s\n' '82c7db45b7bc542189062627dde7ec0a3dc145e097f0e6c03760aa3a2929509e'
+    printf 'cn-entry-role SHA-256=%s\n' 'bbb7db61348d9399804e010ab2be6b4f1507412f7128542c4a5f22414caf100f'
     printf '%s\n'         "scan-agents -> cn-entry:${CN_ENTRY_CMD_SCAN}"         "rollback[1] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_SERVICES}"         "rollback[2] -> overseas-exit:${EXIT_CMD_ROLLBACK}"         "rollback[3] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_FINALIZE}"         "status -> cn-entry:${CN_ENTRY_CMD_STATUS}"         "status -> overseas-exit:${EXIT_CMD_STATUS}"         "health -> cn-entry:${CN_ENTRY_CMD_HEALTH}"         "health -> overseas-exit:${EXIT_CMD_HEALTH}"         "repair -> overseas-exit:${EXIT_CMD_REPAIR}"
     printf '%s\n' 'SELF_TEST=PASS'
 }

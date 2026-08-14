@@ -1886,7 +1886,8 @@ test_claimed_install_cleanup_cannot_rollback_another_deployment() (
     chmod 0600 "${ACTIVE_FILE}" "${fixture_state}/install-claim"
 
     for function_name in \
-        managed_root_file_safe active_state valid_install_claim install_claim_record_safe \
+        managed_root_file_safe managed_root_directory_safe active_state \
+        valid_install_claim install_claim_record_safe \
         active_install_claim_matches \
         rollback_services_claimed; do
         function_body=$(sed -n "/^${function_name}() {/,/^}/p" "${PROJECT_DIR}/cn-entry-role.sh")
@@ -2288,6 +2289,90 @@ test_operation_lock_serializes_and_rejects_unsafe_path() (
 # 管理连接没有保活时，链路被黑洞（NAT 表项过期、运营商丢包）要等 TCP keepalive
 # 约两小时才返回，这期间 /run/po0-unlock/operation.lock 一直被占，其他操作全被挡掉。
 # 反向隧道单元本身是配了 ServerAliveInterval 的，管理通道不应例外。
+# 国内入口的 active_state 此前只做 -r 与前缀判断，-d 还会跟随符号链接：
+# 状态目录被换成软链后，回滚与刷新会把锁文件、closing 标记搬到状态根之外。
+test_cn_entry_active_state_guards_paths() (
+    local case_dir state_root fixture_state function_name function_body outside rc out
+    case_dir=$(mktemp -d "${WORK_ROOT}/active-state.XXXXXXXX")
+    state_root=${case_dir}/lib
+    fixture_state=${state_root}/20260805T010203Z
+    outside=${case_dir}/outside
+    mkdir -p -- "${fixture_state}" "${outside}"
+    chmod 0700 "${state_root}" "${fixture_state}"
+    STATE_ROOT=${state_root}
+    ACTIVE_FILE=${state_root}/ACTIVE
+    for function_name in managed_root_file_safe managed_root_directory_safe active_state; do
+        function_body=$(sed -n "/^${function_name}() {/,/^}/p" "${PROJECT_DIR}/cn-entry-role.sh")
+        [[ -n ${function_body} ]] || { fail "未能提取 ${function_name}"; return 1; }
+        eval "${function_body}"
+    done
+    die() { printf '%s\n' "$*" >&2; exit 1; }
+    stat() { portable_stat "$@"; }
+
+    printf '%s\n' "${fixture_state}" >"${ACTIVE_FILE}"
+    chmod 0600 "${ACTIVE_FILE}"
+    assert_eq "${fixture_state}" "$(active_state)" '正常状态目录被拒绝' || return 1
+
+    # 状态目录被换成符号链接：必须拒绝，否则回滚会写到状态根之外。
+    rm -rf -- "${fixture_state}"
+    ln -s "${outside}" "${fixture_state}"
+    rc=0
+    out=$( (active_state) 2>&1 ) || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '符号链接状态目录被当作有效安装状态'; return 1; }
+    rm -f -- "${fixture_state}"
+    mkdir -p -- "${fixture_state}"
+    chmod 0700 "${fixture_state}"
+
+    # ACTIVE 记录权限异常：必须拒绝。
+    chmod 0644 "${ACTIVE_FILE}"
+    rc=0
+    (active_state) >/dev/null 2>&1 || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '权限异常的 ACTIVE 记录被接受'; return 1; }
+    chmod 0600 "${ACTIVE_FILE}"
+
+    # 借助 ../ 指到状态根之外：前缀判断能过，但必须被目录层级判断拦下。
+    printf '%s\n' "${state_root}/../outside" >"${ACTIVE_FILE}"
+    rc=0
+    (active_state) >/dev/null 2>&1 || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '带 ../ 的状态路径被接受'; return 1; }
+)
+
+# write_helper 的 /tmp 临时文件此前没有清理兜底：任一步失败都会留下 root 属主残留。
+test_write_helper_cleans_temp_on_failure() (
+    local function_body temp_dir recorded rc
+    temp_dir=$(mktemp -d "${WORK_ROOT}/write-helper.XXXXXXXX")
+    recorded=${temp_dir}/created-path
+    # 函数体内嵌了一整段 helper 脚本，其中也有以 ) 结尾的行；
+    # 因此以内嵌 heredoc 的结束标记为界，取其之后的第一个顶格 ) 作为函数结尾。
+    function_body=$(awk '
+        /^write_helper\(\) \(/ { capture=1 }
+        capture { print }
+        capture && /^EOF$/ { seen_heredoc=1; next }
+        capture && seen_heredoc && /^\)$/ { exit }
+    ' "${PROJECT_DIR}/cn-entry-role.sh")
+    [[ -n ${function_body} ]] || { fail '未能提取 write_helper'; return 1; }
+    eval "${function_body}"
+    die() { printf '%s\n' "$*" >&2; exit 1; }
+    HELPER=${temp_dir}/helper-target
+    # 把临时文件收到夹具目录里并记录路径，判定不受 /tmp 上其他文件影响。
+    mktemp() {
+        local path
+        path=$(command mktemp "${temp_dir}/po0-cn-entry-helper.XXXXXX") || return 1
+        printf '%s\n' "${path}" >"${recorded}"
+        printf '%s\n' "${path}"
+    }
+    sed() { command sed "$@"; }
+
+    # 让最后一步安装失败，模拟磁盘或权限故障。
+    install() { return 1; }
+    rc=0
+    write_helper 127.0.0.1 >/dev/null 2>&1 || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '安装失败时 write_helper 仍报告成功'; return 1; }
+    [[ -s ${recorded} ]] || { fail '夹具没有记录到临时文件路径'; return 1; }
+    [[ ! -e $(<"${recorded}") ]] \
+        || { fail "write_helper 失败后留下了临时文件：$(<"${recorded}")"; return 1; }
+)
+
 test_management_ssh_uses_keepalive() {
     local master_body authorize_body
     master_body=$(sed -n '/^start_cn_entry_session() {/,/^}/p' "${SETUP_SOURCE}")
@@ -3074,6 +3159,8 @@ main() {
     run_test '无可信主机密钥时拒绝建立国内入口会话' test_cn_entry_session_requires_trusted_host_key_file
     run_test '国内入口 SSH 会话有限重试、复用与清理' test_cn_entry_session_retries_and_reuses_transport
     run_test '主控操作互斥锁串行化并拒绝异常路径' test_operation_lock_serializes_and_rejects_unsafe_path
+    run_test '国内入口状态目录守卫拒绝异常路径' test_cn_entry_active_state_guards_paths
+    run_test 'write_helper 失败后不留临时文件' test_write_helper_cleans_temp_on_failure
     run_test '管理 SSH 连接启用保活' test_management_ssh_uses_keepalive
     run_test '远程组件调用超时有界并释放操作锁' test_remote_component_timeout_is_bounded_and_releases_operation_lock
     run_test '国内入口写锁等待有界且超时零写入' test_cn_entry_lock_timeout_is_bounded_and_preserves_config
