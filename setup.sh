@@ -59,7 +59,7 @@ EXIT_CMD_STATUS=status
 EXIT_CMD_HEALTH=health
 EXIT_CMD_REPAIR=repair
 EXIT_CMD_ROLLBACK=rollback
-UPDATE_REPOSITORY=DTB201/po0-unlock-assistant-public
+UPDATE_REPOSITORY=Cr0ce11/po0-unlock-assistant-public
 UPDATE_ASSET=po0-unlock-v2.sh
 UPDATE_API_BASE=https://api.github.com/repos/${UPDATE_REPOSITORY}
 UPDATE_STATE_ROOT=/var/lib/po0-unlock/updater
@@ -2140,7 +2140,7 @@ github_public_request() (
 github_download_public_asset() (
     local url=${1:-} output=${2:-}
     case "${url}" in
-        https://github.com/DTB201/po0-unlock-assistant-public/releases/download/*/po0-unlock-v2.sh) ;;
+        https://github.com/Cr0ce11/po0-unlock-assistant-public/releases/download/*/po0-unlock-v2.sh) ;;
         https://release-assets.githubusercontent.com/*) ;;
         *) return 1 ;;
     esac
