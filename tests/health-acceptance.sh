@@ -307,6 +307,105 @@ test_public_connection_path_uses_generic_copy() (
         '修复失败仍把公网记录称为私网记录' || return 1
 )
 
+# 「安全修复必须先经用户确认」此前只靠源码文本行号先后来断言：把拒绝分支改成空操作
+# 也能全绿。这里实跑 health_check_loaded，按修复命令的实际调用次数判定。
+po0_pty_available() {
+    [[ -x /usr/bin/script ]]
+}
+
+po0_run_in_pty() {
+    local typescript=$1 driver=$2
+    shift 2
+    case "$(uname -s)" in
+        Darwin) /usr/bin/script -q "${typescript}" /bin/bash "${driver}" "$@" ;;
+        *) /usr/bin/script -qec "/bin/bash ${driver} $*" "${typescript}" ;;
+    esac
+}
+
+# 等待被测进程建立伪终端后再喂入答案：只有子进程写出 ready 标记，
+# 才说明伪终端已经就绪，此时写入的内容一定能被 read 读到。
+po0_feed_after_ready() {
+    local ready=$1 done_marker=$2 answer=$3 waited=0
+    while [[ ! -e ${ready} ]]; do
+        (( waited < 600 )) || return 1
+        sleep 0.05
+        waited=$((waited + 1))
+    done
+    [[ ${answer} == '<eof>' ]] || printf '%s\n' "${answer}"
+    waited=0
+    while [[ ! -e ${done_marker} ]]; do
+        (( waited < 600 )) || return 1
+        sleep 0.05
+        waited=$((waited + 1))
+    done
+}
+
+test_safe_repair_confirmation_at_runtime() (
+    local case_dir lib driver log ready done_marker function_body
+    local allow answer expected expect_text label repair_calls out
+    po0_pty_available || { fail '缺少 script 命令，无法建立伪终端'; return 1; }
+    case_dir=$(mktemp -d "${TMPDIR:-/tmp}/po0-repair-confirm.XXXXXXXX")
+    trap 'rm -rf -- "${case_dir}"' EXIT
+    lib=${case_dir}/lib.sh
+    driver=${case_dir}/driver.sh
+
+    function_body=$(sed -n '/^health_check_loaded() (/,/^)/p' "${SETUP_SOURCE}")
+    [[ -n ${function_body} ]] || { fail '未能提取健康检查函数'; return 1; }
+    {
+        printf '%s\n' 'C_BLUE= C_RESET= C_GREEN= C_YELLOW= C_RED='
+        printf '%s\n' 'EXIT_CMD_HEALTH=health' 'EXIT_CMD_REPAIR=repair'
+        printf '%s\n' 'CN_ENTRY_TIMEOUT_HEALTH=60' 'CN_ENTRY_CMD_HEALTH=health'
+        # 国外出口健康检查恒定失败，使流程必然走到「发现需要处理的项目」。
+        printf '%s\n' 'run_exit_role() { printf "%s\n" "$1" >>"${PO0_TEST_ROLE_LOG}"; [[ $1 != health ]]; }'
+        printf '%s\n' 'start_cn_entry_session() { return 0; }'
+        printf '%s\n' 'select_current_cn_entry_role() { :; }'
+        printf '%s\n' 'ssh_cn_entry_component() { return 0; }'
+        printf '%s\n' 'ssh_cn_entry() { return 0; }'
+        printf '%s\n' 'upload_cn_entry_role() { printf "upload\n" >>"${PO0_TEST_ROLE_LOG}"; }'
+        printf '%s\n' 'valid_cn_entry_scan_temp_path() { return 1; }'
+        printf '%s\n' "${function_body}"
+    } >"${lib}"
+    /bin/bash -n "${lib}" || { fail '健康检查夹具语法错误'; return 1; }
+    {
+        printf '%s\n' '#!/usr/bin/env bash' 'set -u'
+        printf '%s\n' 'library=$1' 'allow=$2' 'ready=$3' 'done_marker=$4'
+        printf '%s\n' '# shellcheck disable=SC1090' 'source "${library}"'
+        printf '%s\n' ': >"${ready}"' 'health_check_loaded "${allow}" || true' ': >"${done_marker}"'
+    } >"${driver}"
+
+    # allow_repair、答案、期望的修复调用次数、用例说明
+    while IFS='|' read -r allow answer expected expect_text label; do
+        [[ -n ${allow} ]] || continue
+        log=${case_dir}/role-${allow}-${answer//[<>]/}.log
+        out=${case_dir}/out-${allow}-${answer//[<>]/}.txt
+        ready=${case_dir}/ready-${allow}-${answer//[<>]/}
+        done_marker=${case_dir}/done-${allow}-${answer//[<>]/}
+        : >"${log}"
+        export PO0_TEST_ROLE_LOG=${log}
+        if [[ ${answer} == '<notty>' ]]; then
+            /bin/bash "${driver}" "${lib}" "${allow}" "${ready}" "${done_marker}" \
+                >"${out}" 2>&1 </dev/null
+        else
+            po0_feed_after_ready "${ready}" "${done_marker}" "${answer}" \
+                | po0_run_in_pty /dev/null "${driver}" "${lib}" "${allow}" "${ready}" "${done_marker}" \
+                >"${out}" 2>&1
+        fi
+        [[ -e ${done_marker} ]] || { fail "${label}：被测流程没有正常结束"; return 1; }
+        repair_calls=$(grep -Fxc repair "${log}" || true)
+        [[ ${repair_calls} == "${expected}" ]] \
+            || { fail "${label}：修复命令调用了 ${repair_calls} 次，期望 ${expected} 次"; return 1; }
+        grep -Fq -- "${expect_text}" "${out}" \
+            || { fail "${label}：输出中缺少「${expect_text}」"; return 1; }
+    done <<'CASES'
+no|<notty>|0|当前仅生成报告，未做修改。|allow_repair=no 且非交互终端
+no|<eof>|0|当前仅生成报告，未做修改。|allow_repair=no 但在交互终端下
+yes|<notty>|0|当前仅生成报告，未做修改。|允许修复但不是交互终端
+yes|n|0|未执行修复。|交互终端下用户回答 n
+yes|<eof>|0|未执行修复。|交互终端下读到 EOF
+yes|y|1|【执行安全修复】|交互终端下用户确认 y
+CASES
+)
+
 test_safe_repair_boundary() {
     local setup_body repair_body
     setup_body=$(sed -n '/^health_check_loaded() (/,/^)/p' "${SETUP_SOURCE}")
@@ -1457,6 +1556,7 @@ main() {
     run_case 'SSH 对端临时路径严格限制为 mktemp 固定格式' test_remote_temp_paths_are_strictly_validated
     run_case '检查结果不依赖终端列宽并按职责分组' test_readable_layout_contract
     run_case '公网连接的检查、状态与修复使用通用措辞' test_public_connection_path_uses_generic_copy
+    run_case '安全修复的用户确认闸门实跑验证' test_safe_repair_confirmation_at_runtime
     run_case '自动修复严格限制在确认后的自有核心服务' test_safe_repair_boundary
     run_case '服务修复失败会恢复原运行与启用状态' test_service_repair_rollback
     run_case '隧道延迟失败会恢复上一份有效配置' test_delayed_tunnel_failure_restores_previous_config
