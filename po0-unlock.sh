@@ -6293,7 +6293,7 @@ temporary='${scan_remote_temporary}'
 cleanup() {
     if test \"\${temporary}\" = yes; then rm -f -- \"\${tmp}\"; fi
 }
-po0_install_exit_trap cleanup
+trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP

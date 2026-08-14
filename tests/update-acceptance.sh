@@ -448,6 +448,49 @@ test_late_exit_trap_releases_runtime_components() {
     fi
 }
 
+# 发给国内入口执行的多行命令载荷运行在对端 bash 里，只能使用载荷内自带的函数和
+# 系统命令。v2.5.21 曾因批量替换把本地辅助函数 po0_install_exit_trap 写进扫描载荷，
+# 导致对端报「command not found」、Agent 扫描直接失败——本地和 CI 都测不到，
+# 因为那段内容只是一个字符串。这里静态核对每段载荷不引用任何只存在于本地的函数。
+test_remote_payloads_use_no_local_only_functions() {
+    local report
+    report=$(awk '
+        # 收集 setup.sh 中定义的本地函数名（载荷内部的定义不算，见下方 in_payload 分支）
+        !in_payload && /^[a-z_][a-z0-9_]*\(\) [({]$/ {
+            name = $1
+            sub(/\(\)$/, "", name)
+            local_fn[name] = 1
+            next
+        }
+        # 多行远端载荷：以 ssh_cn_entry... " 结尾的行开始，到独立的 " 或 "; ... 结束
+        /ssh_cn_entry[a-z_]*[[:space:]]+"$/ {
+            in_payload = 1
+            payload_start = FNR
+            delete payload_fn
+            next
+        }
+        in_payload && /^"/ { in_payload = 0; next }
+        in_payload {
+            # 载荷内部自己定义的函数可以调用
+            if ($0 ~ /^[a-z_][a-z0-9_]*\(\) \{$/) {
+                name = $1
+                sub(/\(\)$/, "", name)
+                payload_fn[name] = 1
+            }
+            line = $0
+            for (name in local_fn) {
+                if (name in payload_fn) continue
+                if (line ~ ("(^|[^A-Za-z0-9_])" name "([^A-Za-z0-9_]|$)")) {
+                    printf "%s:%s 引用了只存在于本地的函数 %s\n", FNR, payload_start, name
+                }
+            }
+        }
+    ' "${SETUP_SOURCE}")
+    [[ -z ${report} ]] \
+        || { fail "远端命令载荷引用了本地函数：${report}"; return 1; }
+    printf '    远端载荷静态核对通过\n'
+}
+
 test_single_public_edition_contract() {
     local source edition_count marker_count obsolete
     source=$(sed -n '1,$p' "${SETUP_SOURCE}")
@@ -3247,6 +3290,7 @@ main() {
     run_test '释放内置组件不覆盖调用方的 EXIT 陷阱' test_materialize_roles_preserves_caller_exit_trap
     run_test '释放内置组件不串接继承来的 EXIT 陷阱' test_materialize_roles_ignores_inherited_exit_trap
     run_test '后装 EXIT 陷阱前先释放内置组件' test_late_exit_trap_releases_runtime_components
+    run_test '远端命令载荷不引用本地专有函数' test_remote_payloads_use_no_local_only_functions
     run_test '仓库只保留唯一公开版' test_single_public_edition_contract
     run_test '用户可见产物品牌禁词' test_user_visible_branding_terms
     run_test '活动源码不含 v1 旧运行名称' test_legacy_runtime_identifiers_absent
