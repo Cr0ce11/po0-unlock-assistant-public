@@ -155,6 +155,9 @@ install_runtime_exit_trap() {
     handler=${existing#trap -- \'}
     handler=${handler%\' EXIT}
     if [[ ${handler} =~ ^[a-z_][a-z0-9_]*$ ]] && declare -F "${handler}" >/dev/null; then
+        # 这里要的就是立即展开：handler 是当前这一刻读到的处理函数名，
+        # 留到触发时再解析反而会拿到被后续 trap 覆盖后的值。名字已限定为标识符。
+        # shellcheck disable=SC2064
         trap "runtime_chain_exit_cleanup ${handler}" EXIT
         return 0
     fi

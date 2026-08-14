@@ -116,6 +116,7 @@ main() {
     done
     if (( $# == 0 )); then
         check_workflow_coverage "${suites[@]}"
+        check_shellcheck_coverage
     fi
 
     if (( FAIL_COUNT > 0 )); then
@@ -124,6 +125,28 @@ main() {
     fi
     printf '结果：%d 个套件、%d 项 test_* 测试均已完整注册并接入 CI\n' \
         "${SUITE_COUNT}" "${TEST_COUNT}"
+}
+
+# ShellCheck 门禁按 glob 发现文件，这里核对它实际会检查的清单是否覆盖了
+# 全部生产脚本、构建产物、工具与测试套件——漏检比检查失败更危险，因为它是静默的。
+check_shellcheck_coverage() {
+    local listed expected path missing=0
+    listed=$(/bin/bash "${PROJECT_DIR}/tools/check-shell.sh" --list) || {
+        fail 'tools/check-shell.sh --list 执行失败'
+        return
+    }
+    expected=$(
+        printf '%s\n' setup.sh overseas-exit-role.sh cn-entry-role.sh po0-unlock.sh
+        (cd -- "${PROJECT_DIR}" && printf '%s\n' tools/*.sh tests/*.sh)
+    )
+    while IFS= read -r path; do
+        [[ -n ${path} ]] || continue
+        grep -Fxq -- "${path}" <<<"${listed}" || {
+            fail "ShellCheck 门禁没有覆盖：${path}"
+            missing=$((missing + 1))
+        }
+    done <<<"${expected}"
+    (( missing > 0 )) || printf 'PASS: ShellCheck 门禁覆盖全部生产脚本、产物与测试套件\n'
 }
 
 main "$@"
