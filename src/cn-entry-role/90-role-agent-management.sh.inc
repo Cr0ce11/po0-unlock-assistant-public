@@ -216,7 +216,7 @@ manage_configured_service() {
 
 scan_services() {
     local state unit description fragment exec_data exec_path exec_name reason status selection answer index
-    local report_ip managed dependency_rc metadata_line scan_started metadata_output units_output rc
+    local report_ip managed metadata_line scan_started metadata_output units_output rc
     local -a units=() descriptions=() fragments=() exec_names=() reasons=() proxy_states=() managed_states=()
     require_root
     [[ -t 0 ]] || die '服务扫描需要交互终端。'

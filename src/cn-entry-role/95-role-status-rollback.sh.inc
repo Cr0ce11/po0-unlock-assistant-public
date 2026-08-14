@@ -255,7 +255,7 @@ read_recorded_tunnel_user_uid() {
 }
 
 rollback_finalize() {
-    local state attempt current_state closing account_home closed_marker
+    local state attempt current_state closing account_home closed_marker path
     local tunnel_uid= home_owner uid_recorded=
     require_root
     state=$(active_state)

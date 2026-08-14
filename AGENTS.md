@@ -21,7 +21,9 @@ bash -n overseas-exit-role.sh
 bash -n cn-entry-role.sh
 bash -n tools/build-cn-entry-role.sh
 bash -n tools/build-single-file.sh
+bash -n tools/check-shell.sh
 bash -n po0-unlock.sh
+bash tools/check-shell.sh
 bash tools/build-cn-entry-role.sh --check
 bash po0-unlock.sh self-test
 bash tests/check-acceptance-registration.sh
