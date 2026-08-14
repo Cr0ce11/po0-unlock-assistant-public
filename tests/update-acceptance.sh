@@ -174,7 +174,7 @@ write_fixture_script() {
 
 make_release_json() {
     local version=$1 hash=$2
-    printf '{"draft":false,"prerelease":false,"tag_name":"v%s","assets":[{"name":"po0-unlock-v2.sh","browser_download_url":"https://github.com/DTB201/po0-unlock-assistant-public/releases/download/v%s/po0-unlock-v2.sh","digest":"sha256:%s"}]}\n' \
+    printf '{"draft":false,"prerelease":false,"tag_name":"v%s","assets":[{"name":"po0-unlock-v2.sh","browser_download_url":"https://github.com/Cr0ce11/po0-unlock-assistant-public/releases/download/v%s/po0-unlock-v2.sh","digest":"sha256:%s"}]}\n' \
         "${version}" "${version}" "${hash}"
 }
 
@@ -194,7 +194,7 @@ load_harness() {
     UPDATE_BACKUP_DIR=${UPDATE_STATE_ROOT}/backups
     UPDATE_LOCK_FILE=${UPDATE_STATE_ROOT}/update.lock
     UPDATE_LAST_BACKUP=${UPDATE_STATE_ROOT}/last-backup
-    UPDATE_REPOSITORY=DTB201/po0-unlock-assistant-public
+    UPDATE_REPOSITORY=Cr0ce11/po0-unlock-assistant-public
     UPDATE_API_BASE=https://api.github.com/repos/${UPDATE_REPOSITORY}
     UPDATE_ASSET=po0-unlock-v2.sh
     UPDATE_MAX_BYTES=1048576
@@ -254,7 +254,7 @@ load_harness() {
     github_download_public_asset() {
         local url=$1 output=$2
         printf 'download %s\n' "${url}" >>"${TEST_REQUEST_LOG}"
-        [[ ${url} == https://github.com/DTB201/po0-unlock-assistant-public/releases/download/v*/po0-unlock-v2.sh ]] \
+        [[ ${url} == https://github.com/Cr0ce11/po0-unlock-assistant-public/releases/download/v*/po0-unlock-v2.sh ]] \
             || return 22
         [[ -f ${TEST_ASSET_FILE} ]] || return 1
         cp -- "${TEST_ASSET_FILE}" "${output}"
@@ -524,7 +524,7 @@ test_anonymous_public_requests_have_no_credentials() (
     mock_curl=${CASE_DIR}/mock-public-curl
     request_log=${CASE_DIR}/public-curl.log
     candidate=${CASE_DIR}/downloaded-public-asset
-    public_asset_url=https://github.com/DTB201/po0-unlock-assistant-public/releases/download/v1.1.0/po0-unlock-v2.sh
+    public_asset_url=https://github.com/Cr0ce11/po0-unlock-assistant-public/releases/download/v1.1.0/po0-unlock-v2.sh
     : >"${candidate}"
     {
         printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail'
@@ -558,12 +558,58 @@ test_anonymous_public_requests_have_no_credentials() (
         return 1
     fi
     ! real_github_public_request \
-        'https://api.github.com/repos/DTB201/po0-unlock-assistant/releases/latest' >/dev/null 2>&1 \
+        'https://api.github.com/repos/Cr0ce11/po0-unlock-assistant/releases/latest' >/dev/null 2>&1 \
         || fail '匿名请求接受了非公开更新仓库'
     ! real_github_download_public_asset \
-        'https://github.com/DTB201/po0-unlock-assistant/releases/download/v1.1.0/po0-unlock-v2.sh' \
+        'https://github.com/Cr0ce11/po0-unlock-assistant/releases/download/v1.1.0/po0-unlock-v2.sh' \
         "${candidate}" >/dev/null 2>&1 \
         || fail '匿名下载接受了非公开更新仓库'
+)
+
+# 项目所有者的 GitHub 账号从 DTB201 改名为 Cr0ce11 后，旧账号名可被任何人重新注册。
+# 更新器必须只认当前账号下的公开仓库，并拒绝改名前的旧地址。
+test_updater_rejects_previous_owner_repository() (
+    local mock_curl candidate
+    load_harness 1.0.0
+    mock_curl=${CASE_DIR}/mock-owner-curl
+    candidate=${CASE_DIR}/owner-asset-candidate
+    : >"${candidate}"
+    {
+        printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail'
+        printf '%s\n' \
+            'cat >/dev/null' \
+            'output_file=' \
+            'while (( $# > 0 )); do' \
+            '    if [[ $1 == --output ]]; then output_file=$2; shift 2; else shift; fi' \
+            'done' \
+            'if [[ -n ${output_file} ]]; then' \
+            '    printf "%s\\n" current-owner-asset >"${output_file}"' \
+            'else' \
+            '    printf "%s\\n" "{}"' \
+            'fi'
+    } >"${mock_curl}"
+    chmod 0700 "${mock_curl}"
+    CURL_BIN=${mock_curl}
+
+    # 夹具会覆盖 UPDATE_REPOSITORY，因此默认值另行按源码常量核对；
+    # 下面的接受与拒绝断言仍然运行真实的请求与下载守卫。
+    assert_eq 'UPDATE_REPOSITORY=Cr0ce11/po0-unlock-assistant-public' \
+        "$(grep -m1 '^UPDATE_REPOSITORY=' "${SETUP_SOURCE}")" \
+        'setup.sh 的默认更新仓库不是当前 GitHub 账号下的公开仓库' || return 1
+    real_github_public_request "${UPDATE_API_BASE}/releases/latest" >/dev/null \
+        || fail '当前账号公开仓库的 Release 查询被拒绝'
+    real_github_download_public_asset \
+        'https://github.com/Cr0ce11/po0-unlock-assistant-public/releases/download/v1.1.0/po0-unlock-v2.sh' \
+        "${candidate}" || fail '当前账号公开仓库的资产下载被拒绝'
+    assert_eq current-owner-asset "$(<"${candidate}")" '当前账号资产下载内容错误' || return 1
+
+    ! real_github_public_request \
+        'https://api.github.com/repos/DTB201/po0-unlock-assistant-public/releases/latest' >/dev/null 2>&1 \
+        || fail '匿名请求接受了改名前账号下的旧仓库地址'
+    ! real_github_download_public_asset \
+        'https://github.com/DTB201/po0-unlock-assistant-public/releases/download/v1.1.0/po0-unlock-v2.sh' \
+        "${candidate}" >/dev/null 2>&1 \
+        || fail '匿名下载接受了改名前账号下的旧仓库地址'
 )
 
 test_public_candidate_edition_gate() {
@@ -2797,6 +2843,7 @@ main() {
     run_test 'Release 元数据错误不改目标' test_release_metadata_failures_leave_target_unchanged
     run_test '最新版无操作与自动降级拒绝' test_latest_noop_and_downgrade_refusal
     run_test '公开 Release 请求与下载保持匿名' test_anonymous_public_requests_have_no_credentials
+    run_test '更新器拒绝改名前账号下的旧仓库地址' test_updater_rejects_previous_owner_repository
     run_test '公开 Release 候选强制校验公开版类型' test_public_candidate_edition_gate
     run_test '历史私有版与分享版可由高版本公开版接管并恢复' test_legacy_editions_to_public_manual_takeover_and_restore
     run_test '同版本跨版本类型不替换已安装脚本' test_same_version_cross_edition_does_not_replace

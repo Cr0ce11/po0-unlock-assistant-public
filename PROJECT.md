@@ -8,7 +8,7 @@ Po0 解锁助手通过国外出口 VPS，为受公网访问限制的国内入口
 
 ## 正式来源与文档职责
 
-- GitHub 仓库 [`DTB201/po0-unlock-assistant-public`](https://github.com/DTB201/po0-unlock-assistant-public) 的 `main` 是代码和文档的唯一正式来源。
+- GitHub 仓库 [`Cr0ce11/po0-unlock-assistant-public`](https://github.com/Cr0ce11/po0-unlock-assistant-public) 的 `main` 是代码和文档的唯一正式来源。
 - Pull Request 记录实现范围、风险、测试证据和恢复方式。
 - GitHub Release 是可部署脚本的唯一正式来源；每个正式版只提供 `po0-unlock-v2.sh` 与 `po0-unlock-v2.sh.sha256` 两个附件。
 - 服务器只用于部署和运行，不能作为代码或项目记录的唯一来源。
