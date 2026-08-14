@@ -260,6 +260,10 @@ validate_peer_config() {
     { is_private_ipv4 "${CN_ENTRY_PRIVATE_IP}" || is_public_ipv4 "${CN_ENTRY_PRIVATE_IP}"; } \
         || die '国内入口地址必须是受支持的私网或公网 IPv4。'
     valid_port "${CN_ENTRY_SSH_PORT}" || die '国内入口 SSH 端口必须是 1–65535。'
+    # 归一化去掉前导零：ssh 与 ssh-keyscan 内部会把 022 当作 22，
+    # 若原样保留，known_hosts 的键（[ip]:022）就与实际记录（ip）对不上，
+    # 服务器重装后的指纹替换向导将永远无法触发。
+    CN_ENTRY_SSH_PORT=$((10#${CN_ENTRY_SSH_PORT}))
 }
 
 read_config_file() {

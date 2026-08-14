@@ -538,6 +538,31 @@ EOF
 
 # 启用失败时必须撤销本次创建的 Komari 身份守卫。此前只在产物里数字符串出现次数：
 # TX_KOMARI_IDENTITY_CREATED 共出现 6 次，删掉两处真正的赋值仍剩 4 次，断言照样通过。
+# 展示 IP 是纯装饰性菜单，此时代理已启用、ENABLE 已入日志、单元已进托管清单。
+# 该菜单里输错一个字符不应该结束整个组件进程，更不应该让出口侧把已生效的配置报成失败。
+test_report_ipv4_menu_invalid_choice_is_not_fatal() (
+    local case_dir state function_body rc out
+    case_dir=$(mktemp -d "${WORK_ROOT}/report-ip-menu.XXXXXXXX")
+    state=${case_dir}/state
+    mkdir -p -- "${state}"
+    : >"${state}/service-proxy-actions.log"
+
+    function_body=$(sed -n '/^manage_komari_report_ipv4() {/,/^}/p' "${CN_ENTRY_ROLE}")
+    [[ -n ${function_body} ]] || { fail '未能提取展示 IP 菜单函数'; return 1; }
+    eval "${function_body}"
+    refresh_helper_from_state() { :; }
+    HELPER=/bin/true
+    report_ipv4_for_service() { printf '%s\n' ''; }
+    die() { printf 'FATAL:%s\n' "$*" >&2; exit 1; }
+
+    rc=0
+    out=$( (manage_komari_report_ipv4 komari-agent.service "${state}" <<<9) 2>&1 ) || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '无效选择没有返回非零'; return 1; }
+    assert_not_contains "${out}" 'FATAL:' \
+        '展示 IP 菜单的无效选择仍然终结了整个组件进程' || return 1
+    assert_contains "${out}" '未做修改' '无效选择没有说明未做修改' || return 1
+)
+
 test_enable_rollback_removes_identity_guard() (
     local case_dir log rc
     case_dir=$(mktemp -d "${TEMP_BASE}/po0-identity-rollback.XXXXXXXX")
@@ -1162,6 +1187,7 @@ main() {
     run_case 'Agent 扫描取消不探测代理且批量读取元数据' test_agent_scan_cancel_skips_proxy_probe_and_batches_metadata
     run_case '已配置 Agent 可从扫描入口检查更新或安全撤销' test_managed_agent_action_menu_can_refresh_or_disable
     run_case '代理文件被外部删除后仍可注销托管记录' test_disable_service_handles_externally_removed_dropin
+    run_case '展示 IP 菜单输错不会终结组件进程' test_report_ipv4_menu_invalid_choice_is_not_fatal
     run_case '启用失败会撤销身份守卫与动态配置守卫' test_enable_rollback_removes_identity_guard
     run_case '身份守卫在缺少解析器时保守保留身份' test_identity_guard_parser_selection
     printf '结果：%d 通过，%d 失败\n' "${PASS_COUNT}" "${FAIL_COUNT}"
