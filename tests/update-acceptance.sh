@@ -2285,6 +2285,26 @@ test_operation_lock_serializes_and_rejects_unsafe_path() (
     [[ ! -s ${action_log} ]] || { fail '操作锁异常时仍执行了远端操作'; return 1; }
 )
 
+# 管理连接没有保活时，链路被黑洞（NAT 表项过期、运营商丢包）要等 TCP keepalive
+# 约两小时才返回，这期间 /run/po0-unlock/operation.lock 一直被占，其他操作全被挡掉。
+# 反向隧道单元本身是配了 ServerAliveInterval 的，管理通道不应例外。
+test_management_ssh_uses_keepalive() {
+    local master_body authorize_body
+    master_body=$(sed -n '/^start_cn_entry_session() {/,/^}/p' "${SETUP_SOURCE}")
+    [[ -n ${master_body} ]] || { fail '未能提取国内入口控制连接函数'; return 1; }
+    assert_contains "${master_body}" '-o ServerAliveInterval=15' \
+        '控制主连接没有设置保活间隔' || return 1
+    assert_contains "${master_body}" '-o ServerAliveCountMax=4' \
+        '控制主连接没有设置保活失败上限' || return 1
+
+    authorize_body=$(sed -n '/^authorize_admin_key_once() {/,/^}/p' "${SETUP_SOURCE}")
+    [[ -n ${authorize_body} ]] || { fail '未能提取国内入口授权函数'; return 1; }
+    assert_contains "${authorize_body}" '-o ServerAliveInterval=15' \
+        '首次授权连接没有设置保活间隔' || return 1
+    assert_contains "${authorize_body}" '-o ServerAliveCountMax=4' \
+        '首次授权连接没有设置保活失败上限' || return 1
+}
+
 test_remote_component_timeout_is_bounded_and_releases_operation_lock() (
     set -Eeuo pipefail
     local output rc timeout_log=${WORK_ROOT}/component-timeout.log
@@ -2321,8 +2341,22 @@ test_remote_component_timeout_is_bounded_and_releases_operation_lock() (
         || { fail "只读组件超时没有保留 124 返回码（实际 ${rc}）"; return 1; }
     assert_contains "${output}" '本次只读组件调用未修改国内入口' \
         '只读组件超时没有明确说明入口侧未修改' || return 1
-    assert_contains "$(<"${timeout_log}")" '--foreground --kill-after=5s 30s ssh' \
-        '只读组件没有使用保持前台的 30 秒调用上限' || return 1
+    # 本地上限 = 远端上限 + 15 秒余量，确保远端先到期并回报，本地只兜底。
+    assert_contains "$(<"${timeout_log}")" '--foreground --kill-after=5s 45s ssh' \
+        '只读组件没有为远端上限保留本地兜底余量' || return 1
+    assert_contains "$(<"${timeout_log}")" 'timeout --foreground --kill-after=5s 30s /bin/bash -c' \
+        '只读组件没有把 30 秒上限压到远端执行' || return 1
+    assert_contains "$(<"${timeout_log}")" '/usr/local/libexec/po0-unlock-cn-entry' \
+        '远端上限包装丢掉了组件路径' || return 1
+    assert_contains "$(<"${timeout_log}")" status \
+        '远端上限包装丢掉了组件子命令' || return 1
+    # 包装用的引号必须能被远端 shell 原样还原，否则组件命令会被拆错。
+    assert_eq "'/usr/local/libexec/po0-unlock-cn-entry' status" \
+        "$(/bin/sh -c "printf '%s' $(shell_single_quote "'/usr/local/libexec/po0-unlock-cn-entry' status")")" \
+        '远端引号包装无法还原原始组件命令' || return 1
+    assert_eq "a'b\"c d" \
+        "$(/bin/sh -c "printf '%s' $(shell_single_quote "a'b\"c d")")" \
+        '远端引号包装无法还原含引号与空格的字符串' || return 1
     assert_not_contains "$(<"${timeout_log}")" UNEXPECTED_SSH \
         '超时夹具错误执行了 SSH 命令' || return 1
     assert_contains "$(<"${TEST_FLOCK_LOG}")" '-u 7' \
@@ -2340,8 +2374,12 @@ test_remote_component_timeout_is_bounded_and_releases_operation_lock() (
         '修改型组件超时没有说明可能存在部分修改' || return 1
     assert_contains "${output}" '完整回滚' \
         '修改型组件超时没有给出完整回滚指引' || return 1
-    assert_contains "$(<"${timeout_log}")" '--foreground --kill-after=5s 120s ssh' \
-        '修改型组件没有使用保持前台的 120 秒调用上限' || return 1
+    assert_contains "$(<"${timeout_log}")" '--foreground --kill-after=5s 135s ssh' \
+        '修改型组件没有为远端上限保留本地兜底余量' || return 1
+    assert_contains "$(<"${timeout_log}")" 'timeout --foreground --kill-after=5s 120s /bin/bash -c' \
+        '修改型组件没有把 120 秒上限压到远端执行' || return 1
+    assert_contains "$(<"${timeout_log}")" 'prepare fixture fixture' \
+        '远端上限包装丢掉了组件参数' || return 1
     assert_contains "$(<"${TEST_FLOCK_LOG}")" '-u 7' \
         '修改型组件超时后没有释放国外出口操作锁' || return 1
 )
@@ -3036,6 +3074,7 @@ main() {
     run_test '无可信主机密钥时拒绝建立国内入口会话' test_cn_entry_session_requires_trusted_host_key_file
     run_test '国内入口 SSH 会话有限重试、复用与清理' test_cn_entry_session_retries_and_reuses_transport
     run_test '主控操作互斥锁串行化并拒绝异常路径' test_operation_lock_serializes_and_rejects_unsafe_path
+    run_test '管理 SSH 连接启用保活' test_management_ssh_uses_keepalive
     run_test '远程组件调用超时有界并释放操作锁' test_remote_component_timeout_is_bounded_and_releases_operation_lock
     run_test '国内入口写锁等待有界且超时零写入' test_cn_entry_lock_timeout_is_bounded_and_preserves_config
     run_test '当前国内入口组件复用与连接更新分阶段耗时' test_current_cn_entry_role_reuse_and_reconfigure_progress
