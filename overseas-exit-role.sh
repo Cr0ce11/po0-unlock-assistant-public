@@ -650,11 +650,34 @@ health() (
         failures=$((failures + 1))
     fi
 
+    if [[ -n ${state} \
+        && -r ${state}/overseas-exit-private-ip \
+        && -r ${state}/cn-entry-private-ip \
+        && -r ${state}/cn-entry-ssh-port ]]; then
+        exit_ip=$(<"${state}/overseas-exit-private-ip")
+        cn_ip=$(<"${state}/cn-entry-private-ip")
+        cn_port=$(<"${state}/cn-entry-ssh-port")
+    fi
+
     health_group '反向隧道'
     if health_regular_root_file "${TUNNEL_UNIT}" 644 \
         && health_regular_root_file "${KNOWN_HOSTS}" 600 \
         && health_regular_root_file "${KEY_FILE}" 600; then
-        health_line 正常 '反向隧道配置' '文件完整'
+        # 只查权限不查内容时，被人工加过 StrictHostKeyChecking=no 的隧道也会被报成
+        # 「文件完整」。这里用与写入时同一份模板重建 ExecStart 并逐行精确比对；
+        # 不一致时给出的处置是「重新执行连接更新」——安全修复对这种单元同样会拒绝接管。
+        if [[ -n ${exit_ip} && -n ${cn_ip} && -n ${cn_port} ]] \
+            && [[ $(grep -c '^ExecStart=' "${TUNNEL_UNIT}") -eq 1 ]] \
+            && grep -Fqx -- "$(tunnel_exec_start_line "${exit_ip}" "${cn_ip}" "${cn_port}")" \
+                "${TUNNEL_UNIT}"; then
+            health_line 正常 '反向隧道配置' '文件完整且启动参数未被改动'
+        elif [[ -z ${exit_ip} || -z ${cn_ip} || -z ${cn_port} ]]; then
+            health_line 异常 '反向隧道配置' '连接记录缺失，无法核对启动参数'
+            failures=$((failures + 1))
+        else
+            health_line 异常 '反向隧道配置' '启动参数与本助手模板不一致，请重新执行连接更新'
+            failures=$((failures + 1))
+        fi
     else
         health_line 异常 '反向隧道配置' '文件缺失或权限异常'
         failures=$((failures + 1))
@@ -672,14 +695,6 @@ health() (
         failures=$((failures + 1))
     fi
 
-    if [[ -n ${state} \
-        && -r ${state}/overseas-exit-private-ip \
-        && -r ${state}/cn-entry-private-ip \
-        && -r ${state}/cn-entry-ssh-port ]]; then
-        exit_ip=$(<"${state}/overseas-exit-private-ip")
-        cn_ip=$(<"${state}/cn-entry-private-ip")
-        cn_port=$(<"${state}/cn-entry-ssh-port")
-    fi
     health_group '连接路径'
     if valid_ipv4 "${exit_ip}" && valid_ipv4 "${cn_ip}" && valid_port "${cn_port}"; then
         health_line 正常 '连接记录' '地址和端口格式有效'
