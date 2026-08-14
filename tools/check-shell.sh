@@ -22,12 +22,12 @@ shellcheck --severity=warning --exclude=SC1007,SC2100 \
 # SC1007：测试夹具沿用与生产脚本相同的空值初始化写法。
 shellcheck --severity=warning --exclude=SC1007 \
     tests/build-backup-acceptance.sh \
-    tests/cf-probe-acceptance.sh \
     tests/check-acceptance-registration.sh
 
 # SC1007：动态夹具套件沿用与生产脚本相同的空值初始化写法。
 # SC2034：这些套件会动态抽取或 source 函数片段，夹具变量的使用无法被静态追踪。
 shellcheck --severity=warning --exclude=SC1007,SC2034 \
+    tests/cf-probe-acceptance.sh \
     tests/config-migration-acceptance.sh \
     tests/diagnostic-acceptance.sh \
     tests/health-acceptance.sh \

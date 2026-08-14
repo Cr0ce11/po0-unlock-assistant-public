@@ -217,22 +217,25 @@ enable_transaction_cleanup() {
             remove_komari_identity_guard "${TX_KOMARI_IDENTITY_DIR}" "${TX_UNIT}" \
                 || echo '警告：未能清理 Komari 身份守卫，请人工检查。' >&2
         fi
+        # cf-probe 的测速目标改写与兼容文件创建都发生在 drop-in 落盘之前，
+        # 补偿不能挂在 TX_DROPIN_MAY_EXIST 上：该标志置位前失败会整块跳过，
+        # 留下已被改写却未进托管清单的目标和 go-pending 残留。与刷新事务的写法保持一致。
+        if [[ -n ${TX_COMPAT_DIR:-} \
+            && ( -e ${TX_COMPAT_DIR}/go-pending || -L ${TX_COMPAT_DIR}/go-pending ) ]]; then
+            rollback_cf_probe_go_latency_compat "${TX_COMPAT_DIR}" \
+                || echo '警告：未能恢复 cf-probe 本轮测速目标，请人工检查。' >&2
+        fi
+        if [[ ${TX_COMPAT_CREATED:-no} == yes && -n ${TX_COMPAT_DIR:-} ]]; then
+            if ! rmdir "${TX_COMPAT_DIR}" 2>/dev/null; then
+                remove_cf_probe_latency_compat "${TX_COMPAT_DIR}" \
+                    || echo '警告：未能清理 cf-probe 兼容文件，请人工检查。' >&2
+            fi
+        elif [[ ${TX_COMPAT_CURL_CREATED:-no} == yes && -n ${TX_COMPAT_DIR:-} ]]; then
+            remove_cf_probe_direct_report_compat "${TX_COMPAT_DIR}" \
+                || echo '警告：未能清理 cf-probe 真实地区上报兼容文件，请人工检查。' >&2
+        fi
         if [[ ${TX_DROPIN_MAY_EXIST:-no} == yes ]]; then
             rm -f "${TX_DROPIN_FILE}"
-            if [[ -n ${TX_COMPAT_DIR:-} \
-                && ( -e ${TX_COMPAT_DIR}/go-pending || -L ${TX_COMPAT_DIR}/go-pending ) ]]; then
-                rollback_cf_probe_go_latency_compat "${TX_COMPAT_DIR}" \
-                    || echo '警告：未能恢复 cf-probe 本轮测速目标，请人工检查。' >&2
-            fi
-            if [[ ${TX_COMPAT_CREATED:-no} == yes && -n ${TX_COMPAT_DIR:-} ]]; then
-                if ! rmdir "${TX_COMPAT_DIR}" 2>/dev/null; then
-                    remove_cf_probe_latency_compat "${TX_COMPAT_DIR}" \
-                        || echo '警告：未能清理 cf-probe 兼容文件，请人工检查。' >&2
-                fi
-            elif [[ ${TX_COMPAT_CURL_CREATED:-no} == yes && -n ${TX_COMPAT_DIR:-} ]]; then
-                remove_cf_probe_direct_report_compat "${TX_COMPAT_DIR}" \
-                    || echo '警告：未能清理 cf-probe 真实地区上报兼容文件，请人工检查。' >&2
-            fi
             rmdir "${TX_DROPIN_DIR}" 2>/dev/null || true
             if systemctl daemon-reload; then reload_ok=yes; fi
             if [[ ${TX_ORIGINAL_RUNNING:-no} == yes ]]; then
