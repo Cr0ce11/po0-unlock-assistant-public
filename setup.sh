@@ -2748,6 +2748,9 @@ restore_legacy_manager_entry() {
 
 prepare_legacy_config_for_version() {
     local target_version=$1 config_hash candidate=
+    # 告诉调用方旧位置的配置副本是不是本次新建的：没提交的撤销要把它删回去，
+    # 而原本就存在的副本必须原样保留。
+    LEGACY_CONFIG_COPY_CREATED=no
     version_gt "${CONFIG_RELOCATION_VERSION}" "${target_version}" || return 0
     validate_config_directory
     validate_managed_config_file "${CONFIG_FILE}" '当前连接配置'
@@ -2767,6 +2770,7 @@ prepare_legacy_config_for_version() {
             die '无法为旧版脚本恢复连接配置；当前脚本和新配置均未改动。'
         fi
         candidate=
+        LEGACY_CONFIG_COPY_CREATED=yes
     fi
 }
 
@@ -3179,6 +3183,9 @@ perform_script_update() (
 perform_script_restore() (
     local backup_name backup_path backup_version backup_edition backup_hash recorded_hash extra current_hash current_backup= replacement= answer rc
     local pointer_snapshot= restore_pointer=no
+    # 旧位置配置副本的归属标志只能用全局量：bash 3.2 在命令替换里执行本函数时，
+    # EXIT 陷阱读不到函数局部量，用局部量会漏掉这次清理。
+    LEGACY_CONFIG_COPY_CREATED=no
     cleanup_restore_transaction() {
         rc=$?
         trap - EXIT INT TERM HUP
@@ -3193,6 +3200,11 @@ perform_script_restore() (
             else
                 printf '%s\n' '警告：撤销失败后未能还原原脚本备份指针；请人工核对 /var/lib/po0-unlock/updater 下的备份。' >&2
             fi
+        fi
+        # 撤销没有真正完成时删掉本次新建的旧位置配置副本；脚本还是新版，这份副本没有任何流程会读。
+        if [[ ${LEGACY_CONFIG_COPY_CREATED:-no} == yes ]]; then
+            rm -f -- "${LEGACY_CONFIG_FILE}" \
+                || printf '%s\n' '提醒：撤销失败后未能清理本次在旧位置新建的连接配置副本。' >&2
         fi
         case "${pointer_snapshot:-}" in
             "${UPDATE_STATE_ROOT}/.last-backup-before."*) rm -f -- "${pointer_snapshot}" ;;
@@ -3261,6 +3273,7 @@ perform_script_restore() (
         && version_gt "${CANONICAL_ENTRY_VERSION}" "${backup_version}"; then
             restore_legacy_manager_entry "${backup_path}" "${backup_hash}"
             restore_pointer=no
+            LEGACY_CONFIG_COPY_CREATED=no
             finalize_legacy_config_for_version "${backup_version}" \
                 || printf '%s\n' '提醒：助手已经恢复成功，旧版配置可正常使用，但新位置的相同配置未能安全清理。' >&2
             prune_script_backups "${current_backup}" \
@@ -3277,6 +3290,7 @@ perform_script_restore() (
         || die '撤销脚本更新失败；当前脚本未改动，原有的恢复上一版入口仍然可用。'
     replacement=
     restore_pointer=no
+    LEGACY_CONFIG_COPY_CREATED=no
     finalize_legacy_config_for_version "${backup_version}" \
         || printf '%s\n' '提醒：助手已经恢复成功，旧版配置可正常使用，但新位置的相同配置未能安全清理。' >&2
     prune_script_backups "${current_backup}" \

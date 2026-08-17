@@ -1119,12 +1119,12 @@ test_restore_pre_24_script_and_config_together() {
     [[ ${rc} -ne 0 && ${rc} -ne 20 ]] || fail '恢复指针失败时没有停止提交'
     assert_contains "${output}" '当前脚本尚未替换' '恢复指针失败提示不明确'
     assert_file_eq "${new}" "${SCRIPT_PATH}" '恢复指针失败后改变了当前脚本'
-    [[ -f ${CONFIG_FILE} && -f ${LEGACY_CONFIG_FILE} ]] \
-        || fail '恢复指针失败后没有同时保留新旧版本可用配置'
+    [[ -f ${CONFIG_FILE} ]] || fail '恢复指针失败后没有保留当前版本配置'
     assert_eq "${config_hash}" "$(sha256_file "${CONFIG_FILE}")" \
         '恢复指针失败后改变了当前版本配置'
-    assert_eq "${config_hash}" "$(sha256_file "${LEGACY_CONFIG_FILE}")" \
-        '恢复指针失败后旧版兼容配置与当前配置不一致'
+    # 撤销没有提交，脚本仍是 v2.4：本次新建的旧位置副本必须删回去。
+    [[ ! -e ${LEGACY_CONFIG_FILE} ]] \
+        || fail '恢复指针失败后留下了本次新建的旧位置配置副本'
     eval "$(declare -f real_write_last_script_backup | sed '1s/^real_write_last_script_backup /write_last_script_backup /')"
 
     set +e
@@ -1137,6 +1137,97 @@ test_restore_pre_24_script_and_config_together() {
     [[ -f ${LEGACY_CONFIG_FILE} ]] || fail '撤销到 v2.3 没有恢复 /root 配置'
     assert_eq "${config_hash}" "$(sha256_file "${LEGACY_CONFIG_FILE}")" \
         '脚本撤销过程中改变了连接配置'
+}
+
+# 把夹具推到「当前 v2.4、上一版 v2.3、连接配置只在新位置」的状态：撤销到 v2.3 会跨过
+# 配置迁移版本，从而走到「为旧版在 /root 准备一份配置副本」这条路径。
+stage_pre_24_restore_fixture() {
+    local marker=$1 old new rc
+    load_harness 2.3.0
+    CONFIG_RELOCATION_VERSION=2.4.0
+    CONFIG_DIR=${CASE_DIR}/etc/po0-unlock
+    CONFIG_FILE=${CONFIG_DIR}/hosts.conf
+    LEGACY_CONFIG_FILE=${CASE_DIR}/root/hosts.conf
+    old=${CASE_DIR}/old.sh
+    new=${CASE_DIR}/new.sh
+    write_fixture_script "${old}" 2.3.0 good "${marker}-old"
+    write_fixture_script "${new}" 2.4.0 good "${marker}-new"
+    cp -p "${old}" "${SCRIPT_PATH}"
+    chmod 0700 "${SCRIPT_PATH}"
+    TEST_ASSET_FILE=${new}
+    TEST_RELEASE_JSON=$(make_release_json 2.4.0 "$(sha256_file "${new}")")
+    set +e
+    perform_script_update >/dev/null 2>&1
+    rc=$?
+    set -e
+    assert_eq 20 "${rc}" "旧位置配置夹具（${marker}）未能先更新到 v2.4" || return 1
+    mkdir -p "${CONFIG_DIR}" "${LEGACY_CONFIG_FILE%/*}"
+    chmod 0700 "${CONFIG_DIR}" "${LEGACY_CONFIG_FILE%/*}"
+    {
+        printf '%s\n' '# 在国外出口 VPS 上使用；不保存任何 SSH 密码。'
+        printf '%s\n' 'CN_ENTRY_SSH_USER=root'
+        printf '%s\n' 'CN_ENTRY_PRIVATE_IP=10.0.0.2'
+        printf '%s\n' 'CN_ENTRY_SSH_PORT=22'
+    } >"${CONFIG_FILE}"
+    chmod 0600 "${CONFIG_FILE}"
+    SCRIPT_VERSION=2.4.0
+}
+
+# 只让针对目标脚本的撤销替换失败，其余 mv（含旧位置配置副本的落盘）仍走夹具实现。
+fail_restore_script_replacement() {
+    eval "$(declare -f mv | sed '1s/^mv /harness_mv /')"
+    mv() {
+        local last=${*: -1}
+        if [[ ${last} == "${SCRIPT_PATH}" ]]; then
+            case "$*" in *po0-unlock.sh.restore.*) return 1 ;; esac
+        fi
+        harness_mv "$@"
+    }
+}
+
+# 撤销在提交前失败时，本次为旧版新建的 /root 配置副本必须删回去：脚本仍是新版，
+# 这份副本没有任何流程会读，留着只是 root 私有残留。反过来，撤销之前就存在的副本
+# 不是本次新建的，任何失败路径都不得删掉它。
+test_restore_failure_removes_only_its_own_legacy_config_copy() {
+    local rc config_hash script_hash legacy_inode
+
+    stage_pre_24_restore_fixture legacy-copy-new || return 1
+    config_hash=$(sha256_file "${CONFIG_FILE}")
+    script_hash=$(sha256_file "${SCRIPT_PATH}")
+    [[ ! -e ${LEGACY_CONFIG_FILE} ]] || fail '夹具起点不该已有旧位置配置' || return 1
+    fail_restore_script_replacement
+    set +e
+    perform_script_restore >/dev/null 2>&1
+    rc=$?
+    set -e
+    [[ ${rc} -ne 0 && ${rc} -ne 20 ]] || fail '撤销替换失败时没有停止' || return 1
+    assert_eq "${script_hash}" "$(sha256_file "${SCRIPT_PATH}")" \
+        '撤销替换失败后改动了当前脚本' || return 1
+    [[ ! -e ${LEGACY_CONFIG_FILE} ]] \
+        || fail '撤销失败后留下了本次新建的旧位置配置副本' || return 1
+    [[ -z $(find "${LEGACY_CONFIG_FILE%/*}" -maxdepth 1 -name 'hosts.conf.restore.*' -print) ]] \
+        || fail '撤销失败后留下了旧位置配置的临时候选' || return 1
+    assert_eq "${config_hash}" "$(sha256_file "${CONFIG_FILE}")" \
+        '撤销失败后改变了当前版本配置' || return 1
+    assert_no_transaction_residue 'po0-unlock.sh.restore' || return 1
+
+    stage_pre_24_restore_fixture legacy-copy-existing || return 1
+    config_hash=$(sha256_file "${CONFIG_FILE}")
+    cp -p "${CONFIG_FILE}" "${LEGACY_CONFIG_FILE}"
+    chmod 0600 "${LEGACY_CONFIG_FILE}"
+    legacy_inode=$(inode_of "${LEGACY_CONFIG_FILE}")
+    fail_restore_script_replacement
+    set +e
+    perform_script_restore >/dev/null 2>&1
+    rc=$?
+    set -e
+    [[ ${rc} -ne 0 && ${rc} -ne 20 ]] || fail '旧位置已有副本时撤销替换失败没有停止' || return 1
+    [[ -f ${LEGACY_CONFIG_FILE} ]] \
+        || fail '撤销失败后删掉了撤销之前就存在的旧位置配置' || return 1
+    assert_eq "${legacy_inode}" "$(inode_of "${LEGACY_CONFIG_FILE}")" \
+        '撤销失败后替换了撤销之前就存在的旧位置配置' || return 1
+    assert_eq "${config_hash}" "$(sha256_file "${LEGACY_CONFIG_FILE}")" \
+        '撤销失败后改变了旧位置配置内容' || return 1
 }
 
 test_pointer_failure_never_replaces_target() {
@@ -3558,6 +3649,7 @@ main() {
     run_test '公开版接管失败保留原私有版' test_manual_takeover_failure_preserves_private_install
     run_test '有效更新、备份、原子替换与恢复' test_valid_update_backup_and_restore
     run_test '撤销到 v2.3 时同步恢复旧配置位置' test_restore_pre_24_script_and_config_together
+    run_test '撤销失败只回收本次新建的旧位置配置副本' test_restore_failure_removes_only_its_own_legacy_config_copy
     run_test '备份指针写失败不替换更新/恢复目标' test_pointer_failure_never_replaces_target
     run_test '原子替换失败后上一版恢复点仍然可用' test_replacement_failure_keeps_previous_restore_point
     run_test '恢复确认期间目标变化拒绝' test_restore_confirmation_change_is_rejected
