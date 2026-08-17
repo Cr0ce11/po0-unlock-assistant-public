@@ -2588,6 +2588,153 @@ test_reconfigure_refuses_claimed_entry() (
         '换到另一台入口时仍跳过了占用检查' || return 1
 )
 
+# 只读状态检查入口：供手机上的 agent 定时巡检，靠退出码决定要不要打扰人。
+# 0 正常 / 1 提醒 / 2 异常 / 3 工具自身没跑成——第四档是关键，
+# 否则「没装 Po0」「连不上入口」会被误判成一切正常。
+test_readonly_check_entry() (
+    set -Eeuo pipefail
+    local out rc json
+    load_harness 2.5.23
+
+    # 级别映射与 JSON 转义
+    assert_eq ok "$(readonly_check_level_key 正常)" '正常没有映射为 ok' || return 1
+    assert_eq warn "$(readonly_check_level_key 提醒)" '提醒没有映射为 warn' || return 1
+    assert_eq error "$(readonly_check_level_key 异常)" '异常没有映射为 error' || return 1
+    assert_eq unknown "$(readonly_check_level_key 什么)" '未知级别没有兜底' || return 1
+    assert_eq 'a\"b' "$(readonly_check_json_escape 'a"b')" '双引号没有转义' || return 1
+    assert_eq 'a\\b' "$(readonly_check_json_escape 'a\b')" '反斜杠没有转义' || return 1
+
+    # 退出码翻译：内部码 → 对外码；任何意外码都归入 3，不能冒充检查结论
+    run_cn_entry_operation() { return 10; }; rc=0; run_readonly_check || rc=$?
+    assert_eq 0 "${rc}" '正常没有返回 0' || return 1
+    run_cn_entry_operation() { return 11; }; rc=0; run_readonly_check || rc=$?
+    assert_eq 1 "${rc}" '提醒没有返回 1' || return 1
+    run_cn_entry_operation() { return 12; }; rc=0; run_readonly_check || rc=$?
+    assert_eq 2 "${rc}" '异常没有返回 2' || return 1
+    run_cn_entry_operation() { return 13; }; rc=0; run_readonly_check || rc=$?
+    assert_eq 3 "${rc}" '工具出错没有返回 3' || return 1
+    run_cn_entry_operation() { return 1; }; rc=0; out=$(run_readonly_check 2>&1) || rc=$?
+    assert_eq 3 "${rc}" 'die 造成的退出码 1 被当成了检查结论' || return 1
+
+    # 未安装：必须是 3，且两种模式都要给出结论，不能崩溃或误报正常
+    installation_active() { return 1; }
+    rc=0; out=$(readonly_check human) || rc=$?
+    assert_eq 13 "${rc}" '未安装时没有返回工具错误码' || return 1
+    assert_contains "${out}" '检查未完成' '未安装时没有说明检查未完成' || return 1
+    rc=0; json=$(readonly_check json) || rc=$?
+    assert_contains "${json}" '"overall":"tool_error"' '未安装时 JSON 没有标记工具错误' || return 1
+
+    # 正常路径：两端各返回结构化行
+    installation_active() { return 0; }
+    load_config() { :; }
+    preflight() { :; }
+    start_cn_entry_session() { :; }
+    select_current_cn_entry_role() { printf -v "$1" '%s' /usr/local/libexec/po0-unlock-cn-entry; printf -v "$2" '%s' no; }
+    run_exit_role() { printf 'PO0LINE\t正常\t国外出口代理服务\t正在运行\n'; }
+    ssh_cn_entry_component() { printf 'PO0LINE\t正常\t受限隧道账户\t完整\n'; }
+    rc=0; out=$(readonly_check human) || rc=$?
+    assert_eq 10 "${rc}" '两端全绿时没有返回正常' || return 1
+    assert_contains "${out}" 'Po0 状态：正常' '人读结论缺失' || return 1
+    assert_not_contains "${out}" 'PO0LINE' '人读输出泄漏了内部结构化行' || return 1
+
+    # 提醒与异常的判定：异常优先
+    ssh_cn_entry_component() { printf 'PO0LINE\t提醒\tAgent demo.service\t配置完整，但服务当前没有运行\n'; }
+    rc=0; out=$(readonly_check human) || rc=$?
+    assert_eq 11 "${rc}" '只有提醒时没有返回提醒码' || return 1
+    assert_contains "${out}" '需要关注' '提醒项没有被列出' || return 1
+    ssh_cn_entry_component() {
+        printf 'PO0LINE\t提醒\tAgent demo.service\t没有运行\n'
+        printf 'PO0LINE\t异常\t反向隧道服务\t没有运行\n'
+    }
+    rc=0; out=$(readonly_check human) || rc=$?
+    assert_eq 12 "${rc}" '同时存在提醒与异常时没有判为异常' || return 1
+
+    # JSON 合法性与脱敏：detail 里的地址不得原样出现
+    run_exit_role() { printf 'PO0LINE\t异常\t连接路径\t无法连到 203.0.113.77 的入口\n'; }
+    ssh_cn_entry_component() { printf 'PO0LINE\t正常\t受限隧道账户\t完整\n'; }
+    rc=0; json=$(readonly_check json) || rc=$?
+    assert_eq 12 "${rc}" 'JSON 模式没有返回异常码' || return 1
+    assert_eq 1 "$(grep -c . <<<"${json}")" 'JSON 模式输出不是恰好一行' || return 1
+    assert_not_contains "${json}" '203.0.113.77' 'detail 没有脱敏，泄漏了地址' || return 1
+    assert_contains "${json}" '"overall":"error"' 'JSON 总体结论错误' || return 1
+    if command -v jq >/dev/null 2>&1; then
+        jq -e . <<<"${json}" >/dev/null || { fail 'JSON 无法通过 jq 校验'; return 1; }
+    else
+        printf '    （本机没有 jq，跳过 JSON 语法校验）\n' >&2
+    fi
+)
+
+# 只读入口必须绕过「上传候选自动接管已安装脚本」这条写路径：
+# 否则从候选副本跑一次巡检就会替换生产脚本。
+test_readonly_check_never_triggers_takeover() (
+    set -Eeuo pipefail
+    local rc=0 marker
+    load_harness 2.5.23
+    marker=${CASE_DIR}/takeover.marker
+    : >"${marker}"
+    # 夹具必须让判定真正走到接管分支：正式脚本要存在、版本相同、版本类型是公开版、
+    # 且与候选内容不一致——这正是「同版本安全修复」接管的触发条件。
+    SCRIPT_PATH=${CASE_DIR}/candidate.sh
+    OFFICIAL_SCRIPT_PATH=${CASE_DIR}/installed.sh
+    SHORTCUT_PATH=${CASE_DIR}/po0
+    printf '%s\n' 'SCRIPT_VERSION=2.5.23' 'candidate' >"${SCRIPT_PATH}"
+    printf '%s\n' 'SCRIPT_VERSION=2.5.23' 'installed' >"${OFFICIAL_SCRIPT_PATH}"
+    is_root() { return 0; }
+    valid_release_version() { return 0; }
+    validate_official_entry_paths() { :; }
+    ensure_official_shortcut() { :; }
+    replace_managed_shortcut() { :; }
+    handoff_to_official_script() { :; }
+    static_script_version() { printf '2.5.23\n'; }
+    static_script_edition() { printf '%s\n' 公开版; }
+    version_gt() { return 1; }
+    perform_uploaded_local_upgrade() { printf 'TAKEOVER\n' >>"${marker}"; return 0; }
+
+    # 先自证夹具有效：换成任意写命令时，判定确实会走到接管
+    maybe_handoff_to_official_entry rollback >/dev/null 2>&1 || true
+    [[ -s ${marker} ]] \
+        || { fail '夹具无效：写命令都没有触发接管，本用例证明不了任何事'; return 1; }
+
+    : >"${marker}"
+    maybe_handoff_to_official_entry check >/dev/null 2>&1 || rc=$?
+    assert_eq 0 "${rc}" '只读检查没有从接管判定中安全返回' || return 1
+    [[ ! -s ${marker} ]] || { fail '只读检查触发了本地接管写路径'; return 1; }
+)
+
+# 两端 health_line 的机器可读开关是只读入口的解析契约：默认输出必须逐字节不变。
+test_health_line_machine_mode_contract() {
+    local body out
+    for body in "$(sed -n '/^health_line() {/,/^}/p' "${PROJECT_DIR}/overseas-exit-role.sh")" \
+        "$(sed -n '/^health_line() {/,/^}/p' "${PROJECT_DIR}/cn-entry-role.sh")"; do
+        [[ -n ${body} ]] || { fail '未能提取 health_line'; return 1; }
+        out=$(eval "${body}"; health_line 正常 名称 说明)
+        assert_eq '    [正常] 名称：说明' "${out}" '默认输出格式被改变' || return 1
+        out=$(eval "${body}"; PO0_HEALTH_TSV=yes health_line 提醒 名称 说明)
+        assert_eq "$(printf 'PO0LINE\t提醒\t名称\t说明')" "${out}" '机器可读模式格式不符合契约' || return 1
+    done
+}
+
+test_health_verdict_matches_reported_levels() {
+    # 只读入口按逐项等级汇总总体结论，菜单第 3 项按角色脚本的返回码判定。两者要一致，
+    # 前提是每次计入失败或提醒都同时打印对应等级的行；否则会出现「菜单报异常、
+    # 只读入口报正常」的假绿灯，而定时巡检正是靠退出码决定要不要叫人。
+    local file body failures warnings errors reminders
+    for file in overseas-exit-role.sh cn-entry-role.sh; do
+        body=$(sed -n '/^health() (/,/^)$/p' "${PROJECT_DIR}/${file}")
+        [[ -n ${body} ]] || { fail "未能提取 ${file} 的 health 函数体"; return 1; }
+        # grep -c 在计数为 0 时退出码非 0；出口角色本来就没有提醒级检查项，必须容忍。
+        failures=$(grep -cF 'failures + 1' <<<"${body}" || true)
+        errors=$(grep -cF 'health_line 异常' <<<"${body}" || true)
+        warnings=$(grep -cF 'warnings + 1' <<<"${body}" || true)
+        reminders=$(grep -cF 'health_line 提醒' <<<"${body}" || true)
+        assert_eq "${errors}" "${failures}" \
+            "${file}：失败计数与 [异常] 行不是一一对应" || return 1
+        assert_eq "${reminders}" "${warnings}" \
+            "${file}：提醒计数与 [提醒] 行不是一一对应" || return 1
+        (( errors > 0 )) || { fail "${file}：没有提取到任何 [异常] 行，提取范围可能已失效"; return 1; }
+    done
+}
+
 test_management_ssh_uses_keepalive() {
     local master_body authorize_body
     master_body=$(sed -n '/^start_cn_entry_session() {/,/^}/p' "${SETUP_SOURCE}")
@@ -3381,6 +3528,10 @@ main() {
     run_test 'write_helper 失败后不留临时文件' test_write_helper_cleans_temp_on_failure
     run_test '国内入口 SSH 端口归一化去掉前导零' test_ssh_port_is_normalized
     run_test '换入口时的连接更新拒绝已被占用的入口' test_reconfigure_refuses_claimed_entry
+    run_test '只读状态检查入口的结论与退出码' test_readonly_check_entry
+    run_test '只读检查不触发上传接管写路径' test_readonly_check_never_triggers_takeover
+    run_test '两端 health_line 的机器可读契约' test_health_line_machine_mode_contract
+    run_test '健康检查总体判定与逐项等级一一对应' test_health_verdict_matches_reported_levels
     run_test '管理 SSH 连接启用保活' test_management_ssh_uses_keepalive
     run_test '远程组件调用超时有界并释放操作锁' test_remote_component_timeout_is_bounded_and_releases_operation_lock
     run_test '国内入口写锁等待有界且超时零写入' test_cn_entry_lock_timeout_is_bounded_and_preserves_config

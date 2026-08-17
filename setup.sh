@@ -409,7 +409,8 @@ migrate_legacy_config() {
 maybe_migrate_config() {
     local requested_command=${1:-}
     case "${requested_command}" in
-        self-test|__extract-role) return 0 ;;
+        # 只读子命令不得触发任何写路径：从候选副本运行 check 时也不该接管已安装脚本。
+        self-test|__extract-role|check) return 0 ;;
     esac
     valid_release_version "${SCRIPT_VERSION}" || return 0
     is_root || return 0
@@ -2805,7 +2806,8 @@ handoff_to_official_script() {
 maybe_handoff_to_official_entry() {
     local requested_command=${1:-} installed_version installed_edition
     case "${requested_command}" in
-        self-test|__extract-role) return 0 ;;
+        # 只读子命令不得触发任何写路径：从候选副本运行 check 时也不该接管已安装脚本。
+        self-test|__extract-role|check) return 0 ;;
     esac
     valid_release_version "${SCRIPT_VERSION}" || return 0
     is_root || return 0
@@ -3436,6 +3438,164 @@ main_menu() {
     done
 }
 
+# ——— 只读状态检查入口（供非交互调用方定时巡检） ———
+# 只读：不改连接配置、不动服务、不建恢复点、不写任何持久状态；为了检查国内入口，
+# 会经由既有流程释放内置组件并建立 SSH 控制会话，这些都是用完即删的临时运行文件。
+# 内部用 10/11/12/13 表示结论，再由 run_readonly_check 翻译成对外的 0/1/2/3——
+# 这样「检查结论」和 die 的退出码 1 不会混淆。
+READONLY_CHECK_OK=10
+READONLY_CHECK_WARN=11
+READONLY_CHECK_ERROR=12
+READONLY_CHECK_TOOL_ERROR=13
+
+readonly_check_json_escape() {
+    local value=$1
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\t'/ }
+    value=${value//$'\r'/ }
+    printf '%s' "${value}"
+}
+
+readonly_check_level_key() {
+    case "${1:-}" in
+        正常) printf 'ok' ;;
+        提醒) printf 'warn' ;;
+        异常) printf 'error' ;;
+        *) printf 'unknown' ;;
+    esac
+}
+
+readonly_check_report_tool_error() {
+    local mode=$1 reason=$2
+    if [[ ${mode} == json ]]; then
+        printf '{"overall":"tool_error","checked_at":"%s","version":"%s","error":"%s","checks":[]}\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SCRIPT_VERSION}" \
+            "$(readonly_check_json_escape "${reason}")"
+    else
+        printf '%s\n' 'Po0 状态：检查未完成'
+        printf '原因：%s\n' "${reason}"
+    fi
+}
+
+readonly_check() (
+    local mode=${1:-human} exit_output= entry_output= config_error=
+    local remote= remote_temporary=no line level name detail key
+    local ok_count=0 warn_count=0 error_count=0 json_items= attention=
+
+    cleanup_readonly_check() {
+        if [[ ${remote_temporary} == yes ]] \
+            && valid_cn_entry_scan_temp_path "${remote:-}"; then
+            ssh_cn_entry "rm -f -- '${remote}'" >/dev/null 2>&1 || true
+            remote=
+        fi
+    }
+    po0_install_exit_trap cleanup_readonly_check
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+
+    if ! installation_active; then
+        readonly_check_report_tool_error "${mode}" '本机尚未安装 Po0 解锁方案，没有可检查的运行环境。'
+        return "${READONLY_CHECK_TOOL_ERROR}"
+    fi
+    if ! config_error=$( (load_config) 2>&1 ); then
+        readonly_check_report_tool_error "${mode}" "无法读取连接配置：${config_error##*: }"
+        return "${READONLY_CHECK_TOOL_ERROR}"
+    fi
+    load_config
+    if ! preflight >/dev/null 2>&1; then
+        readonly_check_report_tool_error "${mode}" '无法校验国内入口连接或同步组件。'
+        return "${READONLY_CHECK_TOOL_ERROR}"
+    fi
+
+    exit_output=$(PO0_HEALTH_TSV=yes run_exit_role "${EXIT_CMD_HEALTH}" 2>/dev/null) || true
+    if ! grep -q '^PO0LINE' <<<"${exit_output}"; then
+        readonly_check_report_tool_error "${mode}" '国外出口检查没有返回可解析的结果。'
+        return "${READONLY_CHECK_TOOL_ERROR}"
+    fi
+
+    if ! start_cn_entry_session >/dev/null 2>&1; then
+        readonly_check_report_tool_error "${mode}" '无法通过专用密钥连接国内入口。'
+        return "${READONLY_CHECK_TOOL_ERROR}"
+    fi
+    select_current_cn_entry_role remote remote_temporary >/dev/null 2>&1 || true
+    if [[ -z ${remote} ]]; then
+        readonly_check_report_tool_error "${mode}" '无法选择当前国内入口组件。'
+        return "${READONLY_CHECK_TOOL_ERROR}"
+    fi
+    entry_output=$(ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_HEALTH}" read-only '只读状态检查' \
+        "PO0_HEALTH_TSV=yes '${remote}' '${CN_ENTRY_CMD_HEALTH}'" 2>/dev/null) || true
+    if ! grep -q '^PO0LINE' <<<"${entry_output}"; then
+        readonly_check_report_tool_error "${mode}" '国内入口检查没有返回可解析的结果。'
+        return "${READONLY_CHECK_TOOL_ERROR}"
+    fi
+
+    while IFS=$'\t' read -r _ level name detail; do
+        [[ -n ${level} ]] || continue
+        key=$(readonly_check_level_key "${level}")
+        case "${key}" in
+            ok) ok_count=$((ok_count + 1)) ;;
+            warn) warn_count=$((warn_count + 1)) ;;
+            *) error_count=$((error_count + 1)) ;;
+        esac
+        # 只对 detail 脱敏：name 是检查项标识（含服务单元名），调用方要靠它定位问题。
+        detail=$(printf '%s' "${detail}" | sanitize_diagnostic_stream)
+        json_items+="${json_items:+,}{\"name\":\"$(readonly_check_json_escape "${name}")\",\"status\":\"${key}\",\"detail\":\"$(readonly_check_json_escape "${detail}")\"}"
+        [[ ${key} == ok ]] \
+            || attention+="  [${level}] ${name}：${detail}"$'\n'
+    done < <(grep '^PO0LINE' <<<"${exit_output}"$'\n'"${entry_output}")
+
+    if (( error_count > 0 )); then
+        key=error
+    elif (( warn_count > 0 )); then
+        key=warn
+    else
+        key=ok
+    fi
+
+    if [[ ${mode} == json ]]; then
+        printf '{"overall":"%s","checked_at":"%s","version":"%s","checks":[%s]}\n' \
+            "${key}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SCRIPT_VERSION}" "${json_items}"
+    else
+        case "${key}" in
+            ok) printf '%s\n' 'Po0 状态：正常' ;;
+            warn) printf '%s\n' 'Po0 状态：提醒' ;;
+            *) printf '%s\n' 'Po0 状态：异常' ;;
+        esac
+        printf '版本 %s；检查项 %d 项，正常 %d、提醒 %d、异常 %d。\n' \
+            "${SCRIPT_VERSION}" "$((ok_count + warn_count + error_count))" \
+            "${ok_count}" "${warn_count}" "${error_count}"
+        [[ -z ${attention} ]] || { printf '%s\n' '需要关注：'; printf '%s' "${attention}"; }
+    fi
+
+    case "${key}" in
+        ok) return "${READONLY_CHECK_OK}" ;;
+        warn) return "${READONLY_CHECK_WARN}" ;;
+        *) return "${READONLY_CHECK_ERROR}" ;;
+    esac
+)
+
+run_readonly_check() {
+    local mode=human rc=0
+    case "${1:-}" in
+        '') ;;
+        --json) mode=json ;;
+        *) usage; exit 2 ;;
+    esac
+    run_cn_entry_operation readonly_check "${mode}" || rc=$?
+    case "${rc}" in
+        "${READONLY_CHECK_OK}") return 0 ;;
+        "${READONLY_CHECK_WARN}") return 1 ;;
+        "${READONLY_CHECK_ERROR}") return 2 ;;
+        "${READONLY_CHECK_TOOL_ERROR}") return 3 ;;
+        *)
+            readonly_check_report_tool_error "${mode}" '检查过程未能正常结束。'
+            return 3
+            ;;
+    esac
+}
+
 usage() {
     cat <<EOF
 推荐用法（中文菜单）：
@@ -3446,6 +3606,7 @@ usage() {
   ./${PROGRAM_NAME} reconfigure   一次完成配置、授权和隧道更新
   ./${PROGRAM_NAME} scan-agents   扫描 Agent 服务并按编号配置代理
   ./${PROGRAM_NAME} status        健康检查（非交互时只读）
+  ./${PROGRAM_NAME} check         只读状态检查，供定时巡检调用（加 --json 输出结构化结果）
   ./${PROGRAM_NAME} diagnose      生成本机脱敏诊断报告（只读）
   ./${PROGRAM_NAME} raw-status    显示原始运行状态
   ./${PROGRAM_NAME} rollback      完整回滚
@@ -3471,6 +3632,7 @@ case "${1:-}" in
     reconfigure) run_cn_entry_operation guided_reconfigure ;;
     scan-agents) run_cn_entry_operation scan_agent_services ;;
     status|health) run_cn_entry_operation health_check ;;
+    check) run_readonly_check "${2:-}" ;;
     diagnose) run_cn_entry_operation diagnostic_report ;;
     raw-status) run_cn_entry_operation status_all ;;
     rollback) run_cn_entry_operation rollback_all direct ;;
