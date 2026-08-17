@@ -1396,6 +1396,116 @@ test_replacement_failure_keeps_previous_restore_point() {
     assert_file_eq "${old}" "${SCRIPT_PATH}" '重试撤销没有退回到更新前的版本'
 }
 
+# 更新与撤销的清理陷阱在命令替换里调用时也必须生效。bash 3.2 下 $( ) 调用会先弹出函数
+# 作用域，陷阱读不到函数局部量（bash 5.3 下两种调用方式都读得到），指针还原与孤儿备份
+# 清理会被静默跳过。本用例在 macOS 的 bash 3.2 上有判别力，在 CI 的 bash 5 上是回归保护；
+# 结构上的保证由 test_transaction_cleanups_read_no_caller_locals 承担。
+test_transaction_cleanup_runs_inside_command_substitution() {
+    local old new newer rc pointer_after_update backups_after_update output
+
+    load_harness 1.0.0
+    old=${CASE_DIR}/old.sh
+    new=${CASE_DIR}/new.sh
+    newer=${CASE_DIR}/newer.sh
+    write_fixture_script "${old}" 1.0.0 good cmdsub-old
+    write_fixture_script "${new}" 1.1.0 good cmdsub-new
+    write_fixture_script "${newer}" 1.2.0 good cmdsub-newer
+    cp -p "${old}" "${SCRIPT_PATH}"
+    chmod 0700 "${SCRIPT_PATH}"
+    TEST_ASSET_FILE=${new}
+    TEST_RELEASE_JSON=$(make_release_json 1.1.0 "$(sha256_file "${new}")")
+    set +e
+    perform_script_update >/dev/null 2>&1
+    rc=$?
+    set -e
+    assert_eq 20 "${rc}" '命令替换夹具未能先完成一次成功更新' || return 1
+    SCRIPT_VERSION=1.1.0
+    pointer_after_update=$(<"${UPDATE_LAST_BACKUP}")
+    backups_after_update=$(find "${UPDATE_BACKUP_DIR}" -type f | wc -l | tr -d ' ')
+
+    eval "$(declare -f mv | sed '1s/^mv /harness_mv /')"
+    mv() {
+        local last=${*: -1}
+        if [[ ${last} == "${SCRIPT_PATH}" ]]; then
+            case "$*" in
+                *po0-unlock.sh.update.*|*po0-unlock.sh.restore.*) return 1 ;;
+            esac
+        fi
+        harness_mv "$@"
+    }
+
+    # 更新路径：整个函数在命令替换里执行。
+    TEST_ASSET_FILE=${newer}
+    TEST_RELEASE_JSON=$(make_release_json 1.2.0 "$(sha256_file "${newer}")")
+    set +e
+    output=$(perform_script_update 2>&1)
+    rc=$?
+    set -e
+    [[ ${rc} -ne 0 && ${rc} -ne 20 ]] || fail '命令替换里的更新替换失败没有停止' || return 1
+    assert_contains "${output}" '原子替换失败' '命令替换里的更新失败提示不明确' || return 1
+    assert_eq "${pointer_after_update}" "$(<"${UPDATE_LAST_BACKUP}")" \
+        '命令替换里更新失败后没有还原上一版恢复点' || return 1
+    assert_eq "${backups_after_update}" "$(find "${UPDATE_BACKUP_DIR}" -type f | wc -l | tr -d ' ')" \
+        '命令替换里更新失败后留下了孤儿备份' || return 1
+    assert_no_transaction_residue 'po0-unlock.sh.update' || return 1
+
+    # 撤销路径：同样在命令替换里执行。
+    set +e
+    output=$(perform_script_restore 2>&1)
+    rc=$?
+    set -e
+    [[ ${rc} -ne 0 && ${rc} -ne 20 ]] || fail '命令替换里的撤销替换失败没有停止' || return 1
+    assert_file_eq "${new}" "${SCRIPT_PATH}" '命令替换里撤销失败后改动了当前脚本' || return 1
+    assert_eq "${pointer_after_update}" "$(<"${UPDATE_LAST_BACKUP}")" \
+        '命令替换里撤销失败后没有还原上一版恢复点' || return 1
+    assert_eq "${backups_after_update}" "$(find "${UPDATE_BACKUP_DIR}" -type f | wc -l | tr -d ' ')" \
+        '命令替换里撤销失败后留下了孤儿备份' || return 1
+    assert_no_transaction_residue 'po0-unlock.sh.restore' || return 1
+
+    # 还原夹具的 mv 后，恢复点必须仍然可用。
+    eval "$(declare -f harness_mv | sed '1s/^harness_mv /mv /')"
+    set +e
+    perform_script_restore >/dev/null 2>&1
+    rc=$?
+    set -e
+    assert_eq 20 "${rc}" '命令替换里的两次失败后恢复上一版不再可用' || return 1
+    assert_file_eq "${old}" "${SCRIPT_PATH}" '重试撤销没有退回到更新前的版本' || return 1
+}
+
+# 结构守卫：两个事务函数的清理陷阱不得读取所在函数的局部量。运行时用例只在 bash 3.2 上
+# 有判别力，这条在任何版本上都能挡住"把事务状态改回 local"的回归。
+test_transaction_cleanups_read_no_caller_locals() {
+    local function_name body locals cleanup_body name violations=0
+    for function_name in perform_script_update perform_script_restore; do
+        body=$(awk -v fn="${function_name}" '
+            $0 == fn "() (" {capture=1}
+            capture {print}
+            capture && /^\)$/ {exit}
+        ' "${PROJECT_DIR}/setup.sh")
+        [[ -n ${body} ]] || { fail "找不到 ${function_name} 的函数体"; return 1; }
+        cleanup_body=$(awk '
+            /^    cleanup_[a-z_]+_transaction\(\) \{$/ {capture=1}
+            capture {print}
+            capture && /^    \}$/ {exit}
+        ' <<<"${body}")
+        [[ -n ${cleanup_body} ]] || { fail "找不到 ${function_name} 的清理陷阱"; return 1; }
+        locals=$(grep -E '^    local ' <<<"${body}" \
+            | sed -E 's/^    local //' \
+            | tr ' ' '\n' \
+            | sed -E 's/=.*$//' \
+            | grep -E '^[A-Za-z_][A-Za-z0-9_]*$')
+        [[ -n ${locals} ]] || { fail "${function_name} 没有解析出任何局部量，守卫失效"; return 1; }
+        while IFS= read -r name; do
+            [[ -n ${name} ]] || continue
+            if grep -Eq "(^|[^A-Za-z0-9_])${name}([^A-Za-z0-9_]|\$)" <<<"${cleanup_body}"; then
+                fail "${function_name} 的清理陷阱读了局部量 ${name}；bash 3.2 在命令替换里调用时读不到"
+                violations=$((violations + 1))
+            fi
+        done <<<"${locals}"
+    done
+    (( violations == 0 )) || return 1
+}
+
 test_restore_confirmation_change_is_rejected() {
     local old new changed output rc backup_count_before backup_count_after
     load_harness 1.0.0
@@ -3652,6 +3762,8 @@ main() {
     run_test '撤销失败只回收本次新建的旧位置配置副本' test_restore_failure_removes_only_its_own_legacy_config_copy
     run_test '备份指针写失败不替换更新/恢复目标' test_pointer_failure_never_replaces_target
     run_test '原子替换失败后上一版恢复点仍然可用' test_replacement_failure_keeps_previous_restore_point
+    run_test '命令替换里调用时事务清理陷阱仍然生效' test_transaction_cleanup_runs_inside_command_substitution
+    run_test '事务清理陷阱不读所在函数的局部量' test_transaction_cleanups_read_no_caller_locals
     run_test '恢复确认期间目标变化拒绝' test_restore_confirmation_change_is_rejected
     run_test '0777 目标脚本拒绝' test_world_writable_target_is_rejected
     run_test '主菜单与脚本管理菜单 0 无副作用' test_zero_paths_have_no_side_effects
