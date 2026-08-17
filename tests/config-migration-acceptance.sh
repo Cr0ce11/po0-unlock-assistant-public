@@ -307,9 +307,9 @@ test_script_restore_stages_then_finalizes_legacy_config() {
         capture && /^\)$/ {exit}
     ' "${PROJECT_DIR}/setup.sh")
     prepare_line=$(grep -nF 'prepare_legacy_config_for_version "${backup_version}"' <<<"${body}" | cut -d: -f1)
-    pointer_line=$(grep -nF 'write_last_script_backup "${current_backup}"' <<<"${body}" | cut -d: -f1)
+    pointer_line=$(grep -nF 'write_last_script_backup "${RESTORE_TRANSACTION_BACKUP}"' <<<"${body}" | cut -d: -f1)
     manager_line=$(grep -nF 'restore_legacy_manager_entry "${backup_path}" "${backup_hash}"' <<<"${body}" | cut -d: -f1)
-    move_line=$(grep -nF 'mv -fT -- "${replacement}" "${SCRIPT_PATH}"' <<<"${body}" | cut -d: -f1)
+    move_line=$(grep -nF 'mv -fT -- "${RESTORE_TRANSACTION_REPLACEMENT}" "${SCRIPT_PATH}"' <<<"${body}" | cut -d: -f1)
     first_finalize_line=$(grep -nF 'finalize_legacy_config_for_version "${backup_version}"' <<<"${body}" | head -1 | cut -d: -f1)
     last_finalize_line=$(grep -nF 'finalize_legacy_config_for_version "${backup_version}"' <<<"${body}" | tail -1 | cut -d: -f1)
     [[ -n ${prepare_line} && -n ${pointer_line} && ${prepare_line} -lt ${pointer_line} ]] \
