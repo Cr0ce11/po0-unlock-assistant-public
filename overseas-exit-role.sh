@@ -577,6 +577,12 @@ status() {
 
 health_line() {
     local level=$1 name=$2 detail=$3
+    # 机器可读模式只供只读检查入口使用：输出制表符分隔的结构化行，便于调用方
+    # 直接取字段，而不是去解析给人看的界面文本。默认输出逐字节不变。
+    if [[ ${PO0_HEALTH_TSV:-no} == yes ]]; then
+        printf 'PO0LINE\t%s\t%s\t%s\n' "${level}" "${name}" "${detail}"
+        return 0
+    fi
     printf '    [%s] %s：%s\n' "${level}" "${name}" "${detail}"
 }
 
