@@ -797,3 +797,288 @@ remove_cf_probe_direct_report_compat() {
     managed_cf_probe_compat_owned "${directory}" || return 1
     rm -f -- "${directory}/curl"
 }
+
+# ---- cf-probe 出站模式：env（默认）与 forward（本地转发）----
+# 有些 cf-probe 只让 HTTP 上报读取代理环境变量，实时通道自己直接拨号；境内直连不通时
+# HTTP 上报照常、实时通道长期断开，面板看着在线，是典型的假绿灯。forward 模式为这类
+# 客户端补一条本地转发：只在该服务自己的挂载命名空间里把面板域名指向本机，由本地监听
+# 经国外出口的管理代理转出去，全局 /etc/hosts 不受影响。
+# 默认仍是 env 模式，此时不写本节任何文件，既有部署的行为逐字节不变。
+
+CF_PROBE_FORWARD_MARKER='# Managed by Po0 Unlock: CF Probe local forward v1.'
+CF_PROBE_FORWARD_LISTEN_ADDRESS=127.0.0.1
+CF_PROBE_FORWARD_LISTEN_PORT=443
+CF_PROBE_FORWARD_SOCAT=/usr/bin/socat
+
+cf_probe_valid_outbound_mode() {
+    case "${1:-}" in env|forward) return 0 ;; esac
+    return 1
+}
+
+cf_probe_forward_dir() {
+    local dropin=$1
+    printf '%s/po0-cf-probe-forward\n' "${dropin}"
+}
+
+cf_probe_forward_hosts_file() {
+    local directory
+    directory=$(cf_probe_forward_dir "$1") || return 1
+    printf '%s/hosts\n' "${directory}"
+}
+
+# 转发模式的受管记录：记下本次转发的面板主机与监听端点，供健康检查与拆除时核对。
+cf_probe_forward_record_file() {
+    local directory
+    directory=$(cf_probe_forward_dir "$1") || return 1
+    printf '%s/record\n' "${directory}"
+}
+
+# 面板主机名取自 cf-probe 自己的配置；只接受普通主机名，拒绝 IP、端口与路径。
+cf_probe_forward_host() {
+    local config=$1 line value host
+    [[ $(grep -Ec '^WORKER_URL=' "${config}" 2>/dev/null || true) == 1 ]] || return 1
+    line=$(grep -E '^WORKER_URL=' "${config}") || return 1
+    value=${line#*=}
+    if [[ ${value} == \"*\" && ${#value} -ge 2 ]]; then
+        value=${value:1:${#value}-2}
+    fi
+    [[ ${value} == https://* ]] || return 1
+    host=${value#https://}
+    host=${host%%/*}
+    [[ ${#host} -ge 4 && ${#host} -le 253 && ${host} != *:* ]] || return 1
+    grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' \
+        <<<"${host}" || return 1
+    printf '%s\n' "${host}"
+}
+
+# 转发目标就是本角色已有的管理代理，避免出现第二处硬编码地址。
+cf_probe_forward_proxy_endpoint() {
+    local value=${HTTP_PROXY_URL#http://} host port
+    host=${value%%:*}
+    port=${value##*:}
+    [[ ${host} == 127.0.0.1 && ${port} =~ ^[0-9]{1,5}$ ]] || return 1
+    printf '%s %s\n' "${host}" "${port}"
+}
+
+cf_probe_forward_unit_name() {
+    local unit=$1 digest
+    valid_helper_service_unit "${unit}" || return 1
+    digest=$(printf '%s' "${unit}" | sha256sum | awk '{print substr($1,1,16)}') || return 1
+    [[ ${digest} =~ ^[0-9a-f]{16}$ ]] || return 1
+    printf 'po0-unlock-cf-probe-forward-%s.service\n' "${digest}"
+}
+
+cf_probe_forward_unit_file() {
+    local name root
+    name=$(cf_probe_forward_unit_name "$1") || return 1
+    root=$(cf_probe_go_systemd_root) || return 1
+    printf '%s/%s\n' "${root}" "${name}"
+}
+
+cf_probe_forward_unit_content() {
+    local unit=$1 host=$2 endpoint proxy_host proxy_port
+    endpoint=$(cf_probe_forward_proxy_endpoint) || return 1
+    proxy_host=${endpoint%% *}
+    proxy_port=${endpoint##* }
+    cat <<FORWARD_UNIT
+${CF_PROBE_FORWARD_MARKER}
+[Unit]
+Description=Po0 CF Probe local forward for ${unit}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=${CF_PROBE_FORWARD_SOCAT} TCP-LISTEN:${CF_PROBE_FORWARD_LISTEN_PORT},bind=${CF_PROBE_FORWARD_LISTEN_ADDRESS},fork,reuseaddr PROXY:${proxy_host}:${host}:${CF_PROBE_FORWARD_LISTEN_PORT},proxyport=${proxy_port}
+Restart=always
+RestartSec=5
+FORWARD_UNIT
+}
+
+# 该服务专属的 hosts：照抄系统 hosts 再追加一行劫持，首行写标记以便核对归属。
+cf_probe_forward_hosts_content() {
+    local host=$1
+    printf '%s\n' "${CF_PROBE_FORWARD_MARKER}"
+    sed -n '1,$p' /etc/hosts || return 1
+    printf '%s %s\n' "${CF_PROBE_FORWARD_LISTEN_ADDRESS}" "${host}"
+}
+
+cf_probe_forward_record_content() {
+    local unit=$1 host=$2
+    printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" \
+        "UNIT=${unit}" \
+        "FORWARD_HOST=${host}" \
+        "LISTEN=${CF_PROBE_FORWARD_LISTEN_ADDRESS}:${CF_PROBE_FORWARD_LISTEN_PORT}"
+}
+
+cf_probe_forward_record_value() {
+    local file=$1 key=$2 line
+    [[ $(grep -Ec "^${key}=" "${file}" 2>/dev/null || true) == 1 ]] || return 1
+    line=$(grep -E "^${key}=" "${file}") || return 1
+    printf '%s\n' "${line#*=}"
+}
+
+managed_cf_probe_forward_file() {
+    local file=$1
+    [[ -f ${file} && ! -L ${file} ]] || return 1
+    [[ $(stat -c '%u' "${file}" 2>/dev/null) == 0 \
+        && $(stat -c '%h' "${file}" 2>/dev/null) == 1 ]] || return 1
+    [[ $(sed -n '1p' "${file}" 2>/dev/null) == "${CF_PROBE_FORWARD_MARKER}" ]]
+}
+
+managed_cf_probe_forward_dir() {
+    local directory=$1
+    [[ -d ${directory} && ! -L ${directory} ]] || return 1
+    [[ $(stat -c '%u' "${directory}" 2>/dev/null) == 0 ]] || return 1
+    cf_probe_forward_mode_dir_is_safe "${directory}"
+}
+
+cf_probe_forward_mode_dir_is_safe() {
+    local mode
+    mode=$(stat -c '%a' "$1" 2>/dev/null) || return 1
+    [[ ${mode} =~ ^[0-7]{3,4}$ ]] || return 1
+    (( 8#${mode} & 8#022 )) && return 1
+    return 0
+}
+
+# 监听端点是全机资源：被别人占着就拒绝启用，绝不覆盖。
+cf_probe_forward_listen_available() {
+    local expected=${CF_PROBE_FORWARD_LISTEN_ADDRESS}:${CF_PROBE_FORWARD_LISTEN_PORT} listener
+    listener=$(ss -tlnH 2>/dev/null | awk -v addr="${expected}" '$4 == addr {print $4; exit}') || return 0
+    [[ -z ${listener} ]]
+}
+
+cf_probe_forward_dropin_line() {
+    local dropin=$1 hosts_file
+    hosts_file=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+    printf 'BindReadOnlyPaths=%s:/etc/hosts\n' "${hosts_file}"
+}
+
+# 启用转发模式。标准输出为 yes/no，表示本次是否新建了转发目录，供事务回滚判断。
+prepare_cf_probe_forward_mode() {
+    local unit=$1 dropin=$2 directory hosts_file record_file unit_file unit_name
+    local config host hosts_content record_content unit_content created=no tmp
+    directory=$(cf_probe_forward_dir "${dropin}") || return 1
+    hosts_file=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+    record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+    unit_name=${unit_file##*/}
+    [[ -f ${CF_PROBE_FORWARD_SOCAT} && -x ${CF_PROBE_FORWARD_SOCAT} && ! -L ${CF_PROBE_FORWARD_SOCAT} ]] \
+        || { echo "转发模式需要 ${CF_PROBE_FORWARD_SOCAT}，本机没有找到可用的它。" >&2; return 1; }
+    config=$(cf_probe_go_config_path "${unit}") \
+        || { echo '无法定位 cf-probe 配置文件，拒绝启用转发模式。' >&2; return 1; }
+    host=$(cf_probe_forward_host "${config}") \
+        || { echo '无法从 cf-probe 配置中解析出可用的面板主机名，拒绝启用转发模式。' >&2; return 1; }
+    if [[ -e ${unit_file} || -L ${unit_file} ]]; then
+        managed_cf_probe_forward_file "${unit_file}" \
+            || { echo '转发单元已存在且不是本助手写入的，拒绝覆盖。' >&2; return 1; }
+    elif ! cf_probe_forward_listen_available; then
+        echo "本机 ${CF_PROBE_FORWARD_LISTEN_ADDRESS}:${CF_PROBE_FORWARD_LISTEN_PORT} 已被占用，拒绝启用转发模式。" >&2
+        return 1
+    fi
+    hosts_content=$(cf_probe_forward_hosts_content "${host}") || return 1
+    record_content=$(cf_probe_forward_record_content "${unit}" "${host}") || return 1
+    unit_content=$(cf_probe_forward_unit_content "${unit}" "${host}") || return 1
+    if [[ -e ${directory} || -L ${directory} ]]; then
+        managed_cf_probe_forward_dir "${directory}" \
+            || { echo '转发工作目录已存在且不是本助手创建的，拒绝复用。' >&2; return 1; }
+    else
+        install -d -m 0755 "${directory}" || return 1
+        created=yes
+    fi
+    if ! cf_probe_forward_write_file "${hosts_file}" "${hosts_content}" \
+        || ! cf_probe_forward_write_file "${record_file}" "${record_content}" \
+        || ! cf_probe_write_go_guard_file "${unit_file}" "${unit_content}"; then
+        rm -f -- "${hosts_file}" "${record_file}"
+        [[ ${created} == no ]] || rmdir -- "${directory}" 2>/dev/null || true
+        return 1
+    fi
+    if ! systemctl daemon-reload || ! systemctl enable --now -- "${unit_name}" >/dev/null; then
+        systemctl disable -- "${unit_name}" >/dev/null 2>&1 || true
+        rm -f -- "${unit_file}" "${hosts_file}" "${record_file}"
+        [[ ${created} == no ]] || rmdir -- "${directory}" 2>/dev/null || true
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        echo '转发单元未能启动，已撤销本次转发模式配置。' >&2
+        return 1
+    fi
+    printf '%s\n' "${created}"
+}
+
+cf_probe_forward_write_file() {
+    local file=$1 content=$2 directory tmp
+    directory=${file%/*}
+    [[ -d ${directory} && ! -L ${directory} ]] || return 1
+    tmp=$(mktemp "${directory}/.po0-cf-probe-forward.XXXXXXXX") || return 1
+    if ! printf '%s\n' "${content}" >"${tmp}" \
+        || ! chmod 0644 "${tmp}" \
+        || ! chown root:root "${tmp}" \
+        || ! mv -f -- "${tmp}" "${file}"; then
+        rm -f -- "${tmp}"
+        return 1
+    fi
+}
+
+# 拆除转发模式：只动本助手写的东西，任何一处被人工改过都拒绝，避免误删他人文件。
+remove_cf_probe_forward_mode() {
+    local unit=$1 dropin=$2 directory hosts_file record_file unit_file unit_name
+    directory=$(cf_probe_forward_dir "${dropin}") || return 1
+    hosts_file=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+    record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+    unit_name=${unit_file##*/}
+    [[ -e ${directory} || -L ${directory} || -e ${unit_file} || -L ${unit_file} ]] || return 0
+    if [[ -e ${unit_file} || -L ${unit_file} ]]; then
+        managed_cf_probe_forward_file "${unit_file}" || return 1
+        systemctl disable --now -- "${unit_name}" >/dev/null 2>&1 || true
+        rm -f -- "${unit_file}" || return 1
+        systemctl daemon-reload || return 1
+        systemctl reset-failed -- "${unit_name}" >/dev/null 2>&1 || true
+    fi
+    if [[ -e ${hosts_file} || -L ${hosts_file} ]]; then
+        managed_cf_probe_forward_file "${hosts_file}" || return 1
+        rm -f -- "${hosts_file}" || return 1
+    fi
+    if [[ -e ${record_file} || -L ${record_file} ]]; then
+        managed_cf_probe_forward_file "${record_file}" || return 1
+        rm -f -- "${record_file}" || return 1
+    fi
+    [[ ! -d ${directory} ]] || rmdir -- "${directory}" || return 1
+}
+
+cf_probe_forward_mode_active() {
+    local dropin=$1 record_file
+    record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
+    managed_cf_probe_forward_file "${record_file}"
+}
+
+# 专属 hosts 是启用时照抄的快照；系统 hosts 之后被改过就会脱节，健康检查要如实报出来。
+cf_probe_forward_hosts_in_sync() {
+    local file=$1 host=$2
+    sed '1d' "${file}" 2>/dev/null \
+        | grep -vxF "${CF_PROBE_FORWARD_LISTEN_ADDRESS} ${host}" \
+        | diff -q - /etc/hosts >/dev/null 2>&1
+}
+
+# 转发模式的健康检查。标准输出首段是等级，其余是给用户看的说明。
+cf_probe_forward_health() {
+    local unit=$1 dropin=$2 hosts_file record_file unit_name host
+    hosts_file=$(cf_probe_forward_hosts_file "${dropin}") \
+        || { printf '异常 转发路径无法解析\n'; return 0; }
+    record_file=$(cf_probe_forward_record_file "${dropin}") \
+        || { printf '异常 转发路径无法解析\n'; return 0; }
+    unit_name=$(cf_probe_forward_unit_name "${unit}") \
+        || { printf '异常 转发单元名无法解析\n'; return 0; }
+    managed_cf_probe_forward_file "${record_file}" \
+        || { printf '异常 转发记录缺失或已被修改\n'; return 0; }
+    managed_cf_probe_forward_file "${hosts_file}" \
+        || { printf '异常 转发用 hosts 缺失或已被修改\n'; return 0; }
+    host=$(cf_probe_forward_record_value "${record_file}" FORWARD_HOST) \
+        || { printf '异常 转发记录缺少面板主机\n'; return 0; }
+    grep -Fxq "${CF_PROBE_FORWARD_LISTEN_ADDRESS} ${host}" "${hosts_file}" \
+        || { printf '异常 转发用 hosts 没有指向本机\n'; return 0; }
+    systemctl is-active --quiet -- "${unit_name}" \
+        || { printf '异常 转发单元没有运行，实时通道已中断\n'; return 0; }
+    cf_probe_forward_hosts_in_sync "${hosts_file}" "${host}" \
+        || { printf '提醒 转发模式正常，但系统 hosts 已变化，建议重新纳管以同步\n'; return 0; }
+    printf '正常 配置完整且正在运行（转发模式）\n'
+}
