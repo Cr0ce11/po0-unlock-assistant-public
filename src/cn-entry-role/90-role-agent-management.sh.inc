@@ -173,10 +173,13 @@ prompt_cf_probe_outbound_mode() {
     printf '%s\n' '如果面板上这台一直显示在线、但实时数据从来没上来过，通常要选 2：' >&2
     printf '%s\n' '那说明它的实时通道不读代理设置、自己直接连面板，在国内连不通。' >&2
     printf '%s\n' '选 2 会多出一个转发服务，撤销国外出口时会一并拆掉。' >&2
-    read -r -p '请选择 [1/2]，直接回车用 1：' choice
+    printf '%s\n' '  0) 取消，不做任何修改' >&2
+    read -r -p '请选择 [0/1/2]，直接回车用 1：' choice
     case "${choice}" in
         ''|1) printf '%s\n' env ;;
         2) printf '%s\n' forward ;;
+        # 主动取消不是输入错误：这里不报「选择无效」，由调用方统一说明未做修改。
+        0) return 1 ;;
         *) printf '%s\n' '选择无效。' >&2; return 1 ;;
     esac
 }
