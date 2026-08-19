@@ -20,6 +20,8 @@ SOCKS_PROXY_URL=socks5h://127.0.0.1:19080
 MANAGED_MARKER='# Managed by Po0 Unlock; do not edit manually.'
 KOMARI_IDENTITY_MARKER='# Managed by Po0 Komari identity guard; do not edit manually.'
 KOMARI_IDENTITY_BACKUP_DIR=/root/komari-identity-backups
+# 与角色侧 CN_ENTRY_LOCK_WAIT_SECONDS 同值：helper 是独立脚本，取不到角色的变量。
+CN_ENTRY_LOCK_WAIT_SECONDS=30
 
 valid_helper_service_unit() {
     [[ $1 =~ ^[A-Za-z0-9_][A-Za-z0-9_.@:-]*\.service$ ]]

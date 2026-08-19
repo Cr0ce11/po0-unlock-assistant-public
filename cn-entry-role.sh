@@ -346,6 +346,8 @@ SOCKS_PROXY_URL=socks5h://127.0.0.1:19080
 MANAGED_MARKER='# Managed by Po0 Unlock; do not edit manually.'
 KOMARI_IDENTITY_MARKER='# Managed by Po0 Komari identity guard; do not edit manually.'
 KOMARI_IDENTITY_BACKUP_DIR=/root/komari-identity-backups
+# 与角色侧 CN_ENTRY_LOCK_WAIT_SECONDS 同值：helper 是独立脚本，取不到角色的变量。
+CN_ENTRY_LOCK_WAIT_SECONDS=30
 
 valid_helper_service_unit() {
     [[ $1 =~ ^[A-Za-z0-9_][A-Za-z0-9_.@:-]*\.service$ ]]
@@ -1964,9 +1966,31 @@ managed_dropin_owned() {
     [[ ${first_line} == "${MANAGED_MARKER}" ]]
 }
 
+# helper 是独立脚本，取不到角色侧的 acquire_state_mutation_lock，必须自带一份。
+# 与角色侧同语义：等待上限内拿不到写锁就失败退出，绝不在无锁状态下继续修改。
+acquire_helper_state_mutation_lock() {
+    local state=$1 purpose=${2:-配置操作}
+    if [[ ! ${CN_ENTRY_LOCK_WAIT_SECONDS} =~ ^[1-9][0-9]*$ ]]; then
+        echo '国内入口写锁等待上限无效。' >&2
+        exit 1
+    fi
+    if ! command -v flock >/dev/null; then
+        echo '系统缺少 flock，无法安全修改配置。' >&2
+        exit 1
+    fi
+    if ! exec 9>"${state}/service-proxy.lock"; then
+        echo "无法打开国内入口写锁，已停止${purpose}。" >&2
+        exit 1
+    fi
+    if ! flock -w "${CN_ENTRY_LOCK_WAIT_SECONDS}" 9; then
+        echo "另一个国内入口配置操作持续占用写锁；等待 ${CN_ENTRY_LOCK_WAIT_SECONDS} 秒后已停止${purpose}，不会在无锁状态下继续修改。" >&2
+        exit 1
+    fi
+}
+
 acquire_service_lock() {
     local state=$1
-    acquire_state_mutation_lock "${state}" '服务配置操作'
+    acquire_helper_state_mutation_lock "${state}" '服务配置操作'
 }
 
 confirm_helper_state_open() {

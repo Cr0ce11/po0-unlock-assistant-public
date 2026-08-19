@@ -3084,8 +3084,13 @@ test_cn_entry_lock_timeout_is_bounded_and_preserves_config() (
     role_source=$(sed -n '1,$p' "${PROJECT_DIR}/cn-entry-role.sh")
     [[ $(grep -Fc 'flock -x 9' <<<"${role_source}" || true) -eq 0 ]] \
         || { fail '国内入口仍存在无上限的阻塞写锁'; return 1; }
-    [[ $(grep -Fc 'acquire_state_mutation_lock "${state}"' <<<"${role_source}" || true) -eq 6 ]] \
-        || { fail '六处国内入口写锁没有全部接入统一有界助手'; return 1; }
+    # 角色脚本与国内入口组件是两个作用域，组件取不到角色侧的函数，因此各有一份同语义的
+    # 有界助手（BUG-016）。不变量不是「同一个函数名」，而是六处写锁必须全部接入有界助手。
+    [[ $(( $(grep -Fc 'acquire_state_mutation_lock "${state}"' <<<"${role_source}" || true) \
+        + $(grep -Fc 'acquire_helper_state_mutation_lock "${state}"' <<<"${role_source}" || true) )) -eq 6 ]] \
+        || { fail '六处国内入口写锁没有全部接入有界助手'; return 1; }
+    [[ $(grep -Fc 'flock -w "${CN_ENTRY_LOCK_WAIT_SECONDS}" 9' <<<"${role_source}" || true) -eq 3 ]] \
+        || { fail '有界等待的实现数量异常：应为角色侧、组件侧与测速目标守卫各一处'; return 1; }
 )
 
 test_current_cn_entry_role_reuse_and_reconfigure_progress() (
