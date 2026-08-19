@@ -44,6 +44,11 @@ assert_contains() {
     grep -Fq -- "${needle}" <<<"${haystack}" || fail "${message}（缺少：${needle}）"
 }
 
+assert_not_contains() {
+    local haystack=$1 needle=$2 message=$3
+    ! grep -Fq -- "${needle}" <<<"${haystack}" || fail "${message}（不该出现：${needle}）"
+}
+
 make_helper_library() {
     awk '
         index($0, "cat >\"${tmp}\" <<\047EOF\047") { capture=1; next }
@@ -960,6 +965,18 @@ test_outbound_mode_prompt_choices() (
     out=$(prompt_cf_probe_outbound_mode <<<'9' 2>/dev/null) || rc=$?
     [[ ${rc} -ne 0 ]] || { fail '无效选择没有返回非零'; return 1; }
     [[ -z ${out} ]] || { fail "无效选择仍然输出了模式：${out}"; return 1; }
+    assert_contains "$(prompt_cf_probe_outbound_mode <<<'9' 2>&1 >/dev/null)" '选择无效' \
+        '无效输入没有说明是输入错误' || return 1
+
+    # 主动取消必须是被支持的出路，且不能被当成输入错误
+    assert_contains "$(prompt_cf_probe_outbound_mode <<<'0' 2>&1 >/dev/null)" '0) 取消' \
+        '选项里没有提供取消' || return 1
+    rc=0
+    out=$(prompt_cf_probe_outbound_mode <<<'0' 2>/dev/null) || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '取消没有返回非零，会被当成选定了模式'; return 1; }
+    [[ -z ${out} ]] || { fail "取消仍然输出了模式：${out}"; return 1; }
+    assert_not_contains "$(prompt_cf_probe_outbound_mode <<<'0' 2>&1 >/dev/null)" '选择无效' \
+        '主动取消被误报成输入错误' || return 1
 )
 
 # 切换出站方式必须先撤销再重新纳管；任一步失败都要说清楚服务当前处于什么状态。

@@ -4116,10 +4116,13 @@ prompt_cf_probe_outbound_mode() {
     printf '%s\n' '如果面板上这台一直显示在线、但实时数据从来没上来过，通常要选 2：' >&2
     printf '%s\n' '那说明它的实时通道不读代理设置、自己直接连面板，在国内连不通。' >&2
     printf '%s\n' '选 2 会多出一个转发服务，撤销国外出口时会一并拆掉。' >&2
-    read -r -p '请选择 [1/2]，直接回车用 1：' choice
+    printf '%s\n' '  0) 取消，不做任何修改' >&2
+    read -r -p '请选择 [0/1/2]，直接回车用 1：' choice
     case "${choice}" in
         ''|1) printf '%s\n' env ;;
         2) printf '%s\n' forward ;;
+        # 主动取消不是输入错误：这里不报「选择无效」，由调用方统一说明未做修改。
+        0) return 1 ;;
         *) printf '%s\n' '选择无效。' >&2; return 1 ;;
     esac
 }
@@ -4766,7 +4769,7 @@ __PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
     exit_actual=$(sha256sum "${exit_new}" | awk '{print $1}')
     cn_entry_actual=$(sha256sum "${cn_entry_new}" | awk '{print $1}')
     [[ ${exit_actual} == 'a74c13b8078091657888a6b9a1d041ebb1d72fd4af16a42413aba51cf0a8e5eb' ]] || die '国外出口内置组件哈希校验失败。'
-    [[ ${cn_entry_actual} == 'cd85cde0597dbdc8771bd499a39471af784bf5aa655ddedef985ae45ecd85dab' ]] || die '国内入口内置组件哈希校验失败。'
+    [[ ${cn_entry_actual} == '7af6a04d0527045afd7a01aad5fb0a95381283d13edabecdab3497dcd0070b9b' ]] || die '国内入口内置组件哈希校验失败。'
     /bin/bash -n "${exit_new}" || die '国外出口内置组件语法检查失败。'
     /bin/bash -n "${cn_entry_new}" || die '国内入口内置组件语法检查失败。'
     mv "${exit_new}" "${EXIT_ROLE}"
@@ -4797,7 +4800,7 @@ bundle_self_test() {
     printf 'Po0 单文件版本=%s\n' '2.5.25'
     printf 'Po0 单文件版本类型=%s\n' "${SCRIPT_EDITION_LABEL}"
     printf 'overseas-exit-role SHA-256=%s\n' 'a74c13b8078091657888a6b9a1d041ebb1d72fd4af16a42413aba51cf0a8e5eb'
-    printf 'cn-entry-role SHA-256=%s\n' 'cd85cde0597dbdc8771bd499a39471af784bf5aa655ddedef985ae45ecd85dab'
+    printf 'cn-entry-role SHA-256=%s\n' '7af6a04d0527045afd7a01aad5fb0a95381283d13edabecdab3497dcd0070b9b'
     printf '%s\n'         "scan-agents -> cn-entry:${CN_ENTRY_CMD_SCAN}"         "rollback[1] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_SERVICES}"         "rollback[2] -> overseas-exit:${EXIT_CMD_ROLLBACK}"         "rollback[3] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_FINALIZE}"         "status -> cn-entry:${CN_ENTRY_CMD_STATUS}"         "status -> overseas-exit:${EXIT_CMD_STATUS}"         "health -> cn-entry:${CN_ENTRY_CMD_HEALTH}"         "health -> overseas-exit:${EXIT_CMD_HEALTH}"         "repair -> overseas-exit:${EXIT_CMD_REPAIR}"
     printf '%s\n' 'SELF_TEST=PASS'
 }
