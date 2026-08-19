@@ -1782,6 +1782,7 @@ CF_PROBE_GO_SUPPORTED_REVISIONS=(
     6ec57acffc428ae8b480d71d52d066ac62066d2b
     440930f816a7e2b78c33e6d9e208b270a8217c9b
     9e92a7876a82d1df923362955feb19c9fc09d02e
+    69f5e13216a45e06273717a9f072a6c103302187
 )
 
 cf_probe_go_binary_family() {
@@ -4830,7 +4831,7 @@ __PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
     exit_actual=$(sha256sum "${exit_new}" | awk '{print $1}')
     cn_entry_actual=$(sha256sum "${cn_entry_new}" | awk '{print $1}')
     [[ ${exit_actual} == 'a74c13b8078091657888a6b9a1d041ebb1d72fd4af16a42413aba51cf0a8e5eb' ]] || die '国外出口内置组件哈希校验失败。'
-    [[ ${cn_entry_actual} == '565576e6efae32c81f2a2bbc48ccfd78a7a8368f8bc8b8dd77a638cb7a9b38b1' ]] || die '国内入口内置组件哈希校验失败。'
+    [[ ${cn_entry_actual} == '84da850ae371ca047b8ba1489198833113faf6acc107881ba541ffb56e5132c2' ]] || die '国内入口内置组件哈希校验失败。'
     /bin/bash -n "${exit_new}" || die '国外出口内置组件语法检查失败。'
     /bin/bash -n "${cn_entry_new}" || die '国内入口内置组件语法检查失败。'
     mv "${exit_new}" "${EXIT_ROLE}"
@@ -4861,7 +4862,7 @@ bundle_self_test() {
     printf 'Po0 单文件版本=%s\n' '2.5.27'
     printf 'Po0 单文件版本类型=%s\n' "${SCRIPT_EDITION_LABEL}"
     printf 'overseas-exit-role SHA-256=%s\n' 'a74c13b8078091657888a6b9a1d041ebb1d72fd4af16a42413aba51cf0a8e5eb'
-    printf 'cn-entry-role SHA-256=%s\n' '565576e6efae32c81f2a2bbc48ccfd78a7a8368f8bc8b8dd77a638cb7a9b38b1'
+    printf 'cn-entry-role SHA-256=%s\n' '84da850ae371ca047b8ba1489198833113faf6acc107881ba541ffb56e5132c2'
     printf '%s\n'         "scan-agents -> cn-entry:${CN_ENTRY_CMD_SCAN}"         "rollback[1] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_SERVICES}"         "rollback[2] -> overseas-exit:${EXIT_CMD_ROLLBACK}"         "rollback[3] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_FINALIZE}"         "status -> cn-entry:${CN_ENTRY_CMD_STATUS}"         "status -> overseas-exit:${EXIT_CMD_STATUS}"         "health -> cn-entry:${CN_ENTRY_CMD_HEALTH}"         "health -> overseas-exit:${EXIT_CMD_HEALTH}"         "repair -> overseas-exit:${EXIT_CMD_REPAIR}"
     printf '%s\n' 'SELF_TEST=PASS'
 }
