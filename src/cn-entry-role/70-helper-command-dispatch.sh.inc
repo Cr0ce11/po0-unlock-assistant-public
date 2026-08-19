@@ -290,6 +290,9 @@ case "${1:-}" in
             if cf_probe_forward_mode_active "${dropin}"; then
                 cf_probe_forward_dropin_line "${dropin}" >>"${tmp}" \
                     || { echo 'cf-probe 转发模式的挂载配置写入失败，正在恢复更新前配置。' >&2; exit 1; }
+                # 已落地的转发单元不会随升级自己更新，在这里收敛才能补上开机自启。
+                reconcile_cf_probe_forward_unit "${unit}" "${dropin}" \
+                    || { echo 'cf-probe 转发单元未能收敛到当前版本，正在恢复更新前配置。' >&2; exit 1; }
             fi
         fi
         if is_komari_service "${unit}"; then

@@ -772,6 +772,9 @@ test_source_lifecycle_contracts() {
         '启用与刷新没有同时写入转发模式的挂载行' || return 1
     assert_contains "${helper_case}" 'prepare_cf_probe_forward_mode "${unit}" "${dropin}"' \
         '启用路径没有接入转发模式' || return 1
+    # 刷新是既有部署拿到新版转发单元的唯一入口，断了这条线老部署永远不会开机自启
+    assert_contains "${helper_case}" 'reconcile_cf_probe_forward_unit "${unit}" "${dropin}"' \
+        '刷新路径没有核对转发单元，既有部署补不上开机自启' || return 1
     assert_eq 2 "$(grep -Fc '(( compat_rc == 3 )) || exit 1' <<<"${helper_case}")" \
         '启用与刷新没有同时处理「跳过测速目标但继续配置」的返回码' || return 1
     assert_contains "${source}" 'enable_args+=("${outbound_mode}")' \
@@ -815,10 +818,20 @@ forward_fixture() {
     printf '%s\n' '#!/bin/sh' 'exit 0' >"${case_dir}/socat"
     chmod 0755 "${case_dir}/socat"
     : >"${case_dir}/ss.out"
+    # 单元的运行状态与开机自启状态由这两个文件表达，用例改文件即可，不必重定义 systemctl
+    printf '%s\n' 0 >"${case_dir}/is-active.rc"
+    printf '%s\n' enabled >"${case_dir}/is-enabled.out"
     CF_PROBE_FORWARD_SOCAT=${case_dir}/socat
     cf_probe_go_systemd_root() { printf '%s\n' "${case_dir}/systemd"; }
     cf_probe_go_config_path_unverified() { printf '%s\n' "${case_dir}/etc/config.conf"; }
-    systemctl() { printf '%s\n' "$*" >>"${case_dir}/systemctl.log"; return 0; }
+    systemctl() {
+        printf '%s\n' "$*" >>"${case_dir}/systemctl.log"
+        case "${1:-}" in
+            is-active) return "$(cat "${case_dir}/is-active.rc")" ;;
+            is-enabled) cat "${case_dir}/is-enabled.out" ;;
+        esac
+        return 0
+    }
     ss() { cat "${case_dir}/ss.out" 2>/dev/null; return 0; }
 }
 
@@ -865,6 +878,62 @@ test_forward_mode_lifecycle() (
         && { fail '拆除后仍被判定为转发模式'; return 1; }
     remove_cf_probe_forward_mode "${unit}" "${dropin}" \
         || { fail '重复拆除不应报错'; return 1; }
+)
+
+# 转发单元必须能开机自启：新写出的带 [Install] 且被启用；早期版本落下的缺 [Install]
+# 单元要在刷新时被重写并重新启用，否则重启后转发器不起、实时通道静默断开。
+test_forward_unit_boot_enable_and_reconcile() (
+    local case_dir unit host dropin unit_file unit_name legacy log output
+    unit=cf-probe.service
+    host=panel.example.invalid
+    case_dir=$(mktemp -d "${WORK_ROOT}/forward-boot.XXXXXX") || return 1
+    forward_fixture "${case_dir}" "${host}"
+    dropin=${case_dir}/dropin
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+    unit_name=$(cf_probe_forward_unit_name "${unit}") || return 1
+    log=${case_dir}/systemctl.log
+
+    prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
+        || { fail '启用转发模式失败'; return 1; }
+    assert_contains "$(cat "${unit_file}")" '[Install]' \
+        '新写出的转发单元没有 [Install] 段，systemctl enable 只会空转' || return 1
+    assert_contains "$(cat "${unit_file}")" 'WantedBy=multi-user.target' \
+        '新写出的转发单元没有声明开机自启目标' || return 1
+    assert_contains "$(cat "${log}")" "enable --now -- ${unit_name}" \
+        '启用转发模式时没有启用转发单元' || return 1
+
+    # 造出早期版本落地的单元：首行标记仍是本助手的，但没有 [Install] 段
+    legacy=$(grep -vxF '[Install]' "${unit_file}" | grep -vxF 'WantedBy=multi-user.target')
+    printf '%s\n' "${legacy}" >"${unit_file}"
+    assert_not_contains "$(cat "${unit_file}")" 'WantedBy=' \
+        '夹具没有造出缺开机自启的旧单元' || return 1
+    : >"${log}"
+    reconcile_cf_probe_forward_unit "${unit}" "${dropin}" \
+        || { fail '刷新没有收敛旧版转发单元'; return 1; }
+    assert_contains "$(cat "${unit_file}")" 'WantedBy=multi-user.target' \
+        '刷新没有把旧版转发单元重写成带开机自启的版本' || return 1
+    assert_contains "$(cat "${log}")" 'daemon-reload' \
+        '重写转发单元后没有让 systemd 重新载入' || return 1
+    assert_contains "$(cat "${log}")" "try-restart -- ${unit_name}" \
+        '重写转发单元后没有让在跑的转发器用上新内容' || return 1
+    assert_contains "$(cat "${log}")" "enable --now -- ${unit_name}" \
+        '刷新没有重新启用转发单元' || return 1
+
+    # 内容已经一致：不再重写，但仍要启用一次，用来补回缺失的开机链接
+    : >"${log}"
+    reconcile_cf_probe_forward_unit "${unit}" "${dropin}" \
+        || { fail '内容一致时刷新不应失败'; return 1; }
+    assert_not_contains "$(cat "${log}")" 'daemon-reload' \
+        '内容已经一致却仍然重写了转发单元' || return 1
+    assert_contains "$(cat "${log}")" "enable --now -- ${unit_name}" \
+        '内容一致时没有补回开机启用' || return 1
+
+    # 同名单元不是本助手写的：刷新必须拒绝，且一个字都不许改
+    printf '%s\n' '# hand written' >"${unit_file}"
+    output=$(reconcile_cf_probe_forward_unit "${unit}" "${dropin}" 2>&1) \
+        && { fail '转发单元不是本助手所写时刷新没有拒绝'; return 1; }
+    assert_eq '# hand written' "$(cat "${unit_file}")" \
+        '拒绝时改动了他人的单元文件' || return 1
 )
 
 # 护栏：缺 socat、监听口被占、配置无法解析、单元非本助手所写，四种都必须拒绝且不留残留。
@@ -940,11 +1009,22 @@ test_forward_mode_health_reports() (
     assert_eq 正常 "${status%% *}" '一切正常时健康检查没有报正常' || return 1
     assert_contains "${status}" '转发模式' '正常文案没有说明处于转发模式' || return 1
 
-    systemctl() { [[ ${1:-} == is-active ]] && return 3; return 0; }
+    # 单元现在跑着，但没有开机自启：重启后实时通道会断，属于要提醒的隐患
+    printf '%s\n' static >"${case_dir}/is-enabled.out"
+    status=$(cf_probe_forward_health "${unit}" "${dropin}")
+    assert_eq 提醒 "${status%% *}" '转发单元不会开机自启时没有报提醒' || return 1
+    assert_contains "${status}" '开机自启' '提醒没有点出隐患本身' || return 1
+    assert_contains "${status}" '检查并更新配置' '提醒没有给出可执行的处置' || return 1
+    # 对照：同一份部署只把开机自启补上，就必须回到正常，否则说明是别的东西坏了
+    printf '%s\n' enabled >"${case_dir}/is-enabled.out"
+    status=$(cf_probe_forward_health "${unit}" "${dropin}")
+    assert_eq 正常 "${status%% *}" '补上开机自启后没有回到正常' || return 1
+
+    printf '%s\n' 3 >"${case_dir}/is-active.rc"
     status=$(cf_probe_forward_health "${unit}" "${dropin}")
     assert_eq 异常 "${status%% *}" '转发单元没运行时没有报异常' || return 1
     assert_contains "${status}" '实时通道' '转发单元停止的说明没有点出后果' || return 1
-    systemctl() { printf '%s\n' "$*" >>"${case_dir}/systemctl.log"; return 0; }
+    printf '%s\n' 0 >"${case_dir}/is-active.rc"
 
     printf '%s\n' 'hand edited' >"${hosts}"
     status=$(cf_probe_forward_health "${unit}" "${dropin}")
@@ -1172,6 +1252,7 @@ main() {
     run_case '启用事务在 drop-in 落盘前失败也会补偿 cf-probe' test_enable_rollback_compensates_before_dropin_flag
     run_case '启用、刷新、失败回滚、停用和扫描路径均已接入' test_source_lifecycle_contracts
     run_case '转发模式可启用、可核对、可完整拆除' test_forward_mode_lifecycle
+    run_case '转发单元开机自启，旧单元在刷新时被收敛' test_forward_unit_boot_enable_and_reconcile
     run_case '转发模式的护栏拒绝不安全前提' test_forward_mode_guards_refuse_unsafe
     run_case '转发模式健康检查区分正常、异常与提醒' test_forward_mode_health_reports
     run_case '出站方式选择菜单的取值与拒绝' test_outbound_mode_prompt_choices
