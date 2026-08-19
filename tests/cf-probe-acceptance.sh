@@ -1037,6 +1037,92 @@ test_switch_outbound_mode_paths() (
     assert_contains "${out}" '重新纳管' '启用失败没有给出可执行的处置' || return 1
 )
 
+# helper 是独立脚本，取不到角色侧的函数与变量。这两条守卫存在的原因：
+# acquire_state_mutation_lock 从 v2.5.18 起就只定义在角色侧却被 helper 调用，
+# enable-service / disable-service / refresh-service 因此一直失败，直到有人真的去增删
+# Agent 才会暴露——六个版本没被发现。
+helper_region() {
+    awk '
+        index($0, "cat >\"${tmp}\" <<\047EOF\047") { capture=1; next }
+        capture && $0 == "EOF" { exit }
+        capture { print }
+    ' "${CN_ENTRY_ROLE}"
+}
+
+role_region() {
+    awk '
+        index($0, "cat >\"${tmp}\" <<\047EOF\047") { capture=1; next }
+        capture && $0 == "EOF" { capture=0; next }
+        !capture { print }
+    ' "${CN_ENTRY_ROLE}"
+}
+
+test_helper_library_defines_every_function_it_calls() (
+    local helper role name violations=0
+    helper=$(helper_region); role=$(role_region)
+    [[ -n ${helper} && -n ${role} ]] || { fail '未能切分 helper 与角色区间'; return 1; }
+    while IFS= read -r name; do
+        [[ -n ${name} ]] || continue
+        # 只看命令位置的引用：注释、case 标签、JSON 字段名和说明文字都不算调用
+        if awk -v fn="${name}" '
+            /^[[:space:]]*#/ { next }
+            {
+                line=$0
+                sub(/^[[:space:]]+/, "", line)
+                sub(/^(if|!|then|else|while|until|do)[[:space:]]+/, "", line)
+                sub(/^(&&|\|\|)[[:space:]]+/, "", line)
+                if (line ~ "^" fn "([[:space:]]|$)") { found=1 }
+                if (index(line, "$(" fn " ")) { found=1 }
+            }
+            END { exit(found ? 0 : 1) }
+        ' <<<"${helper}"; then
+            fail "helper 调用了只在角色侧定义的函数 ${name}；helper 是独立脚本，运行时会报 command not found"
+            violations=$((violations + 1))
+        fi
+    done < <(comm -23 \
+        <(grep -oE '^[a-z_][a-z0-9_]*\(\)' <<<"${role}" | tr -d '()' | sort -u) \
+        <(grep -oE '^[a-z_][a-z0-9_]*\(\)' <<<"${helper}" | tr -d '()' | sort -u))
+    (( violations == 0 )) || return 1
+)
+
+test_helper_library_assigns_every_constant_it_reads() (
+    local helper name allow violations=0
+    helper=$(helper_region)
+    [[ -n ${helper} ]] || { fail '未能提取 helper 区间'; return 1; }
+    # 带默认值的引用（${X:-...}）在 set -u 下不会失败，且多半属于写给别的脚本的载荷，故排除；
+    # 由运行环境或 bash 自身提供的变量也不在此列
+    allow='^(PATH|HOME|EUID|IFS|PWD|OLDPWD|LANG|LC_ALL|LC_CTYPE|TMPDIR|SHELL|USER|LOGNAME|TERM|BASHPID|BASH_SUBSHELL|BASH_SOURCE|BASH_REMATCH|RANDOM|SECONDS|OPTARG|OPTIND|FUNCNAME|PIPESTATUS|SHLVL|HOSTNAME|SSH_CONNECTION|DEBIAN_FRONTEND|GLOBIGNORE|COLUMNS|LINES)$'
+    while IFS= read -r name; do
+        [[ -n ${name} ]] || continue
+        [[ ${name} =~ ${allow} ]] && continue
+        fail "helper 读取了自己没有赋值的常量 ${name}；helper 取不到角色侧的变量，set -u 下会直接失败"
+        violations=$((violations + 1))
+    done < <(comm -23 \
+        <(grep -oE '\$\{?[A-Z][A-Z0-9_]{2,}[^A-Za-z0-9_]?' <<<"${helper}" \
+            | grep -vE '[:+-]$' \
+            | sed -E 's/^\$\{?//; s/[^A-Za-z0-9_]$//' | sort -u) \
+        <(grep -oE '^[[:space:]]*(export[[:space:]]+)?[A-Z][A-Z0-9_]{2,}=' <<<"${helper}" \
+            | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/=$//' | sort -u))
+    (( violations == 0 )) || return 1
+)
+
+# 写锁必须能在 helper 自己的作用域里真正跑起来，并保持有界等待。
+test_helper_service_lock_runs_in_helper_scope() (
+    local case_dir state log
+    case_dir=$(mktemp -d "${WORK_ROOT}/helper-lock.XXXXXX") || return 1
+    state=${case_dir}/state
+    log=${case_dir}/flock.log
+    mkdir -p -- "${state}"
+    printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$*" >>"$FLOCK_LOG"' 'exit 0' >"${case_dir}/flock"
+    chmod 0755 "${case_dir}/flock"
+    export FLOCK_LOG=${log}
+    PATH=${case_dir}:${PATH}
+
+    acquire_service_lock "${state}" || { fail '在 helper 作用域里取写锁失败'; return 1; }
+    [[ -f ${state}/service-proxy.lock ]] || { fail '没有创建写锁文件'; return 1; }
+    assert_contains "$(<"${log}")" '-w 30' '写锁没有使用 30 秒有界等待' || return 1
+)
+
 run_case() {
     local name=$1 function=$2 rc had_errexit=no
     printf '  - %s ... ' "${name}"
@@ -1075,6 +1161,9 @@ main() {
     run_case '转发模式健康检查区分正常、异常与提醒' test_forward_mode_health_reports
     run_case '出站方式选择菜单的取值与拒绝' test_outbound_mode_prompt_choices
     run_case '切换出站方式的正常、取消与两种失败路径' test_switch_outbound_mode_paths
+    run_case 'helper 不调用只在角色侧定义的函数' test_helper_library_defines_every_function_it_calls
+    run_case 'helper 不读取自己没赋值的常量' test_helper_library_assigns_every_constant_it_reads
+    run_case '服务写锁在 helper 作用域内可用且有界' test_helper_service_lock_runs_in_helper_scope
     printf '结果：%d 通过，%d 失败\n' "${PASS_COUNT}" "${FAIL_COUNT}"
     (( FAIL_COUNT == 0 ))
 }

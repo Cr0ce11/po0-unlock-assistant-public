@@ -1453,6 +1453,8 @@ SOCKS_PROXY_URL=socks5h://127.0.0.1:19080
 MANAGED_MARKER='# Managed by Po0 Unlock; do not edit manually.'
 KOMARI_IDENTITY_MARKER='# Managed by Po0 Komari identity guard; do not edit manually.'
 KOMARI_IDENTITY_BACKUP_DIR=/root/komari-identity-backups
+# 与角色侧 CN_ENTRY_LOCK_WAIT_SECONDS 同值：helper 是独立脚本，取不到角色的变量。
+CN_ENTRY_LOCK_WAIT_SECONDS=30
 
 valid_helper_service_unit() {
     [[ $1 =~ ^[A-Za-z0-9_][A-Za-z0-9_.@:-]*\.service$ ]]
@@ -3071,9 +3073,31 @@ managed_dropin_owned() {
     [[ ${first_line} == "${MANAGED_MARKER}" ]]
 }
 
+# helper 是独立脚本，取不到角色侧的 acquire_state_mutation_lock，必须自带一份。
+# 与角色侧同语义：等待上限内拿不到写锁就失败退出，绝不在无锁状态下继续修改。
+acquire_helper_state_mutation_lock() {
+    local state=$1 purpose=${2:-配置操作}
+    if [[ ! ${CN_ENTRY_LOCK_WAIT_SECONDS} =~ ^[1-9][0-9]*$ ]]; then
+        echo '国内入口写锁等待上限无效。' >&2
+        exit 1
+    fi
+    if ! command -v flock >/dev/null; then
+        echo '系统缺少 flock，无法安全修改配置。' >&2
+        exit 1
+    fi
+    if ! exec 9>"${state}/service-proxy.lock"; then
+        echo "无法打开国内入口写锁，已停止${purpose}。" >&2
+        exit 1
+    fi
+    if ! flock -w "${CN_ENTRY_LOCK_WAIT_SECONDS}" 9; then
+        echo "另一个国内入口配置操作持续占用写锁；等待 ${CN_ENTRY_LOCK_WAIT_SECONDS} 秒后已停止${purpose}，不会在无锁状态下继续修改。" >&2
+        exit 1
+    fi
+}
+
 acquire_service_lock() {
     local state=$1
-    acquire_state_mutation_lock "${state}" '服务配置操作'
+    acquire_helper_state_mutation_lock "${state}" '服务配置操作'
 }
 
 confirm_helper_state_open() {
@@ -4769,7 +4793,7 @@ __PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
     exit_actual=$(sha256sum "${exit_new}" | awk '{print $1}')
     cn_entry_actual=$(sha256sum "${cn_entry_new}" | awk '{print $1}')
     [[ ${exit_actual} == 'a74c13b8078091657888a6b9a1d041ebb1d72fd4af16a42413aba51cf0a8e5eb' ]] || die '国外出口内置组件哈希校验失败。'
-    [[ ${cn_entry_actual} == '7af6a04d0527045afd7a01aad5fb0a95381283d13edabecdab3497dcd0070b9b' ]] || die '国内入口内置组件哈希校验失败。'
+    [[ ${cn_entry_actual} == 'cee49ec09af115bc11d5ee854e1c54a9f1b28f045c58612cce0b3c164c7d8efd' ]] || die '国内入口内置组件哈希校验失败。'
     /bin/bash -n "${exit_new}" || die '国外出口内置组件语法检查失败。'
     /bin/bash -n "${cn_entry_new}" || die '国内入口内置组件语法检查失败。'
     mv "${exit_new}" "${EXIT_ROLE}"
@@ -4800,7 +4824,7 @@ bundle_self_test() {
     printf 'Po0 单文件版本=%s\n' '2.5.26'
     printf 'Po0 单文件版本类型=%s\n' "${SCRIPT_EDITION_LABEL}"
     printf 'overseas-exit-role SHA-256=%s\n' 'a74c13b8078091657888a6b9a1d041ebb1d72fd4af16a42413aba51cf0a8e5eb'
-    printf 'cn-entry-role SHA-256=%s\n' '7af6a04d0527045afd7a01aad5fb0a95381283d13edabecdab3497dcd0070b9b'
+    printf 'cn-entry-role SHA-256=%s\n' 'cee49ec09af115bc11d5ee854e1c54a9f1b28f045c58612cce0b3c164c7d8efd'
     printf '%s\n'         "scan-agents -> cn-entry:${CN_ENTRY_CMD_SCAN}"         "rollback[1] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_SERVICES}"         "rollback[2] -> overseas-exit:${EXIT_CMD_ROLLBACK}"         "rollback[3] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_FINALIZE}"         "status -> cn-entry:${CN_ENTRY_CMD_STATUS}"         "status -> overseas-exit:${EXIT_CMD_STATUS}"         "health -> cn-entry:${CN_ENTRY_CMD_HEALTH}"         "health -> overseas-exit:${EXIT_CMD_HEALTH}"         "repair -> overseas-exit:${EXIT_CMD_REPAIR}"
     printf '%s\n' 'SELF_TEST=PASS'
 }
