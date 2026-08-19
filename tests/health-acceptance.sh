@@ -539,6 +539,102 @@ test_overseas_rollback_seals_active_safely() (
     assert_not_contains "${out}" '国外出口已回滚' '封存失败仍然报告已回滚' || return 1
 )
 
+# 转发模式的结论必须真正走到健康检查的输出里。BUG-019 就是这条路断了：判定函数
+# 只存在于组件作用域，角色脚本调用时 command not found，于是无论转发器是死是活，
+# 健康检查一律显示「配置完整且正在运行」。这条用例从 health() 入口进去实跑。
+test_forward_mode_verdict_reaches_health_output() (
+    local case_dir fixture_state systemd_root dropin_dir cn_health rc output
+    case_dir=$(mktemp -d "${TMPDIR:-/tmp}/po0-health-forward.XXXXXXXX")
+    trap 'rm -rf -- "${case_dir}"' EXIT
+    fixture_state=${case_dir}/state
+    systemd_root=${case_dir}/systemd
+    dropin_dir=${systemd_root}/cf-probe.service.d
+    mkdir -p -- "${fixture_state}" "${dropin_dir}"
+
+    TUNNEL_USER=po0tunnel
+    APT_CONF=${case_dir}/apt.conf
+    PROFILE_CONF=${case_dir}/profile.sh
+    HELPER=${case_dir}/helper.sh
+    HTTP_PROXY_URL=http://127.0.0.1:13128
+    SOCKS_PROXY_URL=socks5h://127.0.0.1:19080
+    # 这条用例要断言输出文字，绝不能把 grep 桩掉——assert_contains 自己也用 grep，
+    # 一旦桩掉，所有文字断言都会空过。因此夹具写入真实内容，让真 grep 去核对。
+    printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' \
+        "${HTTP_PROXY_URL}" "${HTTP_PROXY_URL}" >"${APT_CONF}"
+    printf '%s\n' '# 国内入口管理出站：国外出口反向 SSH 代理' \
+        "export ALL_PROXY='${SOCKS_PROXY_URL}'" >"${PROFILE_CONF}"
+    printf '%s\n' 'cf-probe.service' >"${fixture_state}/managed-services"
+    printf '%s\n' '# Managed by Po0 Unlock; do not edit manually.' '[Service]' \
+        >"${dropin_dir}/90-po0-unlock-proxy.conf"
+
+    # 组件桩：角色脚本只能经它取转发模式结论，返回值与输出由两个文件控制
+    printf '%s\n' '#!/bin/sh' \
+        '[ "$1" = cf-probe-forward-health ] || exit 2' \
+        'cat "${0%/*}/forward-out" 2>/dev/null' \
+        'exit "$(cat "${0%/*}/forward-rc")"' >"${HELPER}"
+    chmod 0755 "${HELPER}"
+
+    cn_health=$(sed -n '/^health() (/,/^)$/p' "${CN_SOURCE}")
+    [[ -n ${cn_health} ]] || { fail '未能提取国内入口健康检查函数'; return 1; }
+    eval "${cn_health//\/etc\/systemd\/system/${systemd_root}}"
+    require_root() { :; }
+    health_group() { :; }
+    health_line() { printf '%s %s：%s\n' "$1" "$2" "$3"; }
+    health_safe_state() { printf '%s\n' "${fixture_state}"; }
+    health_regular_root_file() { return 0; }
+    valid_service_unit() { return 0; }
+    tunnel_authorized_keys_hardened() { return 0; }
+    id() { printf '%s\n' 4242; }
+    pgrep() { return 0; }
+    ss() { printf '%s\n' 'LISTEN 0 128 127.0.0.1:13128' 'LISTEN 0 128 127.0.0.1:19080'; }
+    curl() { return 0; }
+    systemctl() {
+        case "$*" in
+            *'show -p LoadState'*) printf '%s\n' loaded ;;
+            *) return 0 ;;
+        esac
+    }
+
+    # 转发单元停了：必须原样报到健康检查里，并让整体判定变成异常
+    printf '%s\n' '异常 转发单元没有运行，实时通道已中断' >"${case_dir}/forward-out"
+    printf '%s\n' 0 >"${case_dir}/forward-rc"
+    rc=0
+    output=$(health) || rc=$?
+    assert_contains "${output}" '转发单元没有运行' \
+        '转发模式的异常结论没有出现在健康检查输出里' || return 1
+    assert_eq 1 "${rc}" '转发模式异常时整体判定没有变成异常' || return 1
+
+    # 不会开机自启：提醒级，整体判定为提醒
+    printf '%s\n' '提醒 转发模式正常，但转发单元不会开机自启' >"${case_dir}/forward-out"
+    rc=0
+    output=$(health) || rc=$?
+    assert_contains "${output}" '不会开机自启' '开机自启提醒没有出现在健康检查输出里' || return 1
+    assert_eq 2 "${rc}" '转发模式提醒时整体判定没有变成提醒' || return 1
+
+    # 对照一：转发模式一切正常，必须回到 0，并且措辞能看出处于转发模式
+    printf '%s\n' '正常 配置完整且正在运行（转发模式）' >"${case_dir}/forward-out"
+    rc=0
+    output=$(health) || rc=$?
+    assert_contains "${output}" '（转发模式）' '转发模式正常时的措辞没有出现' || return 1
+    assert_eq 0 "${rc}" '转发模式一切正常时没有返回 0' || return 1
+
+    # 对照二：该服务没有启用转发模式（退出码 3），沿用通用措辞且仍为正常
+    : >"${case_dir}/forward-out"
+    printf '%s\n' 3 >"${case_dir}/forward-rc"
+    rc=0
+    output=$(health) || rc=$?
+    assert_contains "${output}" '配置完整且正在运行' '非转发模式的通用措辞丢失' || return 1
+    assert_not_contains "${output}" '（转发模式）' '非转发模式却报出了转发模式措辞' || return 1
+    assert_eq 0 "${rc}" '非转发模式的正常服务没有返回 0' || return 1
+
+    # 组件问不出结果时绝不能退回“看起来正常”，否则又是一次假绿灯
+    printf '%s\n' 1 >"${case_dir}/forward-rc"
+    rc=0
+    output=$(health) || rc=$?
+    assert_contains "${output}" '无法确认转发模式状态' '组件失败时没有如实报出无法确认' || return 1
+    assert_eq 1 "${rc}" '组件失败时整体判定没有变成异常' || return 1
+)
+
 test_health_exit_codes_are_runtime_covered() (
     local case_dir fixture_state systemd_root dropin_dir cn_health rc
     case_dir=$(mktemp -d "${TMPDIR:-/tmp}/po0-health-rc.XXXXXXXX")
@@ -1865,6 +1961,7 @@ main() {
     run_case '健康检查核对隧道单元的启动参数' test_health_verifies_tunnel_exec_start
     run_case '国外出口回滚安全封存 ACTIVE 记录' test_overseas_rollback_seals_active_safely
     run_case '两端健康检查的返回码实跑覆盖' test_health_exit_codes_are_runtime_covered
+    run_case '转发模式结论真正走到健康检查输出' test_forward_mode_verdict_reaches_health_output
     run_case '安全修复校验隧道单元的主机密钥参数' test_repair_verifies_tunnel_host_key_options
     run_case '自动修复严格限制在确认后的自有核心服务' test_safe_repair_boundary
     run_case '服务修复失败会恢复原运行与启用状态' test_service_repair_rollback

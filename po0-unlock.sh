@@ -3389,6 +3389,19 @@ case "${1:-}" in
         proxy_env
         exec "$@"
         ;;
+    cf-probe-forward-health)
+        # 只读入口，供角色脚本的健康检查取转发模式结论。转发模式的判定与检查都写在
+        # 组件作用域里，角色脚本取不到那些函数，必须经这里拿结果；不取锁、不改任何状态。
+        # 退出码：0 已启用转发模式且标准输出为「等级 说明」；3 该服务未启用转发模式；
+        # 其余为无法判定，角色侧据此报异常，绝不退回“看起来正常”。
+        unit=${2:-}
+        [[ -n ${unit} ]] || { usage; exit 2; }
+        valid_helper_service_unit "${unit}" \
+            || { echo '服务名必须是合法的 .service 单元名。' >&2; exit 2; }
+        dropin="/etc/systemd/system/${unit}.d"
+        cf_probe_forward_mode_active "${dropin}" || exit 3
+        cf_probe_forward_health "${unit}" "${dropin}"
+        ;;
     reconcile-cf-probe)
         unit=${2:-}
         [[ -n ${unit} ]] || { usage; exit 2; }
@@ -4516,6 +4529,7 @@ health_regular_root_file() {
 
 health() (
     local state= failures=0 warnings=0 unit dropin load_state tunnel_uid=
+    local forward_status= forward_rc=0
     local managed_marker='# Managed by Po0 Unlock; do not edit manually.'
     require_root
     health_group '基础状态'
@@ -4606,8 +4620,18 @@ health() (
                 health_line 异常 "Agent ${unit}" '国外出口配置缺失或已被修改'
                 failures=$((failures + 1))
             elif systemctl is-active --quiet "${unit}"; then
-                if cf_probe_forward_mode_active "/etc/systemd/system/${unit}.d"; then
-                    forward_status=$(cf_probe_forward_health "${unit}" "/etc/systemd/system/${unit}.d")
+                # 转发模式的判定与检查都只在组件作用域里定义，角色脚本取不到那些函数，
+                # 必须经组件的只读入口取结论。退出码 3 表示该服务没有启用转发模式；
+                # 其余非零一律报异常，不能退回“看起来正常”，否则又是一次假绿灯。
+                forward_rc=0
+                forward_status=$("${HELPER}" cf-probe-forward-health "${unit}" 2>/dev/null) \
+                    || forward_rc=$?
+                if (( forward_rc == 3 )); then
+                    health_line 正常 "Agent ${unit}" '配置完整且正在运行'
+                elif (( forward_rc != 0 )); then
+                    health_line 异常 "Agent ${unit}" '无法确认转发模式状态'
+                    failures=$((failures + 1))
+                else
                     case "${forward_status%% *}" in
                         正常)
                             health_line 正常 "Agent ${unit}" "${forward_status#* }"
@@ -4616,13 +4640,15 @@ health() (
                             health_line 提醒 "Agent ${unit}" "${forward_status#* }"
                             warnings=$((warnings + 1))
                             ;;
-                        *)
+                        异常)
                             health_line 异常 "Agent ${unit}" "${forward_status#* }"
                             failures=$((failures + 1))
                             ;;
+                        *)
+                            health_line 异常 "Agent ${unit}" '转发模式状态无法解析'
+                            failures=$((failures + 1))
+                            ;;
                     esac
-                else
-                    health_line 正常 "Agent ${unit}" '配置完整且正在运行'
                 fi
             else
                 health_line 提醒 "Agent ${unit}" '配置完整，但服务当前没有运行'
@@ -4864,7 +4890,7 @@ __PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
     exit_actual=$(sha256sum "${exit_new}" | awk '{print $1}')
     cn_entry_actual=$(sha256sum "${cn_entry_new}" | awk '{print $1}')
     [[ ${exit_actual} == 'a74c13b8078091657888a6b9a1d041ebb1d72fd4af16a42413aba51cf0a8e5eb' ]] || die '国外出口内置组件哈希校验失败。'
-    [[ ${cn_entry_actual} == '20ae390763b69392dfc4b8b8c01ee247c0f4318d9c7117f523a841c497607893' ]] || die '国内入口内置组件哈希校验失败。'
+    [[ ${cn_entry_actual} == 'a6fc704b09b89eec520678c8638a8fb8e02cfc49f4d1a29464708d472854117f' ]] || die '国内入口内置组件哈希校验失败。'
     /bin/bash -n "${exit_new}" || die '国外出口内置组件语法检查失败。'
     /bin/bash -n "${cn_entry_new}" || die '国内入口内置组件语法检查失败。'
     mv "${exit_new}" "${EXIT_ROLE}"
@@ -4895,7 +4921,7 @@ bundle_self_test() {
     printf 'Po0 单文件版本=%s\n' '2.5.29'
     printf 'Po0 单文件版本类型=%s\n' "${SCRIPT_EDITION_LABEL}"
     printf 'overseas-exit-role SHA-256=%s\n' 'a74c13b8078091657888a6b9a1d041ebb1d72fd4af16a42413aba51cf0a8e5eb'
-    printf 'cn-entry-role SHA-256=%s\n' '20ae390763b69392dfc4b8b8c01ee247c0f4318d9c7117f523a841c497607893'
+    printf 'cn-entry-role SHA-256=%s\n' 'a6fc704b09b89eec520678c8638a8fb8e02cfc49f4d1a29464708d472854117f'
     printf '%s\n'         "scan-agents -> cn-entry:${CN_ENTRY_CMD_SCAN}"         "rollback[1] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_SERVICES}"         "rollback[2] -> overseas-exit:${EXIT_CMD_ROLLBACK}"         "rollback[3] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_FINALIZE}"         "status -> cn-entry:${CN_ENTRY_CMD_STATUS}"         "status -> overseas-exit:${EXIT_CMD_STATUS}"         "health -> cn-entry:${CN_ENTRY_CMD_HEALTH}"         "health -> overseas-exit:${EXIT_CMD_HEALTH}"         "repair -> overseas-exit:${EXIT_CMD_REPAIR}"
     printf '%s\n' 'SELF_TEST=PASS'
 }

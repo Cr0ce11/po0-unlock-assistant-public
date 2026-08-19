@@ -789,6 +789,11 @@ test_source_lifecycle_contracts() {
         '停用服务不会拆除转发模式' || return 1
     assert_contains "${source}" 'cf_probe_forward_health "${unit}"' \
         '健康检查没有覆盖转发模式' || return 1
+    # 转发模式的判定只在组件作用域里，角色侧必须经组件的只读入口取结论
+    assert_contains "${helper_case}" 'cf-probe-forward-health)' \
+        '组件没有提供转发模式健康结论的只读入口' || return 1
+    assert_contains "${source}" '"${HELPER}" cf-probe-forward-health "${unit}"' \
+        '角色侧的健康检查没有经组件入口取转发模式结论' || return 1
     assert_contains "${helper_case}" 'reconcile-cf-probe)' \
         'Helper 缺少动态配置守卫内部入口' || return 1
     assert_contains "${helper_case}" 'remove_cf_probe_go_guard_units "${unit}" "${compat_dir}"' \
@@ -934,6 +939,54 @@ test_forward_unit_boot_enable_and_reconcile() (
         && { fail '转发单元不是本助手所写时刷新没有拒绝'; return 1; }
     assert_eq '# hand written' "$(cat "${unit_file}")" \
         '拒绝时改动了他人的单元文件' || return 1
+)
+
+# 角色侧的健康检查完全依赖这条组件入口的退出码：3 表示未启用转发模式（照旧显示正常），
+# 0 表示给出了结论，其余一律被当成「无法确认」而报异常。所以退出码要真跑一遍，不能只看源码。
+test_forward_health_entry_exit_codes() (
+    local case_dir unit host dropin component out rc
+    unit=cf-probe.service
+    host=panel.example.invalid
+    case_dir=$(mktemp -d "${WORK_ROOT}/forward-entry.XXXXXX") || return 1
+    forward_fixture "${case_dir}" "${host}"
+    mkdir -p "${case_dir}/systemd/${unit}.d" || return 1
+    dropin=${case_dir}/systemd/${unit}.d
+    # 组件里 drop-in 路径写死为 /etc/systemd/system，整体换成夹具目录后按真脚本执行
+    component=${case_dir}/po0-cn-entry
+    helper_region | sed "s|/etc/systemd/system|${case_dir}/systemd|g" >"${component}"
+    /bin/bash -n "${component}" || { fail '改写后的组件语法错误'; return 1; }
+
+    # 未启用转发模式：必须以 3 退出且不输出任何结论
+    rc=0
+    # shellcheck disable=SC1090
+    out=$( ( source "${component}" cf-probe-forward-health "${unit}" ) 2>/dev/null ) || rc=$?
+    assert_eq 3 "${rc}" '未启用转发模式时组件入口没有返回 3' || return 1
+    [[ -z ${out} ]] || { fail "未启用转发模式却输出了结论：${out}"; return 1; }
+
+    # 启用之后：以 0 退出，并给出「等级 说明」
+    prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
+        || { fail '启用转发模式失败'; return 1; }
+    rc=0
+    # shellcheck disable=SC1090
+    out=$( ( source "${component}" cf-probe-forward-health "${unit}" ) 2>/dev/null ) || rc=$?
+    assert_eq 0 "${rc}" '已启用转发模式时组件入口没有返回 0' || return 1
+    assert_eq 正常 "${out%% *}" '组件入口没有给出正常等级' || return 1
+    assert_contains "${out}" '转发模式' '组件入口的说明没有点出转发模式' || return 1
+
+    # 转发单元停了：等级必须变成异常，且仍以 0 退出（0 表示「问出了结论」）
+    printf '%s\n' 3 >"${case_dir}/is-active.rc"
+    rc=0
+    # shellcheck disable=SC1090
+    out=$( ( source "${component}" cf-probe-forward-health "${unit}" ) 2>/dev/null ) || rc=$?
+    assert_eq 0 "${rc}" '转发单元停止时组件入口没有返回 0' || return 1
+    assert_eq 异常 "${out%% *}" '转发单元停止时组件入口没有给出异常等级' || return 1
+    printf '%s\n' 0 >"${case_dir}/is-active.rc"
+
+    # 服务名非法：返回 2，不能被角色侧误当成「未启用转发模式」
+    rc=0
+    # shellcheck disable=SC1090
+    out=$( ( source "${component}" cf-probe-forward-health 'not a unit' ) 2>/dev/null ) || rc=$?
+    assert_eq 2 "${rc}" '非法服务名没有返回 2' || return 1
 )
 
 # 护栏：缺 socat、监听口被占、配置无法解析、单元非本助手所写，四种都必须拒绝且不留残留。
@@ -1180,6 +1233,36 @@ test_helper_library_defines_every_function_it_calls() (
     (( violations == 0 )) || return 1
 )
 
+# 方向相反的同一类守卫：角色脚本同样取不到只写在组件 heredoc 里的函数。
+# BUG-019 就是这样溜进去的——健康检查从角色侧调用组件独有的转发模式判定，
+# 运行时 command not found，条件为假，于是永远走「一切正常」那条分支。
+test_role_does_not_call_helper_only_functions() (
+    local helper role name violations=0
+    helper=$(helper_region); role=$(role_region)
+    [[ -n ${helper} && -n ${role} ]] || { fail '未能切分 helper 与角色区间'; return 1; }
+    while IFS= read -r name; do
+        [[ -n ${name} ]] || continue
+        if awk -v fn="${name}" '
+            /^[[:space:]]*#/ { next }
+            {
+                line=$0
+                sub(/^[[:space:]]+/, "", line)
+                sub(/^(if|!|then|else|while|until|do)[[:space:]]+/, "", line)
+                sub(/^(&&|\|\|)[[:space:]]+/, "", line)
+                if (line ~ "^" fn "([[:space:]]|$)") { found=1 }
+                if (index(line, "$(" fn " ")) { found=1 }
+            }
+            END { exit(found ? 0 : 1) }
+        ' <<<"${role}"; then
+            fail "角色脚本调用了只在组件里定义的函数 ${name}；组件写在 heredoc 里，角色运行时会报 command not found 并静默走错分支"
+            violations=$((violations + 1))
+        fi
+    done < <(comm -23 \
+        <(grep -oE '^[a-z_][a-z0-9_]*\(\)' <<<"${helper}" | tr -d '()' | sort -u) \
+        <(grep -oE '^[a-z_][a-z0-9_]*\(\)' <<<"${role}" | tr -d '()' | sort -u))
+    (( violations == 0 )) || return 1
+)
+
 test_helper_library_assigns_every_constant_it_reads() (
     local helper name allow violations=0
     helper=$(helper_region)
@@ -1253,11 +1336,13 @@ main() {
     run_case '启用、刷新、失败回滚、停用和扫描路径均已接入' test_source_lifecycle_contracts
     run_case '转发模式可启用、可核对、可完整拆除' test_forward_mode_lifecycle
     run_case '转发单元开机自启，旧单元在刷新时被收敛' test_forward_unit_boot_enable_and_reconcile
+    run_case '组件转发健康入口的退出码实跑覆盖' test_forward_health_entry_exit_codes
     run_case '转发模式的护栏拒绝不安全前提' test_forward_mode_guards_refuse_unsafe
     run_case '转发模式健康检查区分正常、异常与提醒' test_forward_mode_health_reports
     run_case '出站方式选择菜单的取值与拒绝' test_outbound_mode_prompt_choices
     run_case '切换出站方式的正常、取消与两种失败路径' test_switch_outbound_mode_paths
     run_case 'helper 不调用只在角色侧定义的函数' test_helper_library_defines_every_function_it_calls
+    run_case '角色脚本不调用只在组件里定义的函数' test_role_does_not_call_helper_only_functions
     run_case 'helper 不读取自己没赋值的常量' test_helper_library_assigns_every_constant_it_reads
     run_case '服务写锁在 helper 作用域内可用且有界' test_helper_service_lock_runs_in_helper_scope
     printf '结果：%d 通过，%d 失败\n' "${PASS_COUNT}" "${FAIL_COUNT}"

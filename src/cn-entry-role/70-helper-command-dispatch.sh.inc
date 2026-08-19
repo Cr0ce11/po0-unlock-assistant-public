@@ -45,6 +45,19 @@ case "${1:-}" in
         proxy_env
         exec "$@"
         ;;
+    cf-probe-forward-health)
+        # 只读入口，供角色脚本的健康检查取转发模式结论。转发模式的判定与检查都写在
+        # 组件作用域里，角色脚本取不到那些函数，必须经这里拿结果；不取锁、不改任何状态。
+        # 退出码：0 已启用转发模式且标准输出为「等级 说明」；3 该服务未启用转发模式；
+        # 其余为无法判定，角色侧据此报异常，绝不退回“看起来正常”。
+        unit=${2:-}
+        [[ -n ${unit} ]] || { usage; exit 2; }
+        valid_helper_service_unit "${unit}" \
+            || { echo '服务名必须是合法的 .service 单元名。' >&2; exit 2; }
+        dropin="/etc/systemd/system/${unit}.d"
+        cf_probe_forward_mode_active "${dropin}" || exit 3
+        cf_probe_forward_health "${unit}" "${dropin}"
+        ;;
     reconcile-cf-probe)
         unit=${2:-}
         [[ -n ${unit} ]] || { usage; exit 2; }
