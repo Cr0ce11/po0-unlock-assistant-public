@@ -11,7 +11,7 @@ CN_ENTRY_BUILDER=${TOOLS_DIR}/build-cn-entry-role.sh
 OUTPUT=${SOURCE_DIR}/po0-unlock.sh
 BACKUP_DIR=${SOURCE_DIR}-backups/bundle-history
 BACKUP_RETENTION_LIMIT=10
-SCRIPT_VERSION=${1:-2.5.27}
+SCRIPT_VERSION=${1:-2.5.28}
 
 [[ ${SCRIPT_VERSION} =~ ^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$ ]] \
     || { printf '%s\n' '版本号必须使用 x.y.z 格式。' >&2; exit 2; }
