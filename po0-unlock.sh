@@ -4107,13 +4107,57 @@ manage_komari_report_ipv4() {
     esac
 }
 
+# 让用户在两种出站方式之间选择。标准输出是模式名，说明文字走标准错误；取消时返回非零。
+prompt_cf_probe_outbound_mode() {
+    local choice
+    printf '\n%s\n' 'CF Probe 有两种出站方式：' >&2
+    printf '%s\n' '  1) 只注入代理环境变量（默认，沿用至今的做法）' >&2
+    printf '%s\n' '  2) 在 1 的基础上，额外加一条本地转发' >&2
+    printf '%s\n' '如果面板上这台一直显示在线、但实时数据从来没上来过，通常要选 2：' >&2
+    printf '%s\n' '那说明它的实时通道不读代理设置、自己直接连面板，在国内连不通。' >&2
+    printf '%s\n' '选 2 会多出一个转发服务，撤销国外出口时会一并拆掉。' >&2
+    read -r -p '请选择 [1/2]，直接回车用 1：' choice
+    case "${choice}" in
+        ''|1) printf '%s\n' env ;;
+        2) printf '%s\n' forward ;;
+        *) printf '%s\n' '选择无效。' >&2; return 1 ;;
+    esac
+}
+
+# 切换出站方式：先撤销再按新方式重新纳管，复用两条已有的事务路径。
+switch_cf_probe_outbound_mode() {
+    local unit=$1 state=$2 mode answer
+    mode=$(prompt_cf_probe_outbound_mode) || { printf '%s\n' '未做修改。'; return 0; }
+    printf '\n%s\n' '切换会先撤销当前配置，再按新方式重新纳管，期间该服务会重启两次。'
+    read -r -p '确认切换？[y/N]：' answer
+    case "${answer}" in y|Y|yes|YES|是) ;; *) printf '%s\n' '未做修改。'; return 0 ;; esac
+    refresh_helper_from_state
+    if ! "${HELPER}" disable-service "${unit}"; then
+        printf '%s\n' '撤销原配置失败，未做切换；底层事务已保留或恢复原配置。' >&2
+        return 1
+    fi
+    printf '%s\tDISABLE\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        "${unit}" >>"${state}/service-proxy-actions.log"
+    if ! "${HELPER}" enable-service "${unit}" "${mode}"; then
+        printf '%s\n' '严重警告：原配置已撤销，但新方式启用失败。' >&2
+        printf '%s\n' "${unit} 当前是直接联网状态，请再次扫描并重新纳管。" >&2
+        return 1
+    fi
+    printf '%s\tENABLE\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        "${unit}" >>"${state}/service-proxy-actions.log"
+    printf '完成：%s 已切换为「%s」出站方式。\n' "${unit}" "${mode}"
+}
+
 manage_configured_service() {
     local unit=$1 reason=$2 state=$3 choice answer action
     printf '\n%s\n' '该服务已由 Po0 配置，请选择：'
     printf '%s\n' '1) 检查并更新配置'
     printf '%s\n' '2) 撤销国外出口配置'
+    if [[ ${reason} == *'CF Probe'* ]]; then
+        printf '%s\n' '3) 切换出站方式'
+    fi
     printf '%s\n' '0) 返回'
-    read -r -p '请选择 [0-2]：' choice
+    read -r -p '请选择：' choice
     case "${choice}" in
         0|'') printf '%s\n' '未做修改。'; return 0 ;;
         1)
@@ -4155,12 +4199,18 @@ manage_configured_service() {
                 "${unit}" >>"${state}/service-proxy-actions.log"
             printf '完成：%s 已恢复直接联网；Agent 服务仍保留。\n' "${unit}"
             ;;
+        3)
+            [[ ${reason} == *'CF Probe'* ]] \
+                || { printf '%s\n' '选择无效，未做修改。' >&2; return 1; }
+            switch_cf_probe_outbound_mode "${unit}" "${state}"
+            ;;
         *) printf '%s\n' '选择无效，未做修改。' >&2; return 1 ;;
     esac
 }
 
 scan_services() {
-    local state unit description fragment exec_data exec_path exec_name reason status selection answer index
+    local state unit description fragment exec_data exec_path exec_name reason status selection answer index outbound_mode='env'
+    local -a enable_args=()
     local report_ip managed metadata_line scan_started metadata_output units_output rc
     local -a units=() descriptions=() fragments=() exec_names=() reasons=() proxy_states=() managed_states=()
     require_root
@@ -4277,10 +4327,19 @@ scan_services() {
     read -r -p '确认只处理这个服务？[y/N]：' answer
     case "${answer}" in y|Y|yes|YES|是) ;; *) printf '%s\n' '未做修改。'; return 0 ;; esac
 
+    outbound_mode='env'
+    if [[ ${reasons[index]} == *'CF Probe'* ]]; then
+        outbound_mode=$(prompt_cf_probe_outbound_mode) \
+            || { printf '%s\n' '未做修改。'; return 0; }
+    fi
+
     verify_agent_proxy_change
     printf '\n[%s] 正在配置……\n' "${unit}"
     refresh_helper_from_state
-    if "${HELPER}" enable-service "${unit}"; then
+    # 默认模式不追加参数：既有服务的调用形态与此前逐字节相同。
+    enable_args=(enable-service "${unit}")
+    [[ ${outbound_mode} == env ]] || enable_args+=("${outbound_mode}")
+    if "${HELPER}" "${enable_args[@]}"; then
         printf '%s\tENABLE\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${unit}" >>"${state}/service-proxy-actions.log"
         printf '\n完成：已为 %s 启用国外出口。\n' "${unit}"
     else
@@ -4707,7 +4766,7 @@ __PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
     exit_actual=$(sha256sum "${exit_new}" | awk '{print $1}')
     cn_entry_actual=$(sha256sum "${cn_entry_new}" | awk '{print $1}')
     [[ ${exit_actual} == 'a74c13b8078091657888a6b9a1d041ebb1d72fd4af16a42413aba51cf0a8e5eb' ]] || die '国外出口内置组件哈希校验失败。'
-    [[ ${cn_entry_actual} == 'e94ce5e80a357eb920285ac8f222df32c5eb0cee803f33b878d7214134f6dd32' ]] || die '国内入口内置组件哈希校验失败。'
+    [[ ${cn_entry_actual} == 'cd85cde0597dbdc8771bd499a39471af784bf5aa655ddedef985ae45ecd85dab' ]] || die '国内入口内置组件哈希校验失败。'
     /bin/bash -n "${exit_new}" || die '国外出口内置组件语法检查失败。'
     /bin/bash -n "${cn_entry_new}" || die '国内入口内置组件语法检查失败。'
     mv "${exit_new}" "${EXIT_ROLE}"
@@ -4738,7 +4797,7 @@ bundle_self_test() {
     printf 'Po0 单文件版本=%s\n' '2.5.25'
     printf 'Po0 单文件版本类型=%s\n' "${SCRIPT_EDITION_LABEL}"
     printf 'overseas-exit-role SHA-256=%s\n' 'a74c13b8078091657888a6b9a1d041ebb1d72fd4af16a42413aba51cf0a8e5eb'
-    printf 'cn-entry-role SHA-256=%s\n' 'e94ce5e80a357eb920285ac8f222df32c5eb0cee803f33b878d7214134f6dd32'
+    printf 'cn-entry-role SHA-256=%s\n' 'cd85cde0597dbdc8771bd499a39471af784bf5aa655ddedef985ae45ecd85dab'
     printf '%s\n'         "scan-agents -> cn-entry:${CN_ENTRY_CMD_SCAN}"         "rollback[1] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_SERVICES}"         "rollback[2] -> overseas-exit:${EXIT_CMD_ROLLBACK}"         "rollback[3] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_FINALIZE}"         "status -> cn-entry:${CN_ENTRY_CMD_STATUS}"         "status -> overseas-exit:${EXIT_CMD_STATUS}"         "health -> cn-entry:${CN_ENTRY_CMD_HEALTH}"         "health -> overseas-exit:${EXIT_CMD_HEALTH}"         "repair -> overseas-exit:${EXIT_CMD_REPAIR}"
     printf '%s\n' 'SELF_TEST=PASS'
 }
