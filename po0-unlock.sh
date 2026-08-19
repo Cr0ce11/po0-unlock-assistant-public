@@ -2648,6 +2648,9 @@ Type=exec
 ExecStart=${CF_PROBE_FORWARD_SOCAT} TCP-LISTEN:${CF_PROBE_FORWARD_LISTEN_PORT},bind=${CF_PROBE_FORWARD_LISTEN_ADDRESS},fork,reuseaddr PROXY:${proxy_host}:${host}:${CF_PROBE_FORWARD_LISTEN_PORT},proxyport=${proxy_port}
 Restart=always
 RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
 FORWARD_UNIT
 }
 
@@ -2775,6 +2778,30 @@ cf_probe_forward_write_file() {
     fi
 }
 
+# 刷新时把转发单元收敛到当前版本的期望内容，并重新启用一次。
+# 已经落地的单元不会随助手升级而更新：早期版本写出的单元没有 [Install] 段，
+# `systemctl enable` 对它只是空转，开机根本不会拉起转发器——实时通道会在重启后
+# 静默断开，而 HTTP 上报照常，面板仍显示在线。只有在这里核对重写，既有部署才
+# 不必重新纳管一遍。内容一致时不重写，但仍然启用一次，用来补回缺失的开机链接。
+reconcile_cf_probe_forward_unit() {
+    local unit=$1 dropin=$2 record_file unit_file unit_name host expected actual
+    record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
+    managed_cf_probe_forward_file "${record_file}" || return 1
+    host=$(cf_probe_forward_record_value "${record_file}" FORWARD_HOST) || return 1
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+    unit_name=${unit_file##*/}
+    expected=$(cf_probe_forward_unit_content "${unit}" "${host}") || return 1
+    managed_cf_probe_forward_file "${unit_file}" || return 1
+    actual=$(sed -n '1,$p' "${unit_file}") || return 1
+    if [[ ${actual} != "${expected}" ]]; then
+        cf_probe_write_go_guard_file "${unit_file}" "${expected}" || return 1
+        systemctl daemon-reload || return 1
+        # 只重启本来就在跑的转发器；没在跑的交给下面的 enable --now 拉起。
+        systemctl try-restart -- "${unit_name}" >/dev/null || return 1
+    fi
+    systemctl enable --now -- "${unit_name}" >/dev/null || return 1
+}
+
 # 拆除转发模式：只动本助手写的东西，任何一处被人工改过都拒绝，避免误删他人文件。
 remove_cf_probe_forward_mode() {
     local unit=$1 dropin=$2 directory hosts_file record_file unit_file unit_name
@@ -2835,6 +2862,9 @@ cf_probe_forward_health() {
         || { printf '异常 转发用 hosts 没有指向本机\n'; return 0; }
     systemctl is-active --quiet -- "${unit_name}" \
         || { printf '异常 转发单元没有运行，实时通道已中断\n'; return 0; }
+    # 现在跑着不代表重启后还在：早期版本写出的单元没有 [Install]，开机不会被拉起。
+    [[ $(systemctl is-enabled -- "${unit_name}" 2>/dev/null) == enabled ]] \
+        || { printf '提醒 转发模式正常，但转发单元不会开机自启，重启后实时通道会断，建议执行「检查并更新配置」\n'; return 0; }
     cf_probe_forward_hosts_in_sync "${hosts_file}" "${host}" \
         || { printf '提醒 转发模式正常，但系统 hosts 已变化，建议重新纳管以同步\n'; return 0; }
     printf '正常 配置完整且正在运行（转发模式）\n'
@@ -3604,6 +3634,9 @@ case "${1:-}" in
             if cf_probe_forward_mode_active "${dropin}"; then
                 cf_probe_forward_dropin_line "${dropin}" >>"${tmp}" \
                     || { echo 'cf-probe 转发模式的挂载配置写入失败，正在恢复更新前配置。' >&2; exit 1; }
+                # 已落地的转发单元不会随升级自己更新，在这里收敛才能补上开机自启。
+                reconcile_cf_probe_forward_unit "${unit}" "${dropin}" \
+                    || { echo 'cf-probe 转发单元未能收敛到当前版本，正在恢复更新前配置。' >&2; exit 1; }
             fi
         fi
         if is_komari_service "${unit}"; then
@@ -4831,7 +4864,7 @@ __PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
     exit_actual=$(sha256sum "${exit_new}" | awk '{print $1}')
     cn_entry_actual=$(sha256sum "${cn_entry_new}" | awk '{print $1}')
     [[ ${exit_actual} == 'a74c13b8078091657888a6b9a1d041ebb1d72fd4af16a42413aba51cf0a8e5eb' ]] || die '国外出口内置组件哈希校验失败。'
-    [[ ${cn_entry_actual} == '84da850ae371ca047b8ba1489198833113faf6acc107881ba541ffb56e5132c2' ]] || die '国内入口内置组件哈希校验失败。'
+    [[ ${cn_entry_actual} == '20ae390763b69392dfc4b8b8c01ee247c0f4318d9c7117f523a841c497607893' ]] || die '国内入口内置组件哈希校验失败。'
     /bin/bash -n "${exit_new}" || die '国外出口内置组件语法检查失败。'
     /bin/bash -n "${cn_entry_new}" || die '国内入口内置组件语法检查失败。'
     mv "${exit_new}" "${EXIT_ROLE}"
@@ -4862,7 +4895,7 @@ bundle_self_test() {
     printf 'Po0 单文件版本=%s\n' '2.5.28'
     printf 'Po0 单文件版本类型=%s\n' "${SCRIPT_EDITION_LABEL}"
     printf 'overseas-exit-role SHA-256=%s\n' 'a74c13b8078091657888a6b9a1d041ebb1d72fd4af16a42413aba51cf0a8e5eb'
-    printf 'cn-entry-role SHA-256=%s\n' '84da850ae371ca047b8ba1489198833113faf6acc107881ba541ffb56e5132c2'
+    printf 'cn-entry-role SHA-256=%s\n' '20ae390763b69392dfc4b8b8c01ee247c0f4318d9c7117f523a841c497607893'
     printf '%s\n'         "scan-agents -> cn-entry:${CN_ENTRY_CMD_SCAN}"         "rollback[1] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_SERVICES}"         "rollback[2] -> overseas-exit:${EXIT_CMD_ROLLBACK}"         "rollback[3] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_FINALIZE}"         "status -> cn-entry:${CN_ENTRY_CMD_STATUS}"         "status -> overseas-exit:${EXIT_CMD_STATUS}"         "health -> cn-entry:${CN_ENTRY_CMD_HEALTH}"         "health -> overseas-exit:${EXIT_CMD_HEALTH}"         "repair -> overseas-exit:${EXIT_CMD_REPAIR}"
     printf '%s\n' 'SELF_TEST=PASS'
 }
