@@ -754,6 +754,12 @@ test_source_lifecycle_contracts() {
         '启用与刷新没有同时写入转发模式的挂载行' || return 1
     assert_contains "${helper_case}" 'prepare_cf_probe_forward_mode "${unit}" "${dropin}"' \
         '启用路径没有接入转发模式' || return 1
+    assert_contains "${source}" 'enable_args+=("${outbound_mode}")' \
+        '扫描菜单没有把选定的出站方式传给底层' || return 1
+    assert_contains "${source}" '[[ ${outbound_mode} == env ]] || enable_args+=' \
+        '默认模式仍然改变了既有服务的调用形态' || return 1
+    assert_contains "${source}" 'switch_cf_probe_outbound_mode "${unit}" "${state}"' \
+        '已托管菜单没有提供切换出站方式' || return 1
     assert_contains "${source}" 'remove_cf_probe_forward_mode "${TX_UNIT}" "${TX_FORWARD_DROPIN}"' \
         '启用失败回滚不会拆除转发模式' || return 1
     assert_contains "${disable_body}" 'remove_cf_probe_forward_mode "${unit}" "${dropin}"' \
@@ -936,6 +942,84 @@ test_forward_mode_health_reports() (
     assert_contains "${status}" '重新纳管' '提醒没有给出可执行的处置' || return 1
 )
 
+# 出站方式的选择菜单：回车与 1 都是默认模式，2 才是转发，其他输入不得当成有效选择。
+test_outbound_mode_prompt_choices() (
+    local body out rc
+    body=$(sed -n '/^prompt_cf_probe_outbound_mode() {/,/^}/p' "${CN_ENTRY_ROLE}")
+    [[ -n ${body} ]] || { fail '未能提取出站方式选择函数'; return 1; }
+    eval "${body}"
+
+    assert_eq env "$(prompt_cf_probe_outbound_mode <<<'' 2>/dev/null)" \
+        '直接回车没有落到默认模式' || return 1
+    assert_eq env "$(prompt_cf_probe_outbound_mode <<<'1' 2>/dev/null)" \
+        '选 1 没有落到默认模式' || return 1
+    assert_eq forward "$(prompt_cf_probe_outbound_mode <<<'2' 2>/dev/null)" \
+        '选 2 没有落到转发模式' || return 1
+
+    rc=0
+    out=$(prompt_cf_probe_outbound_mode <<<'9' 2>/dev/null) || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '无效选择没有返回非零'; return 1; }
+    [[ -z ${out} ]] || { fail "无效选择仍然输出了模式：${out}"; return 1; }
+)
+
+# 切换出站方式必须先撤销再重新纳管；任一步失败都要说清楚服务当前处于什么状态。
+test_switch_outbound_mode_paths() (
+    local body case_dir state log out rc
+    body=$(sed -n '/^prompt_cf_probe_outbound_mode() {/,/^}/p' "${CN_ENTRY_ROLE}")
+    body=${body}$'\n'$(sed -n '/^switch_cf_probe_outbound_mode() {/,/^}/p' "${CN_ENTRY_ROLE}")
+    [[ ${body} == *switch_cf_probe_outbound_mode* ]] || { fail '未能提取切换函数'; return 1; }
+    eval "${body}"
+    refresh_helper_from_state() { :; }
+
+    case_dir=$(mktemp -d "${WORK_ROOT}/switch.XXXXXX") || return 1
+    state=${case_dir}/state
+    log=${case_dir}/helper.log
+    mkdir -p -- "${state}"
+    : >"${state}/service-proxy-actions.log"
+    printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$*" >>"$HELPER_LOG"' 'exit 0' >"${case_dir}/helper"
+    chmod 0755 "${case_dir}/helper"
+    HELPER=${case_dir}/helper
+    export HELPER_LOG=${log}
+
+    # 正常切换：先 disable，再带着新模式 enable
+    : >"${log}"
+    out=$(switch_cf_probe_outbound_mode cf-probe.service "${state}" <<<$'2\ny' 2>&1) \
+        || { fail '正常切换返回了非零'; return 1; }
+    assert_eq 'disable-service cf-probe.service' "$(sed -n '1p' "${log}")" \
+        '切换没有先撤销原配置' || return 1
+    assert_eq 'enable-service cf-probe.service forward' "$(sed -n '2p' "${log}")" \
+        '切换没有按新模式重新纳管' || return 1
+    assert_contains "${out}" 'forward' '完成提示没有说明切换后的方式' || return 1
+    assert_eq 2 "$(grep -c . "${state}/service-proxy-actions.log")" \
+        '切换没有把撤销与启用都写进操作日志' || return 1
+
+    # 用户不确认：一次 helper 都不该被调用
+    : >"${log}"
+    switch_cf_probe_outbound_mode cf-probe.service "${state}" <<<$'2\nn' >/dev/null 2>&1 \
+        || { fail '用户取消时返回了非零'; return 1; }
+    assert_eq 0 "$(grep -c . "${log}" || true)" '用户取消后仍然调用了底层命令' || return 1
+
+    # 撤销失败：不得继续启用新模式
+    : >"${log}"
+    printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$*" >>"$HELPER_LOG"' \
+        'case "$1" in disable-service) exit 1 ;; esac' 'exit 0' >"${case_dir}/helper"
+    rc=0
+    out=$(switch_cf_probe_outbound_mode cf-probe.service "${state}" <<<$'2\ny' 2>&1) || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '撤销失败时切换没有返回非零'; return 1; }
+    assert_eq 1 "$(grep -c . "${log}")" '撤销失败后仍然尝试了启用新模式' || return 1
+    assert_contains "${out}" '未做切换' '撤销失败的提示没有说明未做切换' || return 1
+
+    # 启用失败：必须点明服务当前是直接联网状态，而不是含糊带过
+    : >"${log}"
+    printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$*" >>"$HELPER_LOG"' \
+        'case "$1" in enable-service) exit 1 ;; esac' 'exit 0' >"${case_dir}/helper"
+    rc=0
+    out=$(switch_cf_probe_outbound_mode cf-probe.service "${state}" <<<$'2\ny' 2>&1) || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '启用失败时切换没有返回非零'; return 1; }
+    assert_contains "${out}" '直接联网' '启用失败没有说明服务当前的真实状态' || return 1
+    assert_contains "${out}" '重新纳管' '启用失败没有给出可执行的处置' || return 1
+)
+
 run_case() {
     local name=$1 function=$2 rc had_errexit=no
     printf '  - %s ... ' "${name}"
@@ -972,6 +1056,8 @@ main() {
     run_case '转发模式可启用、可核对、可完整拆除' test_forward_mode_lifecycle
     run_case '转发模式的护栏拒绝不安全前提' test_forward_mode_guards_refuse_unsafe
     run_case '转发模式健康检查区分正常、异常与提醒' test_forward_mode_health_reports
+    run_case '出站方式选择菜单的取值与拒绝' test_outbound_mode_prompt_choices
+    run_case '切换出站方式的正常、取消与两种失败路径' test_switch_outbound_mode_paths
     printf '结果：%d 通过，%d 失败\n' "${PASS_COUNT}" "${FAIL_COUNT}"
     (( FAIL_COUNT == 0 ))
 }
