@@ -151,7 +151,24 @@ health() (
                 health_line 异常 "Agent ${unit}" '国外出口配置缺失或已被修改'
                 failures=$((failures + 1))
             elif systemctl is-active --quiet "${unit}"; then
-                health_line 正常 "Agent ${unit}" '配置完整且正在运行'
+                if cf_probe_forward_mode_active "/etc/systemd/system/${unit}.d"; then
+                    forward_status=$(cf_probe_forward_health "${unit}" "/etc/systemd/system/${unit}.d")
+                    case "${forward_status%% *}" in
+                        正常)
+                            health_line 正常 "Agent ${unit}" "${forward_status#* }"
+                            ;;
+                        提醒)
+                            health_line 提醒 "Agent ${unit}" "${forward_status#* }"
+                            warnings=$((warnings + 1))
+                            ;;
+                        *)
+                            health_line 异常 "Agent ${unit}" "${forward_status#* }"
+                            failures=$((failures + 1))
+                            ;;
+                    esac
+                else
+                    health_line 正常 "Agent ${unit}" '配置完整且正在运行'
+                fi
             else
                 health_line 提醒 "Agent ${unit}" '配置完整，但服务当前没有运行'
                 warnings=$((warnings + 1))

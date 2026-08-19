@@ -749,6 +749,17 @@ test_source_lifecycle_contracts() {
         '启用、刷新与持久守卫没有共同收敛面板动态配置' || return 1
     assert_eq 2 "$(grep -Fc 'prepare_cf_probe_go_guard_units "${unit}" "${compat_dir}"' <<<"${helper_case}")" \
         '启用与刷新没有安装持久动态配置守卫' || return 1
+    # 转发模式：启用与刷新都必须写挂载行，否则刷新会把它抹掉、实时通道静默失效
+    assert_eq 2 "$(grep -Fc 'cf_probe_forward_dropin_line "${dropin}" >>"${tmp}"' <<<"${helper_case}")" \
+        '启用与刷新没有同时写入转发模式的挂载行' || return 1
+    assert_contains "${helper_case}" 'prepare_cf_probe_forward_mode "${unit}" "${dropin}"' \
+        '启用路径没有接入转发模式' || return 1
+    assert_contains "${source}" 'remove_cf_probe_forward_mode "${TX_UNIT}" "${TX_FORWARD_DROPIN}"' \
+        '启用失败回滚不会拆除转发模式' || return 1
+    assert_contains "${disable_body}" 'remove_cf_probe_forward_mode "${unit}" "${dropin}"' \
+        '停用服务不会拆除转发模式' || return 1
+    assert_contains "${source}" 'cf_probe_forward_health "${unit}"' \
+        '健康检查没有覆盖转发模式' || return 1
     assert_contains "${helper_case}" 'reconcile-cf-probe)' \
         'Helper 缺少动态配置守卫内部入口' || return 1
     assert_contains "${helper_case}" 'remove_cf_probe_go_guard_units "${unit}" "${compat_dir}"' \
@@ -766,6 +777,164 @@ test_source_lifecycle_contracts() {
     ' <<<"${disable_body}" \
         || { fail '停用服务在恢复 Go Agent 原测速目标前就重启了服务'; return 1; }
 }
+
+# ---- 转发模式（forward）----
+# 这类客户端只有 HTTP 读代理环境变量，实时通道自己直接拨号；转发模式给它补一条本地转发。
+forward_fixture() {
+    local case_dir=$1 host=$2
+    mkdir -p "${case_dir}/systemd" "${case_dir}/etc" "${case_dir}/dropin"
+    chmod 0755 "${case_dir}/systemd" "${case_dir}/dropin"
+    printf '%s\n' "WORKER_URL=\"https://${host}\"" 'SERVER_ID="fixture"' \
+        >"${case_dir}/etc/config.conf"
+    printf '%s\n' '#!/bin/sh' 'exit 0' >"${case_dir}/socat"
+    chmod 0755 "${case_dir}/socat"
+    : >"${case_dir}/ss.out"
+    CF_PROBE_FORWARD_SOCAT=${case_dir}/socat
+    cf_probe_go_systemd_root() { printf '%s\n' "${case_dir}/systemd"; }
+    cf_probe_go_config_path() { printf '%s\n' "${case_dir}/etc/config.conf"; }
+    systemctl() { printf '%s\n' "$*" >>"${case_dir}/systemctl.log"; return 0; }
+    ss() { cat "${case_dir}/ss.out" 2>/dev/null; return 0; }
+}
+
+# 启用后要生成受管目录、专属 hosts、受管记录与转发单元，并给出挂载行；拆除后一件不剩。
+test_forward_mode_lifecycle() (
+    local case_dir unit host dropin hosts record unit_file created line
+    unit=cf-probe.service
+    host=panel.example.invalid
+    case_dir=$(mktemp -d "${WORK_ROOT}/forward-life.XXXXXX") || return 1
+    forward_fixture "${case_dir}" "${host}"
+    dropin=${case_dir}/dropin
+    hosts=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+    record=$(cf_probe_forward_record_file "${dropin}") || return 1
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+
+    created=$(prepare_cf_probe_forward_mode "${unit}" "${dropin}") \
+        || { fail '启用转发模式失败'; return 1; }
+    assert_eq yes "${created}" '启用没有报告新建了转发目录' || return 1
+    [[ -f ${hosts} && -f ${record} && -f ${unit_file} ]] \
+        || { fail '转发模式没有生成完整的三件套'; return 1; }
+    grep -Fxq "127.0.0.1 ${host}" "${hosts}" \
+        || { fail '专属 hosts 没有把面板域名指向本机'; return 1; }
+    grep -Fq 'PROXY:127.0.0.1:'"${host}"':443,proxyport=13128' "${unit_file}" \
+        || { fail '转发单元没有经管理代理转发'; return 1; }
+    assert_eq "${host}" "$(cf_probe_forward_record_value "${record}" FORWARD_HOST)" \
+        '受管记录里的面板主机不正确' || return 1
+    cf_probe_forward_mode_active "${dropin}" \
+        || { fail '受管记录存在却判定为未启用转发模式'; return 1; }
+    line=$(cf_probe_forward_dropin_line "${dropin}") || return 1
+    assert_eq "BindReadOnlyPaths=${hosts}:/etc/hosts" "${line}" \
+        '挂载行不正确' || return 1
+    # 专属 hosts 必须是系统 hosts 的超集，否则会破坏服务里的其他解析
+    assert_eq 0 "$(sed '1d' "${hosts}" | grep -vxF "127.0.0.1 ${host}" \
+        | diff -q - /etc/hosts >/dev/null 2>&1; echo $?)" \
+        '专属 hosts 与系统 hosts 的其余内容不一致' || return 1
+
+    remove_cf_probe_forward_mode "${unit}" "${dropin}" \
+        || { fail '拆除转发模式失败'; return 1; }
+    [[ ! -e ${hosts} && ! -e ${record} && ! -e ${unit_file} ]] \
+        || { fail '拆除后仍有转发模式残留'; return 1; }
+    [[ ! -d $(cf_probe_forward_dir "${dropin}") ]] \
+        || { fail '拆除后转发目录仍然存在'; return 1; }
+    cf_probe_forward_mode_active "${dropin}" \
+        && { fail '拆除后仍被判定为转发模式'; return 1; }
+    remove_cf_probe_forward_mode "${unit}" "${dropin}" \
+        || { fail '重复拆除不应报错'; return 1; }
+)
+
+# 护栏：缺 socat、监听口被占、配置无法解析、单元非本助手所写，四种都必须拒绝且不留残留。
+test_forward_mode_guards_refuse_unsafe() (
+    local case_dir unit host dropin unit_file output
+    unit=cf-probe.service
+    host=panel.example.invalid
+    dropin=
+
+    case_dir=$(mktemp -d "${WORK_ROOT}/forward-nosocat.XXXXXX") || return 1
+    forward_fixture "${case_dir}" "${host}"
+    dropin=${case_dir}/dropin
+    rm -f "${case_dir}/socat"
+    output=$(prepare_cf_probe_forward_mode "${unit}" "${dropin}" 2>&1) \
+        && { fail '缺少 socat 时没有拒绝'; return 1; }
+    assert_contains "${output}" 'socat' '缺少 socat 的拒绝理由不明确' || return 1
+    [[ ! -d $(cf_probe_forward_dir "${dropin}") ]] \
+        || { fail '拒绝后仍留下了转发目录'; return 1; }
+
+    case_dir=$(mktemp -d "${WORK_ROOT}/forward-busy.XXXXXX") || return 1
+    forward_fixture "${case_dir}" "${host}"
+    dropin=${case_dir}/dropin
+    printf '%s\n' 'LISTEN 0 128 127.0.0.1:443 0.0.0.0:*' >"${case_dir}/ss.out"
+    output=$(prepare_cf_probe_forward_mode "${unit}" "${dropin}" 2>&1) \
+        && { fail '监听口被占用时没有拒绝'; return 1; }
+    assert_contains "${output}" '已被占用' '端口占用的拒绝理由不明确' || return 1
+    [[ ! -d $(cf_probe_forward_dir "${dropin}") ]] \
+        || { fail '端口占用被拒后仍留下了转发目录'; return 1; }
+
+    case_dir=$(mktemp -d "${WORK_ROOT}/forward-badurl.XXXXXX") || return 1
+    forward_fixture "${case_dir}" "${host}"
+    dropin=${case_dir}/dropin
+    printf '%s\n' 'WORKER_URL="http://panel.example.invalid"' >"${case_dir}/etc/config.conf"
+    output=$(prepare_cf_probe_forward_mode "${unit}" "${dropin}" 2>&1) \
+        && { fail '非 https 的面板地址没有被拒绝'; return 1; }
+    assert_contains "${output}" '面板主机名' '面板地址无法解析的拒绝理由不明确' || return 1
+
+    case_dir=$(mktemp -d "${WORK_ROOT}/forward-foreign.XXXXXX") || return 1
+    forward_fixture "${case_dir}" "${host}"
+    dropin=${case_dir}/dropin
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+    printf '%s\n' '# hand written' >"${unit_file}"
+    chmod 0644 "${unit_file}"
+    output=$(prepare_cf_probe_forward_mode "${unit}" "${dropin}" 2>&1) \
+        && { fail '同名单元不是本助手所写时没有拒绝'; return 1; }
+    assert_contains "${output}" '拒绝覆盖' '拒绝覆盖他人单元的理由不明确' || return 1
+    assert_eq '# hand written' "$(cat "${unit_file}")" '拒绝时改动了他人的单元文件' || return 1
+
+    # 人工改过专属 hosts 后，拆除必须拒绝，不许误删
+    case_dir=$(mktemp -d "${WORK_ROOT}/forward-tamper.XXXXXX") || return 1
+    forward_fixture "${case_dir}" "${host}"
+    dropin=${case_dir}/dropin
+    prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null || return 1
+    printf '%s\n' 'hand edited' >"$(cf_probe_forward_hosts_file "${dropin}")"
+    remove_cf_probe_forward_mode "${unit}" "${dropin}" \
+        && { fail '专属 hosts 被人工改过时拆除没有拒绝'; return 1; }
+    [[ -f $(cf_probe_forward_hosts_file "${dropin}") ]] \
+        || { fail '拒绝拆除时仍删掉了被改过的文件'; return 1; }
+)
+
+# 健康检查要能区分：正常、转发单元没跑（异常）、hosts 被改（异常）、系统 hosts 变化（提醒）。
+test_forward_mode_health_reports() (
+    local case_dir unit host dropin hosts status
+    unit=cf-probe.service
+    host=panel.example.invalid
+    case_dir=$(mktemp -d "${WORK_ROOT}/forward-health.XXXXXX") || return 1
+    forward_fixture "${case_dir}" "${host}"
+    dropin=${case_dir}/dropin
+    hosts=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+    prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null || return 1
+
+    status=$(cf_probe_forward_health "${unit}" "${dropin}")
+    assert_eq 正常 "${status%% *}" '一切正常时健康检查没有报正常' || return 1
+    assert_contains "${status}" '转发模式' '正常文案没有说明处于转发模式' || return 1
+
+    systemctl() { [[ ${1:-} == is-active ]] && return 3; return 0; }
+    status=$(cf_probe_forward_health "${unit}" "${dropin}")
+    assert_eq 异常 "${status%% *}" '转发单元没运行时没有报异常' || return 1
+    assert_contains "${status}" '实时通道' '转发单元停止的说明没有点出后果' || return 1
+    systemctl() { printf '%s\n' "$*" >>"${case_dir}/systemctl.log"; return 0; }
+
+    printf '%s\n' 'hand edited' >"${hosts}"
+    status=$(cf_probe_forward_health "${unit}" "${dropin}")
+    assert_eq 异常 "${status%% *}" '专属 hosts 被改后没有报异常' || return 1
+
+    # 系统 hosts 变化：专属 hosts 仍合法，但正文与系统的已经对不上
+    {
+        printf '%s\n' "${CF_PROBE_FORWARD_MARKER}"
+        printf '%s\n' '127.0.0.1 localhost'
+        printf '%s\n' '10.0.0.9 stale.example.invalid'
+        printf '%s %s\n' 127.0.0.1 "${host}"
+    } >"${hosts}"
+    status=$(cf_probe_forward_health "${unit}" "${dropin}")
+    assert_eq 提醒 "${status%% *}" '系统 hosts 变化后没有报提醒' || return 1
+    assert_contains "${status}" '重新纳管' '提醒没有给出可执行的处置' || return 1
+)
 
 run_case() {
     local name=$1 function=$2 rc had_errexit=no
@@ -800,6 +969,9 @@ main() {
     run_case 'cf-probe 兼容文件归属校验包含权限位' test_cf_probe_compat_ownership_checks_mode
     run_case '启用事务在 drop-in 落盘前失败也会补偿 cf-probe' test_enable_rollback_compensates_before_dropin_flag
     run_case '启用、刷新、失败回滚、停用和扫描路径均已接入' test_source_lifecycle_contracts
+    run_case '转发模式可启用、可核对、可完整拆除' test_forward_mode_lifecycle
+    run_case '转发模式的护栏拒绝不安全前提' test_forward_mode_guards_refuse_unsafe
+    run_case '转发模式健康检查区分正常、异常与提醒' test_forward_mode_health_reports
     printf '结果：%d 通过，%d 失败\n' "${PASS_COUNT}" "${FAIL_COUNT}"
     (( FAIL_COUNT == 0 ))
 }

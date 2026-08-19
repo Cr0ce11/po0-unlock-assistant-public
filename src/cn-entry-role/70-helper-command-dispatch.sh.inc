@@ -5,14 +5,15 @@ usage() {
   po0-cn-entry status
   po0-cn-entry test
   po0-cn-entry run <命令> [参数...]
-  po0-cn-entry enable-service <systemd-unit>
+  po0-cn-entry enable-service <systemd-unit> [env|forward]
   po0-cn-entry disable-service <systemd-unit>
   po0-cn-entry set-report-ip <komari-unit> <IPv4>
   po0-cn-entry clear-report-ip <komari-unit>
 
 说明：
   run             仅让本次命令通过国外出口。
-  enable-service  为指定服务添加代理环境并重启该服务。
+  enable-service  为指定服务添加代理环境并重启该服务；模式默认 env，forward
+                  仅用于 cf-probe，额外加一条本地转发供不读代理环境变量的通道使用。
   disable-service 移除指定服务的代理环境并重启该服务。
   set-report-ip   设置 Komari 在面板展示的 IPv4。
   clear-report-ip 恢复 Komari 自动检测出口 IPv4。
@@ -75,11 +76,19 @@ case "${1:-}" in
     enable-service)
         unit=${2:-}
         [[ -n ${unit} ]] || { usage; exit 2; }
+        # 出站模式：env（默认，仅注入代理环境变量）或 forward（额外加一条本地转发）。
+        outbound_mode=${3:-env}
+        cf_probe_valid_outbound_mode "${outbound_mode}" \
+            || { echo '未知的出站模式，只支持 env 或 forward。' >&2; exit 2; }
         state=$(helper_active_state)
         acquire_service_lock "${state}"
         confirm_helper_state_open "${state}" \
             || { echo '安装状态正在关闭或已经变化，拒绝修改服务。' >&2; exit 1; }
         validate_service_target "${unit}"
+        if [[ ${outbound_mode} == forward ]] && ! is_cf_probe_service "${unit}"; then
+            echo '转发模式目前只支持 cf-probe，其他服务请使用默认的 env 模式。' >&2
+            exit 2
+        fi
         dropin="/etc/systemd/system/${unit}.d"
         dropin_file="${dropin}/90-po0-unlock-proxy.conf"
         [[ ! -e ${dropin_file} ]] \
@@ -117,6 +126,8 @@ case "${1:-}" in
         TX_CF_GUARD_CREATED=no
         TX_KOMARI_IDENTITY_DIR=
         TX_KOMARI_IDENTITY_CREATED=no
+        TX_FORWARD_DROPIN=
+        TX_FORWARD_PREPARED=no
         trap 'enable_transaction_cleanup "$?"' EXIT
         trap 'exit 130' INT
         trap 'exit 143' TERM
@@ -132,6 +143,14 @@ case "${1:-}" in
             compat_dir=$(prepare_cf_probe_latency_compat "${unit}" "${dropin}")
             printf 'Environment="PATH=%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n' \
                 "${compat_dir}" >>"${tmp}"
+            if [[ ${outbound_mode} == forward ]]; then
+                TX_FORWARD_DROPIN=${dropin}
+                prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
+                    || { echo 'cf-probe 转发模式配置失败，正在撤销本次服务代理。' >&2; exit 1; }
+                TX_FORWARD_PREPARED=yes
+                cf_probe_forward_dropin_line "${dropin}" >>"${tmp}" \
+                    || { echo 'cf-probe 转发模式的挂载配置写入失败，正在撤销本次服务代理。' >&2; exit 1; }
+            fi
         fi
         if is_komari_service "${unit}"; then
             komari_identity_dir=$(komari_identity_compat_dir "${dropin}")
@@ -247,6 +266,11 @@ case "${1:-}" in
             compat_dir=$(prepare_cf_probe_latency_compat "${unit}" "${dropin}")
             printf 'Environment="PATH=%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n' \
                 "${compat_dir}" >>"${tmp}"
+            # 重写 drop-in 会丢掉挂载行，转发模式已启用时必须原样补回，否则静默失效。
+            if cf_probe_forward_mode_active "${dropin}"; then
+                cf_probe_forward_dropin_line "${dropin}" >>"${tmp}" \
+                    || { echo 'cf-probe 转发模式的挂载配置写入失败，正在恢复更新前配置。' >&2; exit 1; }
+            fi
         fi
         if is_komari_service "${unit}"; then
             komari_identity_dir=$(komari_identity_compat_dir "${dropin}")
@@ -492,6 +516,11 @@ case "${1:-}" in
         if [[ -e ${komari_identity_dir} || -L ${komari_identity_dir} ]]; then
             remove_komari_identity_guard "${komari_identity_dir}" "${unit}" \
                 || echo '警告：国外出口已移除，但 Komari 身份守卫未能清理。' >&2
+            rmdir "${dropin}" 2>/dev/null || true
+        fi
+        if cf_probe_forward_mode_active "${dropin}"; then
+            remove_cf_probe_forward_mode "${unit}" "${dropin}" \
+                || echo '警告：国外出口已移除，但 cf-probe 转发模式未能清理。' >&2
             rmdir "${dropin}" 2>/dev/null || true
         fi
         if [[ ${original_running} == yes ]]; then

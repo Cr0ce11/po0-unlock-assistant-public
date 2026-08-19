@@ -221,6 +221,12 @@ enable_transaction_cleanup() {
             remove_cf_probe_go_guard_units "${TX_UNIT}" "${TX_COMPAT_DIR}" \
                 || echo '警告：未能清理 cf-probe 动态配置守卫，请人工检查。' >&2
         fi
+        # 转发模式的目录、专属 hosts 与转发单元都是本次事务新建的，未提交时整套撤掉；
+        # 拆除函数只动带本助手标记的文件，人工改过的一律拒绝删除。
+        if [[ ${TX_FORWARD_PREPARED:-no} == yes && -n ${TX_FORWARD_DROPIN:-} ]]; then
+            remove_cf_probe_forward_mode "${TX_UNIT}" "${TX_FORWARD_DROPIN}" \
+                || echo '警告：未能清理 cf-probe 转发模式配置，请人工检查。' >&2
+        fi
         if [[ ${TX_KOMARI_IDENTITY_CREATED:-no} == yes \
             && -n ${TX_KOMARI_IDENTITY_DIR:-} ]]; then
             remove_komari_identity_guard "${TX_KOMARI_IDENTITY_DIR}" "${TX_UNIT}" \
