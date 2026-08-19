@@ -1814,13 +1814,15 @@ cf_probe_go_executable_path() {
     printf '%s\n' "${exe}"
 }
 
-cf_probe_go_config_path() {
+# 只解析并校验配置文件路径本身，不要求二进制修订在白名单内。
+# 仅供只读取值使用（例如读面板地址）；改写测速目标必须走下面带白名单闸门的版本。
+cf_probe_go_config_path_unverified() {
     local unit=$1 pid exe arg next_is_config=no config=/etc/config/cf-probe/config.conf resolved
     local -a args=()
     pid=$(systemctl show -p MainPID --value -- "${unit}" 2>/dev/null || true)
     [[ ${pid} =~ ^[1-9][0-9]*$ && -r /proc/${pid}/cmdline ]] || return 1
     exe=$(cf_probe_go_executable_path "${unit}" "${pid}") || return 1
-    cf_probe_go_binary_contract "${exe}" || return 1
+    cf_probe_go_binary_family "${exe}" || return 1
     mapfile -d '' -t args <"/proc/${pid}/cmdline" || return 1
     for arg in "${args[@]}"; do
         if [[ ${next_is_config} == yes ]]; then
@@ -1843,6 +1845,16 @@ cf_probe_go_config_path() {
         && $(stat -c '%a' "${config}" 2>/dev/null) == 600 \
         && $(stat -c '%h' "${config}" 2>/dev/null) == 1 ]] || return 1
     printf '%s\n' "${config}"
+}
+
+# 带白名单闸门：任何会改写 cf-probe 自身配置的路径都必须经过这里。
+cf_probe_go_config_path() {
+    local unit=$1 pid exe
+    pid=$(systemctl show -p MainPID --value -- "${unit}" 2>/dev/null || true)
+    [[ ${pid} =~ ^[1-9][0-9]*$ ]] || return 1
+    exe=$(cf_probe_go_executable_path "${unit}" "${pid}") || return 1
+    cf_probe_go_binary_contract "${exe}" || return 1
+    cf_probe_go_config_path_unverified "${unit}"
 }
 
 cf_probe_go_config_value() {
@@ -2455,11 +2467,15 @@ prepare_cf_probe_latency_compat() {
     go_exe=$(cf_probe_go_executable_path "${unit}" 2>/dev/null || true)
     if [[ -n ${go_exe} ]] && cf_probe_go_binary_family "${go_exe}"; then
         if cf_probe_go_binary_contract "${go_exe}"; then
+            # 版本受支持却过不了安全校验，可能意味着配置或启动参数被改动过，仍然拒绝整次配置。
             echo '已识别受支持的官方 Go cf-probe，但运行参数或配置文件未通过安全校验，已停止配置。' >&2
-        else
-            echo '当前官方 Go cf-probe 未在 Po0 已审查的正式版本清单中，已停止配置。' >&2
+            return 1
         fi
-        return 1
+        # 修订不在白名单：不去碰它的配置文件，但国外出口该配还是要配。cf-probe 默认开启
+        # 自动更新，上游一发新版就会走到这里；若因此整次拒绝，探针会退回直连而彻底失联。
+        echo '当前官方 Go cf-probe 不在 Po0 已审查的正式版本清单中：本次只配置国外出口，不改动它的测速目标。' >&2
+        echo '待该版本经过审查并加入清单后，再次执行「检查并更新配置」即可补上测速目标处理。' >&2
+        return 3
     fi
     command -v ping >/dev/null \
         || { echo '系统缺少 ping，无法为 cf-probe 保留延迟检测。' >&2; return 1; }
@@ -2704,7 +2720,8 @@ prepare_cf_probe_forward_mode() {
     unit_name=${unit_file##*/}
     [[ -f ${CF_PROBE_FORWARD_SOCAT} && -x ${CF_PROBE_FORWARD_SOCAT} && ! -L ${CF_PROBE_FORWARD_SOCAT} ]] \
         || { echo "转发模式需要 ${CF_PROBE_FORWARD_SOCAT}，本机没有找到可用的它。" >&2; return 1; }
-    config=$(cf_probe_go_config_path "${unit}") \
+    # 转发模式只从配置里读面板地址，不改写它，因此不要求修订在白名单内。
+    config=$(cf_probe_go_config_path_unverified "${unit}") \
         || { echo '无法定位 cf-probe 配置文件，拒绝启用转发模式。' >&2; return 1; }
     host=$(cf_probe_forward_host "${config}") \
         || { echo '无法从 cf-probe 配置中解析出可用的面板主机名，拒绝启用转发模式。' >&2; return 1; }
@@ -3436,9 +3453,19 @@ case "${1:-}" in
             TX_COMPAT_DIR=${compat_dir}
             TX_COMPAT_CREATED=${compat_created}
             TX_COMPAT_CURL_CREATED=${compat_curl_created}
-            compat_dir=$(prepare_cf_probe_latency_compat "${unit}" "${dropin}")
-            printf 'Environment="PATH=%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n' \
-                "${compat_dir}" >>"${tmp}"
+            # 修订不在白名单时返回 3：跳过测速目标处理，但继续把国外出口配上，
+            # 否则 cf-probe 一自动更新就会退回直连而彻底失联。其余失败仍然整次撤销。
+            if compat_dir=$(prepare_cf_probe_latency_compat "${unit}" "${dropin}"); then
+                printf 'Environment="PATH=%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n' \
+                    "${compat_dir}" >>"${tmp}"
+            else
+                compat_rc=$?
+                (( compat_rc == 3 )) || exit 1
+                compat_dir=
+                TX_COMPAT_DIR=
+                TX_COMPAT_CREATED=no
+                TX_COMPAT_CURL_CREATED=no
+            fi
             if [[ ${outbound_mode} == forward ]]; then
                 TX_FORWARD_DROPIN=${dropin}
                 prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
@@ -3559,9 +3586,19 @@ case "${1:-}" in
             TX_COMPAT_DIR=${compat_dir}
             TX_COMPAT_CREATED=${compat_created}
             TX_COMPAT_CURL_CREATED=${compat_curl_created}
-            compat_dir=$(prepare_cf_probe_latency_compat "${unit}" "${dropin}")
-            printf 'Environment="PATH=%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n' \
-                "${compat_dir}" >>"${tmp}"
+            # 修订不在白名单时返回 3：跳过测速目标处理，但继续把国外出口配上，
+            # 否则 cf-probe 一自动更新就会退回直连而彻底失联。其余失败仍然整次撤销。
+            if compat_dir=$(prepare_cf_probe_latency_compat "${unit}" "${dropin}"); then
+                printf 'Environment="PATH=%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n' \
+                    "${compat_dir}" >>"${tmp}"
+            else
+                compat_rc=$?
+                (( compat_rc == 3 )) || exit 1
+                compat_dir=
+                TX_COMPAT_DIR=
+                TX_COMPAT_CREATED=no
+                TX_COMPAT_CURL_CREATED=no
+            fi
             # 重写 drop-in 会丢掉挂载行，转发模式已启用时必须原样补回，否则静默失效。
             if cf_probe_forward_mode_active "${dropin}"; then
                 cf_probe_forward_dropin_line "${dropin}" >>"${tmp}" \
@@ -4793,7 +4830,7 @@ __PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
     exit_actual=$(sha256sum "${exit_new}" | awk '{print $1}')
     cn_entry_actual=$(sha256sum "${cn_entry_new}" | awk '{print $1}')
     [[ ${exit_actual} == 'a74c13b8078091657888a6b9a1d041ebb1d72fd4af16a42413aba51cf0a8e5eb' ]] || die '国外出口内置组件哈希校验失败。'
-    [[ ${cn_entry_actual} == 'cee49ec09af115bc11d5ee854e1c54a9f1b28f045c58612cce0b3c164c7d8efd' ]] || die '国内入口内置组件哈希校验失败。'
+    [[ ${cn_entry_actual} == '565576e6efae32c81f2a2bbc48ccfd78a7a8368f8bc8b8dd77a638cb7a9b38b1' ]] || die '国内入口内置组件哈希校验失败。'
     /bin/bash -n "${exit_new}" || die '国外出口内置组件语法检查失败。'
     /bin/bash -n "${cn_entry_new}" || die '国内入口内置组件语法检查失败。'
     mv "${exit_new}" "${EXIT_ROLE}"
@@ -4824,7 +4861,7 @@ bundle_self_test() {
     printf 'Po0 单文件版本=%s\n' '2.5.27'
     printf 'Po0 单文件版本类型=%s\n' "${SCRIPT_EDITION_LABEL}"
     printf 'overseas-exit-role SHA-256=%s\n' 'a74c13b8078091657888a6b9a1d041ebb1d72fd4af16a42413aba51cf0a8e5eb'
-    printf 'cn-entry-role SHA-256=%s\n' 'cee49ec09af115bc11d5ee854e1c54a9f1b28f045c58612cce0b3c164c7d8efd'
+    printf 'cn-entry-role SHA-256=%s\n' '565576e6efae32c81f2a2bbc48ccfd78a7a8368f8bc8b8dd77a638cb7a9b38b1'
     printf '%s\n'         "scan-agents -> cn-entry:${CN_ENTRY_CMD_SCAN}"         "rollback[1] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_SERVICES}"         "rollback[2] -> overseas-exit:${EXIT_CMD_ROLLBACK}"         "rollback[3] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_FINALIZE}"         "status -> cn-entry:${CN_ENTRY_CMD_STATUS}"         "status -> overseas-exit:${EXIT_CMD_STATUS}"         "health -> cn-entry:${CN_ENTRY_CMD_HEALTH}"         "health -> overseas-exit:${EXIT_CMD_HEALTH}"         "repair -> overseas-exit:${EXIT_CMD_REPAIR}"
     printf '%s\n' 'SELF_TEST=PASS'
 }

@@ -140,9 +140,19 @@ case "${1:-}" in
             TX_COMPAT_DIR=${compat_dir}
             TX_COMPAT_CREATED=${compat_created}
             TX_COMPAT_CURL_CREATED=${compat_curl_created}
-            compat_dir=$(prepare_cf_probe_latency_compat "${unit}" "${dropin}")
-            printf 'Environment="PATH=%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n' \
-                "${compat_dir}" >>"${tmp}"
+            # 修订不在白名单时返回 3：跳过测速目标处理，但继续把国外出口配上，
+            # 否则 cf-probe 一自动更新就会退回直连而彻底失联。其余失败仍然整次撤销。
+            if compat_dir=$(prepare_cf_probe_latency_compat "${unit}" "${dropin}"); then
+                printf 'Environment="PATH=%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n' \
+                    "${compat_dir}" >>"${tmp}"
+            else
+                compat_rc=$?
+                (( compat_rc == 3 )) || exit 1
+                compat_dir=
+                TX_COMPAT_DIR=
+                TX_COMPAT_CREATED=no
+                TX_COMPAT_CURL_CREATED=no
+            fi
             if [[ ${outbound_mode} == forward ]]; then
                 TX_FORWARD_DROPIN=${dropin}
                 prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
@@ -263,9 +273,19 @@ case "${1:-}" in
             TX_COMPAT_DIR=${compat_dir}
             TX_COMPAT_CREATED=${compat_created}
             TX_COMPAT_CURL_CREATED=${compat_curl_created}
-            compat_dir=$(prepare_cf_probe_latency_compat "${unit}" "${dropin}")
-            printf 'Environment="PATH=%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n' \
-                "${compat_dir}" >>"${tmp}"
+            # 修订不在白名单时返回 3：跳过测速目标处理，但继续把国外出口配上，
+            # 否则 cf-probe 一自动更新就会退回直连而彻底失联。其余失败仍然整次撤销。
+            if compat_dir=$(prepare_cf_probe_latency_compat "${unit}" "${dropin}"); then
+                printf 'Environment="PATH=%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n' \
+                    "${compat_dir}" >>"${tmp}"
+            else
+                compat_rc=$?
+                (( compat_rc == 3 )) || exit 1
+                compat_dir=
+                TX_COMPAT_DIR=
+                TX_COMPAT_CREATED=no
+                TX_COMPAT_CURL_CREATED=no
+            fi
             # 重写 drop-in 会丢掉挂载行，转发模式已启用时必须原样补回，否则静默失效。
             if cf_probe_forward_mode_active "${dropin}"; then
                 cf_probe_forward_dropin_line "${dropin}" >>"${tmp}" \
