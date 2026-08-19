@@ -109,6 +109,7 @@ test_go_agent_contract_detection() {
     local v104=${WORK_ROOT}/cf-probe-go-v1.0.4
     local v105=${WORK_ROOT}/cf-probe-go-v1.0.5
     local v106=${WORK_ROOT}/cf-probe-go-v1.0.6
+    local v109=${WORK_ROOT}/cf-probe-go-v1.0.9
     local invalid=${WORK_ROOT}/cf-probe-go-invalid
     local snapshot=${WORK_ROOT}/cf-probe-go-snapshot
     local unknown=${WORK_ROOT}/cf-probe-go-unknown
@@ -151,6 +152,11 @@ test_go_agent_contract_detection() {
         'github.com/huilang-me/cfsm-agent/cmd/cf-probe' \
         'X-Agent-Config-Md5' \
         'CT_NODE' \
+        '69f5e13216a45e06273717a9f072a6c103302187' >"${v109}"
+    printf '%s\n' \
+        'github.com/huilang-me/cfsm-agent/cmd/cf-probe' \
+        'X-Agent-Config-Md5' \
+        'CT_NODE' \
         '2d30633f552d343e5d70acb589105b6165a466fa' >"${snapshot}"
     printf '%s\n' \
         'github.com/huilang-me/cfsm-agent/cmd/cf-probe' \
@@ -172,6 +178,8 @@ test_go_agent_contract_detection() {
         || { fail '未识别官方 Go CF Probe v1.0.5 二进制契约'; return 1; }
     cf_probe_go_binary_contract "${v106}" \
         || { fail '未识别官方 Go CF Probe v1.0.6 二进制契约'; return 1; }
+    cf_probe_go_binary_contract "${v109}" \
+        || { fail '未识别官方 Go CF Probe v1.0.9 二进制契约'; return 1; }
     ! cf_probe_go_binary_contract "${snapshot}" \
         || { fail '官方快照版 Go CF Probe 被错误接受'; return 1; }
     ! cf_probe_go_binary_contract "${unknown}" \
