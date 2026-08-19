@@ -181,7 +181,7 @@ test_go_agent_contract_detection() {
 }
 
 test_go_agent_rejection_explains_reason() {
-    local supported=${WORK_ROOT}/cf-probe-go-supported
+    local rc supported=${WORK_ROOT}/cf-probe-go-supported
     local unknown=${WORK_ROOT}/cf-probe-go-unknown-reason output
     printf '%s\n' \
         'github.com/huilang-me/cfsm-agent/cmd/cf-probe' \
@@ -197,18 +197,23 @@ test_go_agent_rejection_explains_reason() {
     cf_probe_go_executable_path() { printf '%s\n' "${CF_PROBE_GO_EXE_FIXTURE}"; }
 
     CF_PROBE_GO_EXE_FIXTURE=${unknown}
-    if output=$(prepare_cf_probe_latency_compat cf-probe.service "${WORK_ROOT}/unknown.d" 2>&1); then
-        fail '未知 Go Agent 修订版被错误接受'
-        return 1
-    fi
-    assert_contains "${output}" '未在 Po0 已审查的正式版本清单中' \
-        '未知 Go Agent 没有显示准确拒绝原因' || return 1
+    rc=0
+    output=$(prepare_cf_probe_latency_compat cf-probe.service "${WORK_ROOT}/unknown.d" 2>&1) || rc=$?
+    # 未知修订不再整次拒绝：返回 3 表示只跳过测速目标处理，国外出口照配。
+    # cf-probe 默认开启自动更新，上游一发新版就会走到这里。
+    assert_eq 3 "${rc}" '未知 Go Agent 修订版没有返回可跳过的状态' || return 1
+    assert_contains "${output}" '不在 Po0 已审查的正式版本清单中' \
+        '未知 Go Agent 没有显示准确原因' || return 1
+    assert_contains "${output}" '只配置国外出口' \
+        '没有说明这次仍然会配置国外出口' || return 1
+    assert_contains "${output}" '检查并更新配置' \
+        '没有告诉用户版本进入清单后该怎么补上' || return 1
 
     CF_PROBE_GO_EXE_FIXTURE=${supported}
-    if output=$(prepare_cf_probe_latency_compat cf-probe.service "${WORK_ROOT}/unsafe.d" 2>&1); then
-        fail '配置安全校验失败的 Go Agent 被错误接受'
-        return 1
-    fi
+    rc=0
+    output=$(prepare_cf_probe_latency_compat cf-probe.service "${WORK_ROOT}/unsafe.d" 2>&1) || rc=$?
+    # 版本受支持却过不了安全校验，可能意味着被改动过，必须仍然整次拒绝而不是跳过。
+    assert_eq 1 "${rc}" '受支持版本的安全校验失败被降级成了可跳过' || return 1
     assert_contains "${output}" '运行参数或配置文件未通过安全校验' \
         '受支持 Go Agent 的配置安全失败原因不准确' || return 1
 }
@@ -759,6 +764,8 @@ test_source_lifecycle_contracts() {
         '启用与刷新没有同时写入转发模式的挂载行' || return 1
     assert_contains "${helper_case}" 'prepare_cf_probe_forward_mode "${unit}" "${dropin}"' \
         '启用路径没有接入转发模式' || return 1
+    assert_eq 2 "$(grep -Fc '(( compat_rc == 3 )) || exit 1' <<<"${helper_case}")" \
+        '启用与刷新没有同时处理「跳过测速目标但继续配置」的返回码' || return 1
     assert_contains "${source}" 'enable_args+=("${outbound_mode}")' \
         '扫描菜单没有把选定的出站方式传给底层' || return 1
     assert_contains "${source}" '[[ ${outbound_mode} == env ]] || enable_args+=' \
@@ -802,7 +809,7 @@ forward_fixture() {
     : >"${case_dir}/ss.out"
     CF_PROBE_FORWARD_SOCAT=${case_dir}/socat
     cf_probe_go_systemd_root() { printf '%s\n' "${case_dir}/systemd"; }
-    cf_probe_go_config_path() { printf '%s\n' "${case_dir}/etc/config.conf"; }
+    cf_probe_go_config_path_unverified() { printf '%s\n' "${case_dir}/etc/config.conf"; }
     systemctl() { printf '%s\n' "$*" >>"${case_dir}/systemctl.log"; return 0; }
     ss() { cat "${case_dir}/ss.out" 2>/dev/null; return 0; }
 }

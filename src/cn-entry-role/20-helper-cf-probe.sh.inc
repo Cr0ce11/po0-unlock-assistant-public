@@ -75,13 +75,15 @@ cf_probe_go_executable_path() {
     printf '%s\n' "${exe}"
 }
 
-cf_probe_go_config_path() {
+# 只解析并校验配置文件路径本身，不要求二进制修订在白名单内。
+# 仅供只读取值使用（例如读面板地址）；改写测速目标必须走下面带白名单闸门的版本。
+cf_probe_go_config_path_unverified() {
     local unit=$1 pid exe arg next_is_config=no config=/etc/config/cf-probe/config.conf resolved
     local -a args=()
     pid=$(systemctl show -p MainPID --value -- "${unit}" 2>/dev/null || true)
     [[ ${pid} =~ ^[1-9][0-9]*$ && -r /proc/${pid}/cmdline ]] || return 1
     exe=$(cf_probe_go_executable_path "${unit}" "${pid}") || return 1
-    cf_probe_go_binary_contract "${exe}" || return 1
+    cf_probe_go_binary_family "${exe}" || return 1
     mapfile -d '' -t args <"/proc/${pid}/cmdline" || return 1
     for arg in "${args[@]}"; do
         if [[ ${next_is_config} == yes ]]; then
@@ -104,6 +106,16 @@ cf_probe_go_config_path() {
         && $(stat -c '%a' "${config}" 2>/dev/null) == 600 \
         && $(stat -c '%h' "${config}" 2>/dev/null) == 1 ]] || return 1
     printf '%s\n' "${config}"
+}
+
+# 带白名单闸门：任何会改写 cf-probe 自身配置的路径都必须经过这里。
+cf_probe_go_config_path() {
+    local unit=$1 pid exe
+    pid=$(systemctl show -p MainPID --value -- "${unit}" 2>/dev/null || true)
+    [[ ${pid} =~ ^[1-9][0-9]*$ ]] || return 1
+    exe=$(cf_probe_go_executable_path "${unit}" "${pid}") || return 1
+    cf_probe_go_binary_contract "${exe}" || return 1
+    cf_probe_go_config_path_unverified "${unit}"
 }
 
 cf_probe_go_config_value() {
@@ -716,11 +728,15 @@ prepare_cf_probe_latency_compat() {
     go_exe=$(cf_probe_go_executable_path "${unit}" 2>/dev/null || true)
     if [[ -n ${go_exe} ]] && cf_probe_go_binary_family "${go_exe}"; then
         if cf_probe_go_binary_contract "${go_exe}"; then
+            # 版本受支持却过不了安全校验，可能意味着配置或启动参数被改动过，仍然拒绝整次配置。
             echo '已识别受支持的官方 Go cf-probe，但运行参数或配置文件未通过安全校验，已停止配置。' >&2
-        else
-            echo '当前官方 Go cf-probe 未在 Po0 已审查的正式版本清单中，已停止配置。' >&2
+            return 1
         fi
-        return 1
+        # 修订不在白名单：不去碰它的配置文件，但国外出口该配还是要配。cf-probe 默认开启
+        # 自动更新，上游一发新版就会走到这里；若因此整次拒绝，探针会退回直连而彻底失联。
+        echo '当前官方 Go cf-probe 不在 Po0 已审查的正式版本清单中：本次只配置国外出口，不改动它的测速目标。' >&2
+        echo '待该版本经过审查并加入清单后，再次执行「检查并更新配置」即可补上测速目标处理。' >&2
+        return 3
     fi
     command -v ping >/dev/null \
         || { echo '系统缺少 ping，无法为 cf-probe 保留延迟检测。' >&2; return 1; }
@@ -965,7 +981,8 @@ prepare_cf_probe_forward_mode() {
     unit_name=${unit_file##*/}
     [[ -f ${CF_PROBE_FORWARD_SOCAT} && -x ${CF_PROBE_FORWARD_SOCAT} && ! -L ${CF_PROBE_FORWARD_SOCAT} ]] \
         || { echo "转发模式需要 ${CF_PROBE_FORWARD_SOCAT}，本机没有找到可用的它。" >&2; return 1; }
-    config=$(cf_probe_go_config_path "${unit}") \
+    # 转发模式只从配置里读面板地址，不改写它，因此不要求修订在白名单内。
+    config=$(cf_probe_go_config_path_unverified "${unit}") \
         || { echo '无法定位 cf-probe 配置文件，拒绝启用转发模式。' >&2; return 1; }
     host=$(cf_probe_forward_host "${config}") \
         || { echo '无法从 cf-probe 配置中解析出可用的面板主机名，拒绝启用转发模式。' >&2; return 1; }
