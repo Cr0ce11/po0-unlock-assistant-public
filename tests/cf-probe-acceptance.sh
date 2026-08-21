@@ -67,6 +67,7 @@ stat() {
     if [[ $# -eq 3 && $1 == -c ]]; then
         case "$2" in
             '%u') printf '%s\n' 0; return 0 ;;
+            '%g') printf '%s\n' 0; return 0 ;;
             '%h') printf '%s\n' 1; return 0 ;;
             '%a')
                 if [[ $(uname -s) == Darwin ]]; then
@@ -772,6 +773,8 @@ test_source_lifecycle_contracts() {
         '启用与刷新没有同时写入转发模式的挂载行' || return 1
     assert_contains "${helper_case}" '"${unit}" "${dropin}" "${TX_FORWARD_SNAPSHOT}" >/dev/null' \
         '启用路径没有把外层事务快照交给转发模式准备流程' || return 1
+    assert_contains "${helper_case}" 'cf_probe_forward_state_safe_to_prepare "${unit}" "${dropin}"' \
+        '启用事务没有在登记清理责任前拒绝完整漂移或外来残片' || return 1
     # 刷新是既有部署拿到新版转发单元的唯一入口，断了这条线老部署永远不会开机自启
     assert_contains "${helper_case}" 'reconcile_cf_probe_forward_unit "${unit}" "${dropin}"' \
         '刷新路径没有核对转发单元，既有部署补不上开机自启' || return 1
@@ -833,11 +836,14 @@ forward_fixture() {
     printf '%s\n' '#!/bin/sh' 'exit 0' >"${case_dir}/socat"
     chmod 0755 "${case_dir}/socat"
     : >"${case_dir}/ss.out"
+    CF_PROBE_TEST_SYSTEM_HOSTS=${case_dir}/system-hosts
+    cp -- /etc/hosts "${CF_PROBE_TEST_SYSTEM_HOSTS}"
     # 单元的运行状态与开机自启状态由这两个文件表达，用例改文件即可，不必重定义 systemctl
     printf '%s\n' 0 >"${case_dir}/is-active.rc"
     printf '%s\n' enabled >"${case_dir}/is-enabled.out"
     : >"${case_dir}/systemctl-fail-next"
     CF_PROBE_FORWARD_SOCAT=${case_dir}/socat
+    cf_probe_forward_system_hosts() { printf '%s\n' "${CF_PROBE_TEST_SYSTEM_HOSTS}"; }
     cf_probe_go_systemd_root() { printf '%s\n' "${case_dir}/systemd"; }
     cf_probe_go_config_path_unverified() { printf '%s\n' "${case_dir}/etc/config.conf"; }
     systemctl() {
@@ -882,7 +888,7 @@ forward_fail_next_systemctl() {
 
 # 启用后要生成受管目录、专属 hosts、受管记录与转发单元，并给出挂载行；拆除后一件不剩。
 test_forward_mode_lifecycle() (
-    local case_dir unit host dropin hosts record unit_file created line
+    local case_dir unit host dropin hosts record unit_file system_hosts created line
     unit=cf-probe.service
     host=panel.example.invalid
     case_dir=$(mktemp -d "${WORK_ROOT}/forward-life.XXXXXX") || return 1
@@ -903,14 +909,15 @@ test_forward_mode_lifecycle() (
         || { fail '转发单元没有经管理代理转发'; return 1; }
     assert_eq "${host}" "$(cf_probe_forward_record_value "${record}" FORWARD_HOST)" \
         '受管记录里的面板主机不正确' || return 1
-    cf_probe_forward_mode_active "${dropin}" \
+    cf_probe_forward_mode_active "${unit}" "${dropin}" \
         || { fail '受管记录存在却判定为未启用转发模式'; return 1; }
     line=$(cf_probe_forward_dropin_line "${dropin}") || return 1
     assert_eq "BindReadOnlyPaths=${hosts}:/etc/hosts" "${line}" \
         '挂载行不正确' || return 1
     # 专属 hosts 必须是系统 hosts 的超集，否则会破坏服务里的其他解析
+    system_hosts=$(cf_probe_forward_system_hosts) || return 1
     assert_eq 0 "$(sed '1d' "${hosts}" | grep -vxF "127.0.0.1 ${host}" \
-        | diff -q - /etc/hosts >/dev/null 2>&1; echo $?)" \
+        | diff -q - "${system_hosts}" >/dev/null 2>&1; echo $?)" \
         '专属 hosts 与系统 hosts 的其余内容不一致' || return 1
 
     remove_cf_probe_forward_mode "${unit}" "${dropin}" \
@@ -919,7 +926,7 @@ test_forward_mode_lifecycle() (
         || { fail '拆除后仍有转发模式残留'; return 1; }
     [[ ! -d $(cf_probe_forward_dir "${dropin}") ]] \
         || { fail '拆除后转发目录仍然存在'; return 1; }
-    cf_probe_forward_mode_active "${dropin}" \
+    cf_probe_forward_mode_active "${unit}" "${dropin}" \
         && { fail '拆除后仍被判定为转发模式'; return 1; }
     remove_cf_probe_forward_mode "${unit}" "${dropin}" \
         || { fail '重复拆除不应报错'; return 1; }
@@ -928,12 +935,13 @@ test_forward_mode_lifecycle() (
 # 转发单元必须能开机自启：新写出的带 [Install] 且被启用；早期版本落下的缺 [Install]
 # 单元要在刷新时被重写并重新启用，否则重启后转发器不起、实时通道静默断开。
 test_forward_unit_boot_enable_and_reconcile() (
-    local case_dir unit host dropin unit_file unit_name legacy log output
+    local case_dir unit host dropin record unit_file unit_name legacy log output
     unit=cf-probe.service
     host=panel.example.invalid
     case_dir=$(mktemp -d "${WORK_ROOT}/forward-boot.XXXXXX") || return 1
     forward_fixture "${case_dir}" "${host}"
     dropin=${case_dir}/dropin
+    record=$(cf_probe_forward_record_file "${dropin}") || return 1
     unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
     unit_name=$(cf_probe_forward_unit_name "${unit}") || return 1
     log=${case_dir}/systemctl.log
@@ -950,6 +958,8 @@ test_forward_unit_boot_enable_and_reconcile() (
     # 造出早期版本落地的单元：首行标记仍是本助手的，但没有 [Install] 段
     legacy=$(grep -vxF '[Install]' "${unit_file}" | grep -vxF 'WantedBy=multi-user.target')
     printf '%s\n' "${legacy}" >"${unit_file}"
+    cf_probe_forward_legacy_record_content "${unit}" "${host}" >"${record}" \
+        || { fail '无法建立旧版四行 record 夹具'; return 1; }
     assert_not_contains "$(cat "${unit_file}")" 'WantedBy=' \
         '夹具没有造出缺开机自启的旧单元' || return 1
     : >"${log}"
@@ -957,6 +967,8 @@ test_forward_unit_boot_enable_and_reconcile() (
         || { fail '刷新没有收敛旧版转发单元'; return 1; }
     assert_contains "$(cat "${unit_file}")" 'WantedBy=multi-user.target' \
         '刷新没有把旧版转发单元重写成带开机自启的版本' || return 1
+    grep -Eq '^HOSTS_SHA256=[0-9a-f]{64}$' "${record}" \
+        || { fail '刷新没有把旧版 record 升级为绑定 hosts 摘要的新格式'; return 1; }
     assert_contains "$(cat "${log}")" 'daemon-reload' \
         '重写转发单元后没有让 systemd 重新载入' || return 1
     assert_contains "$(cat "${log}")" "try-restart -- ${unit_name}" \
@@ -998,11 +1010,7 @@ test_forward_prepare_failure_restores_reused_state() (
 
     prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
         || { fail '建立既有转发夹具失败'; return 1; }
-    # 保持首行归属标记，但造出与当前模板不同的旧版内容，确保重试确实发生过改写。
-    printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" 'legacy hosts content' >"${hosts}"
-    printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" \
-        "UNIT=${unit}" "FORWARD_HOST=${host}" 'LISTEN=127.0.0.1:443' 'LEGACY=yes' >"${record}"
-    printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" '[Unit]' 'Description=legacy forward unit' >"${unit_file}"
+    # 复用的是一套完整且仍有效的当前状态；测试关注第二次启用失败后是否逐字节保留它。
     snapshot=${case_dir}/before
     mkdir -p "${snapshot}"
     cp -p -- "${hosts}" "${record}" "${unit_file}" "${snapshot}/"
@@ -1036,12 +1044,7 @@ run_forward_prepare_write_failure_case() (
 
     prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
         || { fail "建立 ${failure} 写失败夹具失败"; return 1; }
-    printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" 'legacy hosts before write failure' >"${hosts}"
-    printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" \
-        "UNIT=${unit}" "FORWARD_HOST=${host}" 'LISTEN=127.0.0.1:443' \
-        'LEGACY=before-write-failure' >"${record}"
-    printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" '[Unit]' \
-        "Description=legacy unit before ${failure}" >"${unit_file}"
+    # 复用一套严格有效的当前状态；测试关注第二次写入中断后是否逐字节恢复。
     snapshot=${case_dir}/before
     mkdir -p "${snapshot}"
     cp -p -- "${hosts}" "${record}" "${unit_file}" "${snapshot}/"
@@ -1095,6 +1098,8 @@ test_forward_partial_state_can_be_removed_and_recreated() (
     prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
         || { fail '建立残缺状态夹具失败'; return 1; }
     rm -- "${record}"
+    cf_probe_forward_state_safe_to_prepare "${unit}" "${dropin}" \
+        || { fail '启用事务只读闸门拒绝了归属明确的残缺状态'; return 1; }
     snapshot=$(snapshot_cf_probe_forward_state_if_complete \
         "${unit}" "${dropin}" "${state}") \
         || { fail '停用事务预检拒绝了可安全清理的残缺状态'; return 1; }
@@ -1130,8 +1135,8 @@ test_forward_reconcile_failures_restore_unit() (
         unit_name=$(cf_probe_forward_unit_name "${unit}") || return 1
         prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
             || { fail "建立 ${command} 失败夹具失败"; return 1; }
-        printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" '[Unit]' \
-            "Description=legacy before ${command}" >"${unit_file}"
+        cf_probe_forward_legacy_unit_content "${unit}" "${host}" >"${unit_file}" \
+            || { fail "无法建立 ${command} 的已知旧版 unit 夹具"; return 1; }
         before=${case_dir}/before-unit
         cp -p -- "${unit_file}" "${before}"
         case "${command}" in
@@ -1214,7 +1219,9 @@ test_forward_health_entry_exit_codes() (
     dropin=${case_dir}/systemd/${unit}.d
     # 组件里 drop-in 路径写死为 /etc/systemd/system，整体换成夹具目录后按真脚本执行
     component=${case_dir}/po0-cn-entry
-    helper_region | sed "s|/etc/systemd/system|${case_dir}/systemd|g" >"${component}"
+    helper_region | sed \
+        -e "s|/etc/systemd/system|${case_dir}/systemd|g" \
+        -e "s|/usr/bin/socat|${case_dir}/socat|g" >"${component}"
     /bin/bash -n "${component}" || { fail '改写后的组件语法错误'; return 1; }
 
     # 未启用转发模式：必须以 3 退出且不输出任何结论
@@ -1308,9 +1315,133 @@ test_forward_mode_guards_refuse_unsafe() (
         || { fail '拒绝拆除时仍删掉了被改过的文件'; return 1; }
 )
 
+# 转发状态会被 root systemd 单元读取，因此复用时必须保持精确权限；但只要材料
+# 仍能确认属于 Po0，撤销就必须能清理漂移现场，不能形成永久无法解管的状态。
+test_forward_managed_state_rejects_unsafe_metadata() (
+    local kind case_dir unit host dropin directory hosts record unit_file before log
+    unit=cf-probe.service
+    host=panel.example.invalid
+    for kind in directory hosts record unit; do
+        case_dir=$(mktemp -d "${WORK_ROOT}/forward-metadata-${kind}.XXXXXX") || return 1
+        forward_fixture "${case_dir}" "${host}"
+        dropin=${case_dir}/dropin
+        directory=$(cf_probe_forward_dir "${dropin}") || return 1
+        hosts=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+        record=$(cf_probe_forward_record_file "${dropin}") || return 1
+        unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+        prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
+            || { fail "建立 ${kind} 权限漂移夹具失败"; return 1; }
+        case "${kind}" in
+            directory) chmod 0750 "${directory}" ;;
+            hosts) chmod 0666 "${hosts}" ;;
+            record) chmod 0666 "${record}" ;;
+            unit) chmod 0666 "${unit_file}" ;;
+        esac
+        before=${case_dir}/before
+        mkdir -p "${before}"
+        cp -p -- "${hosts}" "${record}" "${unit_file}" "${before}/"
+        log=${case_dir}/systemctl.log
+        : >"${log}"
+        cf_probe_forward_state_safe_to_prepare "${unit}" "${dropin}" \
+            && { fail "${kind} 权限漂移没有被启用事务只读闸门拒绝"; return 1; }
+        prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null 2>&1 \
+            && { fail "${kind} 权限漂移后复用仍返回成功"; return 1; }
+        [[ -d ${directory} && -f ${hosts} && -f ${record} && -f ${unit_file} ]] \
+            || { fail "${kind} 权限漂移的复用拒绝删除了转发状态"; return 1; }
+        cmp -s "${before}/${hosts##*/}" "${hosts}" \
+            || { fail "${kind} 权限漂移后改写了 hosts"; return 1; }
+        cmp -s "${before}/${record##*/}" "${record}" \
+            || { fail "${kind} 权限漂移后改写了 record"; return 1; }
+        cmp -s "${before}/${unit_file##*/}" "${unit_file}" \
+            || { fail "${kind} 权限漂移后改写了 unit"; return 1; }
+        [[ ! -s ${log} ]] \
+            || { fail "${kind} 权限漂移的复用拒绝仍调用了 systemd：$(<"${log}")"; return 1; }
+        remove_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null 2>&1 \
+            || { fail "${kind} 权限漂移后无法安全撤销"; return 1; }
+        [[ ! -e ${hosts} && ! -e ${record} && ! -e ${unit_file} && ! -d ${directory} ]] \
+            || { fail "${kind} 权限漂移撤销后仍有材料残留"; return 1; }
+    done
+)
+
+test_forward_managed_state_rejects_tampered_content() (
+    local kind case_dir unit host dropin directory hosts record unit_file before log
+    unit=cf-probe.service
+    host=panel.example.invalid
+    for kind in hosts record record_order record_format record_unit host listen unit; do
+        case_dir=$(mktemp -d "${WORK_ROOT}/forward-content-${kind}.XXXXXX") || return 1
+        forward_fixture "${case_dir}" "${host}"
+        dropin=${case_dir}/dropin
+        directory=$(cf_probe_forward_dir "${dropin}") || return 1
+        hosts=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+        record=$(cf_probe_forward_record_file "${dropin}") || return 1
+        unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+        prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
+            || { fail "建立 ${kind} 内容漂移夹具失败"; return 1; }
+        case "${kind}" in
+            hosts) printf '%s\n' '203.0.113.9 injected.example.invalid' >>"${hosts}" ;;
+            record) printf '%s\n' 'EXTRA=unexpected' >>"${record}" ;;
+            record_order)
+                {
+                    sed -n '1p' "${record}"
+                    sed -n '3p' "${record}"
+                    sed -n '2p' "${record}"
+                    sed -n '4,5p' "${record}"
+                } >"${record}.tmp"
+                mv -f -- "${record}.tmp" "${record}"
+                chmod 0644 "${record}"
+                ;;
+            record_format)
+                sed 's/^LISTEN=/LISTEN =/' "${record}" >"${record}.tmp"
+                mv -f -- "${record}.tmp" "${record}"
+                chmod 0644 "${record}"
+                ;;
+            record_unit)
+                sed 's/^UNIT=.*/UNIT=other.service/' "${record}" >"${record}.tmp"
+                mv -f -- "${record}.tmp" "${record}"
+                chmod 0644 "${record}"
+                ;;
+            host)
+                sed 's/^FORWARD_HOST=.*/FORWARD_HOST=panel.example.invalid:8443/' \
+                    "${record}" >"${record}.tmp"
+                mv -f -- "${record}.tmp" "${record}"
+                chmod 0644 "${record}"
+                ;;
+            listen)
+                sed 's/^LISTEN=.*/LISTEN=127.0.0.1:444/' "${record}" >"${record}.tmp"
+                mv -f -- "${record}.tmp" "${record}"
+                chmod 0644 "${record}"
+                ;;
+            unit)
+                printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" '[Service]' \
+                    'ExecStart=/bin/false' >"${unit_file}"
+                ;;
+        esac
+        before=${case_dir}/before
+        mkdir -p "${before}"
+        cp -p -- "${hosts}" "${record}" "${unit_file}" "${before}/"
+        log=${case_dir}/systemctl.log
+        : >"${log}"
+        reconcile_cf_probe_forward_unit "${unit}" "${dropin}" >/dev/null 2>&1 \
+            && { fail "${kind} 内容漂移后刷新仍返回成功"; return 1; }
+        cmp -s "${before}/${hosts##*/}" "${hosts}" \
+            || { fail "${kind} 内容漂移后刷新改写了 hosts"; return 1; }
+        cmp -s "${before}/${record##*/}" "${record}" \
+            || { fail "${kind} 内容漂移后刷新改写了 record"; return 1; }
+        cmp -s "${before}/${unit_file##*/}" "${unit_file}" \
+            || { fail "${kind} 内容漂移后刷新改写了 unit"; return 1; }
+        [[ ! -s ${log} ]] \
+            || { fail "${kind} 内容漂移后仍调用了 systemd：$(<"${log}")"; return 1; }
+        [[ -d ${directory} ]] || { fail "${kind} 内容漂移后删除了转发目录"; return 1; }
+        remove_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null 2>&1 \
+            || { fail "${kind} 内容漂移后无法安全撤销"; return 1; }
+        [[ ! -e ${hosts} && ! -e ${record} && ! -e ${unit_file} && ! -d ${directory} ]] \
+            || { fail "${kind} 内容漂移撤销后仍有材料残留"; return 1; }
+    done
+)
+
 # 健康检查要能区分：正常、转发单元没跑（异常）、hosts 被改（异常）、系统 hosts 变化（提醒）。
 test_forward_mode_health_reports() (
-    local case_dir unit host dropin hosts status
+    local case_dir unit host dropin hosts hosts_before system_hosts status
     unit=cf-probe.service
     host=panel.example.invalid
     case_dir=$(mktemp -d "${WORK_ROOT}/forward-health.XXXXXX") || return 1
@@ -1318,6 +1449,8 @@ test_forward_mode_health_reports() (
     dropin=${case_dir}/dropin
     hosts=$(cf_probe_forward_hosts_file "${dropin}") || return 1
     prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null || return 1
+    hosts_before=${case_dir}/hosts-before
+    cp -p -- "${hosts}" "${hosts_before}"
 
     status=$(cf_probe_forward_health "${unit}" "${dropin}")
     assert_eq 正常 "${status%% *}" '一切正常时健康检查没有报正常' || return 1
@@ -1344,13 +1477,10 @@ test_forward_mode_health_reports() (
     status=$(cf_probe_forward_health "${unit}" "${dropin}")
     assert_eq 异常 "${status%% *}" '专属 hosts 被改后没有报异常' || return 1
 
-    # 系统 hosts 变化：专属 hosts 仍合法，但正文与系统的已经对不上
-    {
-        printf '%s\n' "${CF_PROBE_FORWARD_MARKER}"
-        printf '%s\n' '127.0.0.1 localhost'
-        printf '%s\n' '10.0.0.9 stale.example.invalid'
-        printf '%s %s\n' 127.0.0.1 "${host}"
-    } >"${hosts}"
+    # 系统 hosts 变化：恢复未被改动的专属 hosts，再只改变系统 hosts 夹具。
+    cp -p -- "${hosts_before}" "${hosts}"
+    system_hosts=$(cf_probe_forward_system_hosts) || return 1
+    printf '%s\n' '10.0.0.9 changed.example.invalid' >>"${system_hosts}"
     status=$(cf_probe_forward_health "${unit}" "${dropin}")
     assert_eq 提醒 "${status%% *}" '系统 hosts 变化后没有报提醒' || return 1
     assert_contains "${status}" '重新纳管' '提醒没有给出可执行的处置' || return 1
@@ -1604,6 +1734,8 @@ main() {
     run_case '停用失败不删除且服务事务可恢复转发状态' test_forward_disable_failure_and_transaction_restore
     run_case '组件转发健康入口的退出码实跑覆盖' test_forward_health_entry_exit_codes
     run_case '转发模式的护栏拒绝不安全前提' test_forward_mode_guards_refuse_unsafe
+    run_case '转发受管状态拒绝异常权限' test_forward_managed_state_rejects_unsafe_metadata
+    run_case '转发受管状态拒绝内容漂移' test_forward_managed_state_rejects_tampered_content
     run_case '转发模式健康检查区分正常、异常与提醒' test_forward_mode_health_reports
     run_case '出站方式选择菜单的取值与拒绝' test_outbound_mode_prompt_choices
     run_case '切换出站方式的正常、取消与两种失败路径' test_switch_outbound_mode_paths

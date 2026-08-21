@@ -2586,6 +2586,12 @@ CF_PROBE_FORWARD_MARKER='# Managed by Po0 Unlock: CF Probe local forward v1.'
 CF_PROBE_FORWARD_LISTEN_ADDRESS=127.0.0.1
 CF_PROBE_FORWARD_LISTEN_PORT=443
 CF_PROBE_FORWARD_SOCAT=/usr/bin/socat
+CF_PROBE_FORWARD_SYSTEM_HOSTS=/etc/hosts
+
+# 单独留函数缝给验收夹具替换；生产常量不可被环境变量改写。
+cf_probe_forward_system_hosts() {
+    printf '%s\n' "${CF_PROBE_FORWARD_SYSTEM_HOSTS}"
+}
 
 cf_probe_valid_outbound_mode() {
     case "${1:-}" in env|forward) return 0 ;; esac
@@ -2611,6 +2617,13 @@ cf_probe_forward_record_file() {
 }
 
 # 面板主机名取自 cf-probe 自己的配置；只接受普通主机名，拒绝 IP、端口与路径。
+cf_probe_valid_forward_host() {
+    local host=$1
+    [[ ${#host} -ge 4 && ${#host} -le 253 && ${host} != *:* ]] || return 1
+    grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' \
+        <<<"${host}"
+}
+
 cf_probe_forward_host() {
     local config=$1 line value host
     [[ $(grep -Ec '^WORKER_URL=' "${config}" 2>/dev/null || true) == 1 ]] || return 1
@@ -2622,9 +2635,7 @@ cf_probe_forward_host() {
     [[ ${value} == https://* ]] || return 1
     host=${value#https://}
     host=${host%%/*}
-    [[ ${#host} -ge 4 && ${#host} -le 253 && ${host} != *:* ]] || return 1
-    grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' \
-        <<<"${host}" || return 1
+    cf_probe_valid_forward_host "${host}" || return 1
     printf '%s\n' "${host}"
 }
 
@@ -2675,16 +2686,35 @@ WantedBy=multi-user.target
 FORWARD_UNIT
 }
 
+# v2.5.26 至 v2.5.28 写出的唯一旧模板没有 [Install] 段。只接受这个精确旧模板，
+# 让「检查并更新配置」仍能补上开机自启；仅有首行标记的任意正文不再被视为受管。
+cf_probe_forward_legacy_unit_content() {
+    cf_probe_forward_unit_content "$1" "$2" | awk '/^\[Install\]$/ { exit } { print }'
+}
+
 # 该服务专属的 hosts：照抄系统 hosts 再追加一行劫持，首行写标记以便核对归属。
 cf_probe_forward_hosts_content() {
-    local host=$1
+    local host=$1 system_hosts
+    system_hosts=$(cf_probe_forward_system_hosts) || return 1
     printf '%s\n' "${CF_PROBE_FORWARD_MARKER}"
-    sed -n '1,$p' /etc/hosts || return 1
+    sed -n '1,$p' "${system_hosts}" || return 1
     printf '%s %s\n' "${CF_PROBE_FORWARD_LISTEN_ADDRESS}" "${host}"
 }
 
 cf_probe_forward_record_content() {
+    local unit=$1 host=$2 hosts_sha256=$3
+    cf_probe_valid_forward_host "${host}" || return 1
+    [[ ${hosts_sha256} =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" \
+        "UNIT=${unit}" \
+        "FORWARD_HOST=${host}" \
+        "LISTEN=${CF_PROBE_FORWARD_LISTEN_ADDRESS}:${CF_PROBE_FORWARD_LISTEN_PORT}" \
+        "HOSTS_SHA256=${hosts_sha256}"
+}
+
+cf_probe_forward_legacy_record_content() {
     local unit=$1 host=$2
+    cf_probe_valid_forward_host "${host}" || return 1
     printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" \
         "UNIT=${unit}" \
         "FORWARD_HOST=${host}" \
@@ -2698,27 +2728,116 @@ cf_probe_forward_record_value() {
     printf '%s\n' "${line#*=}"
 }
 
-managed_cf_probe_forward_file() {
+cf_probe_forward_file_metadata_safe() {
+    local file=$1 expected_mode=$2
+    [[ -f ${file} && ! -L ${file} ]] || return 1
+    [[ $(stat -c '%u' "${file}" 2>/dev/null) == 0 \
+        && $(stat -c '%g' "${file}" 2>/dev/null) == 0 \
+        && $(stat -c '%a' "${file}" 2>/dev/null) == "${expected_mode}" \
+        && $(stat -c '%h' "${file}" 2>/dev/null) == 1 ]] || return 1
+}
+
+# 严格校验用于复用、刷新和快照；撤销只需要确认材料确实属于 Po0。
+# 这样权限或内容漂移会阻止 root 服务继续信任它，却不会把安全清理入口永久堵死。
+owned_cf_probe_forward_file() {
     local file=$1
     [[ -f ${file} && ! -L ${file} ]] || return 1
     [[ $(stat -c '%u' "${file}" 2>/dev/null) == 0 \
+        && $(stat -c '%g' "${file}" 2>/dev/null) == 0 \
         && $(stat -c '%h' "${file}" 2>/dev/null) == 1 ]] || return 1
     [[ $(sed -n '1p' "${file}" 2>/dev/null) == "${CF_PROBE_FORWARD_MARKER}" ]]
+}
+
+owned_cf_probe_forward_dir() {
+    local directory=$1
+    [[ -d ${directory} && ! -L ${directory} ]] || return 1
+    [[ $(stat -c '%u' "${directory}" 2>/dev/null) == 0 \
+        && $(stat -c '%g' "${directory}" 2>/dev/null) == 0 ]]
 }
 
 managed_cf_probe_forward_dir() {
     local directory=$1
     [[ -d ${directory} && ! -L ${directory} ]] || return 1
-    [[ $(stat -c '%u' "${directory}" 2>/dev/null) == 0 ]] || return 1
-    cf_probe_forward_mode_dir_is_safe "${directory}"
+    [[ $(stat -c '%u' "${directory}" 2>/dev/null) == 0 \
+        && $(stat -c '%g' "${directory}" 2>/dev/null) == 0 \
+        && $(stat -c '%a' "${directory}" 2>/dev/null) == 755 ]]
 }
 
-cf_probe_forward_mode_dir_is_safe() {
-    local mode
-    mode=$(stat -c '%a' "$1" 2>/dev/null) || return 1
-    [[ ${mode} =~ ^[0-7]{3,4}$ ]] || return 1
-    (( 8#${mode} & 8#022 )) && return 1
-    return 0
+managed_cf_probe_forward_record() {
+    local file=$1 unit=$2 host listen hosts_sha256 actual expected line_count
+    cf_probe_forward_file_metadata_safe "${file}" 644 || return 1
+    [[ $(sed -n '1p' "${file}" 2>/dev/null) == "${CF_PROBE_FORWARD_MARKER}" ]] || return 1
+    line_count=$(wc -l <"${file}" | tr -d ' ') || return 1
+    [[ ${line_count} == 4 || ${line_count} == 5 ]] || return 1
+    [[ $(cf_probe_forward_record_value "${file}" UNIT) == "${unit}" ]] || return 1
+    host=$(cf_probe_forward_record_value "${file}" FORWARD_HOST) || return 1
+    cf_probe_valid_forward_host "${host}" || return 1
+    listen=$(cf_probe_forward_record_value "${file}" LISTEN) || return 1
+    [[ ${listen} == "${CF_PROBE_FORWARD_LISTEN_ADDRESS}:${CF_PROBE_FORWARD_LISTEN_PORT}" ]] \
+        || return 1
+    actual=$(sed -n '1,$p' "${file}") || return 1
+    if [[ ${line_count} == 5 ]]; then
+        hosts_sha256=$(cf_probe_forward_record_value "${file}" HOSTS_SHA256) || return 1
+        expected=$(cf_probe_forward_record_content "${unit}" "${host}" "${hosts_sha256}") \
+            || return 1
+    else
+        expected=$(cf_probe_forward_legacy_record_content "${unit}" "${host}") || return 1
+    fi
+    [[ ${actual} == "${expected}" ]]
+}
+
+managed_cf_probe_forward_hosts() {
+    local file=$1 record=$2 host expected_last hosts_sha256 actual_sha256
+    cf_probe_forward_file_metadata_safe "${file}" 644 || return 1
+    [[ $(sed -n '1p' "${file}" 2>/dev/null) == "${CF_PROBE_FORWARD_MARKER}" ]] || return 1
+    [[ $(grep -Fxc -- "${CF_PROBE_FORWARD_MARKER}" "${file}" 2>/dev/null || true) == 1 ]] \
+        || return 1
+    host=$(cf_probe_forward_record_value "${record}" FORWARD_HOST) || return 1
+    cf_probe_valid_forward_host "${host}" || return 1
+    expected_last="${CF_PROBE_FORWARD_LISTEN_ADDRESS} ${host}"
+    [[ $(tail -n 1 "${file}" 2>/dev/null) == "${expected_last}" ]] || return 1
+    if [[ $(wc -l <"${record}" | tr -d ' ') == 5 ]]; then
+        hosts_sha256=$(cf_probe_forward_record_value "${record}" HOSTS_SHA256) || return 1
+        [[ ${hosts_sha256} =~ ^[0-9a-f]{64}$ ]] || return 1
+        actual_sha256=$(sha256sum "${file}" | awk '{print $1}') || return 1
+        [[ ${actual_sha256} == "${hosts_sha256}" ]] || return 1
+    fi
+}
+
+managed_cf_probe_forward_unit() {
+    local file=$1 unit=$2 host=$3 actual expected legacy
+    cf_probe_valid_forward_host "${host}" || return 1
+    cf_probe_forward_file_metadata_safe "${file}" 644 || return 1
+    actual=$(sed -n '1,$p' "${file}") || return 1
+    expected=$(cf_probe_forward_unit_content "${unit}" "${host}") || return 1
+    [[ ${actual} == "${expected}" ]] && return 0
+    legacy=$(cf_probe_forward_legacy_unit_content "${unit}" "${host}") || return 1
+    [[ ${actual} == "${legacy}" ]]
+}
+
+managed_cf_probe_forward_state() {
+    local unit=$1 dropin=$2 directory hosts_file record_file unit_file host
+    directory=$(cf_probe_forward_dir "${dropin}") || return 1
+    hosts_file=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+    record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+    managed_cf_probe_forward_dir "${directory}" || return 1
+    managed_cf_probe_forward_record "${record_file}" "${unit}" || return 1
+    host=$(cf_probe_forward_record_value "${record_file}" FORWARD_HOST) || return 1
+    managed_cf_probe_forward_hosts "${hosts_file}" "${record_file}" || return 1
+    managed_cf_probe_forward_unit "${unit_file}" "${unit}" "${host}"
+}
+
+cf_probe_forward_artifacts_complete() {
+    local unit=$1 dropin=$2 directory hosts_file record_file unit_file
+    directory=$(cf_probe_forward_dir "${dropin}") || return 1
+    hosts_file=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+    record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+    [[ ( -e ${directory} || -L ${directory} ) \
+        && ( -e ${hosts_file} || -L ${hosts_file} ) \
+        && ( -e ${record_file} || -L ${record_file} ) \
+        && ( -e ${unit_file} || -L ${unit_file} ) ]]
 }
 
 # 监听端点是全机资源：被别人占着就拒绝启用，绝不覆盖。
@@ -2742,15 +2861,7 @@ cf_probe_forward_mode_present() {
 }
 
 cf_probe_forward_mode_complete() {
-    local unit=$1 dropin=$2 directory hosts_file record_file unit_file
-    directory=$(cf_probe_forward_dir "${dropin}") || return 1
-    hosts_file=$(cf_probe_forward_hosts_file "${dropin}") || return 1
-    record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
-    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
-    managed_cf_probe_forward_dir "${directory}" \
-        && managed_cf_probe_forward_file "${hosts_file}" \
-        && managed_cf_probe_forward_file "${record_file}" \
-        && managed_cf_probe_forward_file "${unit_file}"
+    managed_cf_probe_forward_state "$1" "$2"
 }
 
 discard_cf_probe_forward_snapshot() {
@@ -2778,13 +2889,10 @@ create_cf_probe_forward_snapshot() {
     record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
     unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
     unit_name=${unit_file##*/}
-    managed_cf_probe_forward_dir "${directory}" || return 1
-    managed_cf_probe_forward_file "${hosts_file}" || return 1
-    managed_cf_probe_forward_file "${record_file}" || return 1
-    managed_cf_probe_forward_file "${unit_file}" || return 1
+    managed_cf_probe_forward_state "${unit}" "${dropin}" || return 1
     [[ -d ${parent} && ! -L ${parent} ]] || return 1
     directory_mode=$(stat -c '%a' "${directory}" 2>/dev/null) || return 1
-    [[ ${directory_mode} =~ ^[0-7]{3,4}$ ]] || return 1
+    [[ ${directory_mode} == 755 ]] || return 1
     systemctl is-active --quiet -- "${unit_name}" >/dev/null 2>&1 && active=yes
     [[ $(systemctl is-enabled -- "${unit_name}" 2>/dev/null || true) == enabled ]] && enabled=yes
     snapshot=$(mktemp -d "${parent}/.po0-cf-probe-forward-snapshot.XXXXXXXX") || return 1
@@ -2815,6 +2923,27 @@ snapshot_cf_probe_forward_state_if_complete() {
     create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${parent}"
 }
 
+# 外层启用事务在登记“可能需要清理”之前先走这条只读闸门。完整但已漂移的
+# 状态必须原地保留；残缺状态只有每一件现存材料都能确认归属时才允许后续清理重建。
+cf_probe_forward_state_safe_to_prepare() {
+    local unit=$1 dropin=$2 directory hosts_file record_file unit_file
+    cf_probe_forward_mode_present "${unit}" "${dropin}" || return 0
+    cf_probe_forward_mode_complete "${unit}" "${dropin}" && return 0
+    cf_probe_forward_artifacts_complete "${unit}" "${dropin}" && return 1
+    directory=$(cf_probe_forward_dir "${dropin}") || return 1
+    hosts_file=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+    record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+    [[ ! -e ${directory} && ! -L ${directory} ]] \
+        || owned_cf_probe_forward_dir "${directory}" || return 1
+    [[ ! -e ${hosts_file} && ! -L ${hosts_file} ]] \
+        || owned_cf_probe_forward_file "${hosts_file}" || return 1
+    [[ ! -e ${record_file} && ! -L ${record_file} ]] \
+        || owned_cf_probe_forward_file "${record_file}" || return 1
+    [[ ! -e ${unit_file} && ! -L ${unit_file} ]] \
+        || owned_cf_probe_forward_file "${unit_file}" || return 1
+}
+
 cf_probe_forward_restore_file() {
     local source=$1 target=$2 directory tmp
     [[ -f ${source} && ! -L ${source} ]] || return 1
@@ -2843,12 +2972,13 @@ restore_cf_probe_forward_snapshot() {
     enabled=$(cf_probe_forward_snapshot_value "${snapshot}" ENABLED) || return 1
     directory_mode=$(cf_probe_forward_snapshot_value "${snapshot}" DIRECTORY_MODE) || return 1
     case "${active}:${enabled}" in yes:yes|yes:no|no:yes|no:no) ;; *) return 1 ;; esac
-    [[ ${directory_mode} =~ ^[0-7]{3,4}$ ]] || return 1
+    [[ ${directory_mode} == 755 ]] || return 1
     install -d -m "${directory_mode}" "${directory}" || return 1
     chown root:root "${directory}" || return 1
     cf_probe_forward_restore_file "${snapshot}/hosts" "${hosts_file}" || return 1
     cf_probe_forward_restore_file "${snapshot}/record" "${record_file}" || return 1
     cf_probe_forward_restore_file "${snapshot}/unit" "${unit_file}" || return 1
+    managed_cf_probe_forward_state "${unit}" "${dropin}" || return 1
     systemctl daemon-reload || return 1
     if [[ ${enabled} == yes ]]; then
         systemctl enable -- "${unit_name}" >/dev/null || return 1
@@ -2889,7 +3019,7 @@ rollback_cf_probe_forward_snapshot() {
 prepare_cf_probe_forward_mode() {
     local unit=$1 dropin=$2 external_snapshot=${3:-}
     local directory hosts_file record_file unit_file unit_name snapshot= snapshot_owned=no
-    local config host hosts_content record_content unit_content created=no files_written=no
+    local config host hosts_content hosts_sha256 record_content unit_content created=no files_written=no
     directory=$(cf_probe_forward_dir "${dropin}") || return 1
     hosts_file=$(cf_probe_forward_hosts_file "${dropin}") || return 1
     record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
@@ -2903,11 +3033,11 @@ prepare_cf_probe_forward_mode() {
     host=$(cf_probe_forward_host "${config}") \
         || { echo '无法从 cf-probe 配置中解析出可用的面板主机名，拒绝启用转发模式。' >&2; return 1; }
     if [[ -e ${unit_file} || -L ${unit_file} ]]; then
-        managed_cf_probe_forward_file "${unit_file}" \
+        owned_cf_probe_forward_file "${unit_file}" \
             || { echo '转发单元已存在且不是本助手写入的，拒绝覆盖。' >&2; return 1; }
     fi
     if [[ -e ${directory} || -L ${directory} ]]; then
-        managed_cf_probe_forward_dir "${directory}" \
+        owned_cf_probe_forward_dir "${directory}" \
             || { echo '转发工作目录已存在且不是本助手创建的，拒绝复用。' >&2; return 1; }
     fi
     if cf_probe_forward_mode_present "${unit}" "${dropin}"; then
@@ -2921,6 +3051,9 @@ prepare_cf_probe_forward_mode() {
                     || { echo '既有转发状态无法建立恢复快照，拒绝复用。' >&2; return 1; }
                 snapshot_owned=yes
             fi
+        elif cf_probe_forward_artifacts_complete "${unit}" "${dropin}"; then
+            echo '既有转发状态的权限或内容已变化，拒绝覆盖；如确认不再需要，请先执行撤销。' >&2
+            return 1
         else
             remove_cf_probe_forward_mode "${unit}" "${dropin}" \
                 || { echo '既有转发残缺状态无法安全清理，拒绝继续启用。' >&2; return 1; }
@@ -2931,16 +3064,17 @@ prepare_cf_probe_forward_mode() {
         return 1
     fi
     hosts_content=$(cf_probe_forward_hosts_content "${host}") || return 1
-    record_content=$(cf_probe_forward_record_content "${unit}" "${host}") || return 1
     unit_content=$(cf_probe_forward_unit_content "${unit}" "${host}") || return 1
     if [[ -e ${directory} || -L ${directory} ]]; then
-        managed_cf_probe_forward_dir "${directory}" \
+        owned_cf_probe_forward_dir "${directory}" \
             || { echo '转发工作目录已存在且不是本助手创建的，拒绝复用。' >&2; return 1; }
     else
         install -d -m 0755 "${directory}" || return 1
         created=yes
     fi
     if ! cf_probe_forward_write_file "${hosts_file}" "${hosts_content}" \
+        || ! hosts_sha256=$(sha256sum "${hosts_file}" | awk '{print $1}') \
+        || ! record_content=$(cf_probe_forward_record_content "${unit}" "${host}" "${hosts_sha256}") \
         || ! cf_probe_forward_write_file "${record_file}" "${record_content}" \
         || ! cf_probe_write_go_guard_file "${unit_file}" "${unit_content}"; then
         if [[ -n ${snapshot} ]]; then
@@ -2991,19 +3125,36 @@ cf_probe_forward_write_file() {
 # 静默断开，而 HTTP 上报照常，面板仍显示在线。只有在这里核对重写，既有部署才
 # 不必重新纳管一遍。内容一致时不重写，但仍然启用一次，用来补回缺失的开机链接。
 reconcile_cf_probe_forward_unit() {
-    local unit=$1 dropin=$2 record_file unit_file unit_name host expected actual snapshot
+    local unit=$1 dropin=$2 hosts_file record_file unit_file unit_name host hosts_sha256
+    local expected_record actual_record expected_unit actual_unit snapshot unit_changed=no
+    managed_cf_probe_forward_state "${unit}" "${dropin}" || return 1
+    hosts_file=$(cf_probe_forward_hosts_file "${dropin}") || return 1
     record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
-    managed_cf_probe_forward_file "${record_file}" || return 1
     host=$(cf_probe_forward_record_value "${record_file}" FORWARD_HOST) || return 1
+    cf_probe_valid_forward_host "${host}" || return 1
+    hosts_sha256=$(sha256sum "${hosts_file}" | awk '{print $1}') || return 1
+    expected_record=$(cf_probe_forward_record_content "${unit}" "${host}" "${hosts_sha256}") \
+        || return 1
+    actual_record=$(sed -n '1,$p' "${record_file}") || return 1
     unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
     unit_name=${unit_file##*/}
-    expected=$(cf_probe_forward_unit_content "${unit}" "${host}") || return 1
-    managed_cf_probe_forward_file "${unit_file}" || return 1
-    actual=$(sed -n '1,$p' "${unit_file}") || return 1
+    expected_unit=$(cf_probe_forward_unit_content "${unit}" "${host}") || return 1
+    actual_unit=$(sed -n '1,$p' "${unit_file}") || return 1
     snapshot=$(create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${dropin}") || return 1
-    if [[ ${actual} != "${expected}" ]]; then
-        if ! cf_probe_write_go_guard_file "${unit_file}" "${expected}" \
-            || ! systemctl daemon-reload; then
+    if [[ ${actual_unit} != "${expected_unit}" ]]; then
+        if ! cf_probe_write_go_guard_file "${unit_file}" "${expected_unit}"; then
+            rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
+            return 1
+        fi
+        unit_changed=yes
+    fi
+    if [[ ${actual_record} != "${expected_record}" ]] \
+        && ! cf_probe_forward_write_file "${record_file}" "${expected_record}"; then
+        rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
+        return 1
+    fi
+    if [[ ${unit_changed} == yes ]]; then
+        if ! systemctl daemon-reload; then
             rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
             return 1
         fi
@@ -3020,7 +3171,8 @@ reconcile_cf_probe_forward_unit() {
     discard_cf_probe_forward_snapshot "${snapshot}"
 }
 
-# 拆除转发模式：只动本助手写的东西，任何一处被人工改过都拒绝，避免误删他人文件。
+# 拆除转发模式：严格状态可以快照回滚；发生漂移时只按最小归属逐件清理，
+# 既不执行被改过的内容，也不会让明确属于 Po0 的残片永久无法解管。
 remove_cf_probe_forward_mode() {
     local unit=$1 dropin=$2 external_snapshot=${3:-}
     local directory hosts_file record_file unit_file unit_name snapshot= active_state complete=yes
@@ -3032,26 +3184,31 @@ remove_cf_probe_forward_mode() {
     unit_name=${unit_file##*/}
     [[ -e ${directory} || -L ${directory} || -e ${unit_file} || -L ${unit_file} ]] || return 0
     if [[ -e ${directory} || -L ${directory} ]]; then
-        managed_cf_probe_forward_dir "${directory}" || return 1
+        owned_cf_probe_forward_dir "${directory}" || return 1
     else
         complete=no
     fi
     if [[ -e ${unit_file} || -L ${unit_file} ]]; then
-        managed_cf_probe_forward_file "${unit_file}" || return 1
+        owned_cf_probe_forward_file "${unit_file}" || return 1
     else
         complete=no
     fi
     if [[ -e ${hosts_file} || -L ${hosts_file} ]]; then
-        managed_cf_probe_forward_file "${hosts_file}" || return 1
+        owned_cf_probe_forward_file "${hosts_file}" || return 1
     else
         complete=no
     fi
     if [[ -e ${record_file} || -L ${record_file} ]]; then
-        managed_cf_probe_forward_file "${record_file}" || return 1
+        owned_cf_probe_forward_file "${record_file}" || return 1
     else
         complete=no
     fi
-    if [[ ${complete} == yes ]]; then
+    if [[ -n ${external_snapshot} ]] \
+        && ! cf_probe_forward_mode_complete "${unit}" "${dropin}"; then
+        return 1
+    fi
+    if [[ ${complete} == yes ]] \
+        && cf_probe_forward_mode_complete "${unit}" "${dropin}"; then
         if [[ -n ${external_snapshot} ]]; then
             [[ -d ${external_snapshot} && ! -L ${external_snapshot} ]] || return 1
             snapshot=${external_snapshot}
@@ -3095,36 +3252,41 @@ remove_cf_probe_forward_mode() {
 }
 
 cf_probe_forward_mode_active() {
-    local dropin=$1 record_file
-    record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
-    managed_cf_probe_forward_file "${record_file}"
+    managed_cf_probe_forward_state "$1" "$2"
 }
 
 # 专属 hosts 是启用时照抄的快照；系统 hosts 之后被改过就会脱节，健康检查要如实报出来。
 cf_probe_forward_hosts_in_sync() {
-    local file=$1 host=$2
+    local file=$1 host=$2 system_hosts
+    system_hosts=$(cf_probe_forward_system_hosts) || return 1
     sed '1d' "${file}" 2>/dev/null \
         | grep -vxF "${CF_PROBE_FORWARD_LISTEN_ADDRESS} ${host}" \
-        | diff -q - /etc/hosts >/dev/null 2>&1
+        | diff -q - "${system_hosts}" >/dev/null 2>&1
 }
 
 # 转发模式的健康检查。标准输出首段是等级，其余是给用户看的说明。
 cf_probe_forward_health() {
-    local unit=$1 dropin=$2 hosts_file record_file unit_name host
+    local unit=$1 dropin=$2 directory hosts_file record_file unit_file unit_name host
+    directory=$(cf_probe_forward_dir "${dropin}") \
+        || { printf '异常 转发路径无法解析\n'; return 0; }
     hosts_file=$(cf_probe_forward_hosts_file "${dropin}") \
         || { printf '异常 转发路径无法解析\n'; return 0; }
     record_file=$(cf_probe_forward_record_file "${dropin}") \
         || { printf '异常 转发路径无法解析\n'; return 0; }
+    unit_file=$(cf_probe_forward_unit_file "${unit}") \
+        || { printf '异常 转发单元名无法解析\n'; return 0; }
     unit_name=$(cf_probe_forward_unit_name "${unit}") \
         || { printf '异常 转发单元名无法解析\n'; return 0; }
-    managed_cf_probe_forward_file "${record_file}" \
+    managed_cf_probe_forward_dir "${directory}" \
+        || { printf '异常 转发工作目录缺失或权限已变化\n'; return 0; }
+    managed_cf_probe_forward_record "${record_file}" "${unit}" \
         || { printf '异常 转发记录缺失或已被修改\n'; return 0; }
-    managed_cf_probe_forward_file "${hosts_file}" \
-        || { printf '异常 转发用 hosts 缺失或已被修改\n'; return 0; }
     host=$(cf_probe_forward_record_value "${record_file}" FORWARD_HOST) \
         || { printf '异常 转发记录缺少面板主机\n'; return 0; }
-    grep -Fxq "${CF_PROBE_FORWARD_LISTEN_ADDRESS} ${host}" "${hosts_file}" \
-        || { printf '异常 转发用 hosts 没有指向本机\n'; return 0; }
+    managed_cf_probe_forward_hosts "${hosts_file}" "${record_file}" \
+        || { printf '异常 转发用 hosts 缺失或已被修改\n'; return 0; }
+    managed_cf_probe_forward_unit "${unit_file}" "${unit}" "${host}" \
+        || { printf '异常 转发单元内容或权限已变化\n'; return 0; }
     systemctl is-active --quiet -- "${unit_name}" \
         || { printf '异常 转发单元没有运行，实时通道已中断\n'; return 0; }
     # 现在跑着不代表重启后还在：早期版本写出的单元没有 [Install]，开机不会被拉起。
@@ -3682,7 +3844,8 @@ case "${1:-}" in
         valid_helper_service_unit "${unit}" \
             || { echo '服务名必须是合法的 .service 单元名。' >&2; exit 2; }
         dropin="/etc/systemd/system/${unit}.d"
-        cf_probe_forward_mode_active "${dropin}" || exit 3
+        cf_probe_forward_mode_present "${unit}" "${dropin}" || exit 3
+        cf_probe_forward_mode_active "${unit}" "${dropin}" || exit 1
         cf_probe_forward_health "${unit}" "${dropin}"
         ;;
     reconcile-cf-probe)
@@ -3797,6 +3960,8 @@ case "${1:-}" in
             fi
             if [[ ${outbound_mode} == forward ]]; then
                 TX_FORWARD_DROPIN=${dropin}
+                cf_probe_forward_state_safe_to_prepare "${unit}" "${dropin}" \
+                    || { echo '既有 cf-probe 转发状态的权限或内容已变化，拒绝覆盖。' >&2; exit 1; }
                 TX_FORWARD_SNAPSHOT=$(snapshot_cf_probe_forward_state_if_complete \
                     "${unit}" "${dropin}" "${state}") \
                     || { echo '既有 cf-probe 转发状态无法建立恢复快照，拒绝复用。' >&2; exit 1; }
@@ -3940,7 +4105,9 @@ case "${1:-}" in
                 TX_COMPAT_CURL_CREATED=no
             fi
             # 重写 drop-in 会丢掉挂载行，转发模式已启用时必须原样补回，否则静默失效。
-            if cf_probe_forward_mode_active "${dropin}"; then
+            if cf_probe_forward_mode_present "${unit}" "${dropin}"; then
+                cf_probe_forward_mode_active "${unit}" "${dropin}" \
+                    || { echo 'cf-probe 转发模式状态不完整或已被修改，拒绝刷新。' >&2; exit 1; }
                 forward_active=yes
                 cf_probe_forward_dropin_line "${dropin}" >>"${tmp}" \
                     || { echo 'cf-probe 转发模式的挂载配置写入失败，正在恢复更新前配置。' >&2; exit 1; }
@@ -5202,7 +5369,7 @@ __PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
     exit_actual=$(sha256sum "${exit_new}" | awk '{print $1}')
     cn_entry_actual=$(sha256sum "${cn_entry_new}" | awk '{print $1}')
     [[ ${exit_actual} == 'bb75e1213278b7170d885038b790e7a2ef43ea13b0b9f38f3029e2262922b5d5' ]] || die '国外出口内置组件哈希校验失败。'
-    [[ ${cn_entry_actual} == '2e92a92a8d4ccbfd5f9363c113d957fe58d4d72086927b314da11f80dafd30b1' ]] || die '国内入口内置组件哈希校验失败。'
+    [[ ${cn_entry_actual} == '483f61cd1a0f5d35df65fcd6c9eca46e14a68969a872d97ee54eae11a1e51121' ]] || die '国内入口内置组件哈希校验失败。'
     /bin/bash -n "${exit_new}" || die '国外出口内置组件语法检查失败。'
     /bin/bash -n "${cn_entry_new}" || die '国内入口内置组件语法检查失败。'
     mv "${exit_new}" "${EXIT_ROLE}"
@@ -5233,7 +5400,7 @@ bundle_self_test() {
     printf 'Po0 单文件版本=%s\n' '2.5.30'
     printf 'Po0 单文件版本类型=%s\n' "${SCRIPT_EDITION_LABEL}"
     printf 'overseas-exit-role SHA-256=%s\n' 'bb75e1213278b7170d885038b790e7a2ef43ea13b0b9f38f3029e2262922b5d5'
-    printf 'cn-entry-role SHA-256=%s\n' '2e92a92a8d4ccbfd5f9363c113d957fe58d4d72086927b314da11f80dafd30b1'
+    printf 'cn-entry-role SHA-256=%s\n' '483f61cd1a0f5d35df65fcd6c9eca46e14a68969a872d97ee54eae11a1e51121'
     printf '%s\n'         "scan-agents -> cn-entry:${CN_ENTRY_CMD_SCAN}"         "rollback[1] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_SERVICES}"         "rollback[2] -> overseas-exit:${EXIT_CMD_ROLLBACK}"         "rollback[3] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_FINALIZE}"         "status -> cn-entry:${CN_ENTRY_CMD_STATUS}"         "status -> overseas-exit:${EXIT_CMD_STATUS}"         "health -> cn-entry:${CN_ENTRY_CMD_HEALTH}"         "health -> overseas-exit:${EXIT_CMD_HEALTH}"         "repair -> overseas-exit:${EXIT_CMD_REPAIR}"
     printf '%s\n' 'SELF_TEST=PASS'
 }
