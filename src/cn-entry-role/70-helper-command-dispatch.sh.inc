@@ -170,14 +170,14 @@ case "${1:-}" in
             fi
             if [[ ${outbound_mode} == forward ]]; then
                 TX_FORWARD_DROPIN=${dropin}
-                if cf_probe_forward_mode_present "${unit}" "${dropin}"; then
-                    TX_FORWARD_SNAPSHOT=$(create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${state}") \
-                        || { echo '既有 cf-probe 转发状态不完整，拒绝在无法回退时复用。' >&2; exit 1; }
-                fi
+                TX_FORWARD_SNAPSHOT=$(snapshot_cf_probe_forward_state_if_complete \
+                    "${unit}" "${dropin}" "${state}") \
+                    || { echo '既有 cf-probe 转发状态无法建立恢复快照，拒绝复用。' >&2; exit 1; }
                 TX_FORWARD_MAY_CHANGE=yes
                 # 提前置位：即使收到信号中断在 prepare 中间，清理也会处理本次新建的残片。
                 TX_FORWARD_PREPARED=yes
-                prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
+                prepare_cf_probe_forward_mode \
+                    "${unit}" "${dropin}" "${TX_FORWARD_SNAPSHOT}" >/dev/null \
                     || { echo 'cf-probe 转发模式配置失败，正在撤销本次服务代理。' >&2; exit 1; }
                 cf_probe_forward_dropin_line "${dropin}" >>"${tmp}" \
                     || { echo 'cf-probe 转发模式的挂载配置写入失败，正在撤销本次服务代理。' >&2; exit 1; }
@@ -561,10 +561,11 @@ case "${1:-}" in
         fi
         if cf_probe_forward_mode_present "${unit}" "${dropin}"; then
             TX_FORWARD_DROPIN=${dropin}
-            TX_FORWARD_SNAPSHOT=$(create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${state}") \
-                || { echo 'cf-probe 转发状态不完整，拒绝在无法回退时拆除。' >&2; exit 1; }
+            TX_FORWARD_SNAPSHOT=$(snapshot_cf_probe_forward_state_if_complete \
+                "${unit}" "${dropin}" "${state}") \
+                || { echo 'cf-probe 转发状态无法建立恢复快照，拒绝拆除。' >&2; exit 1; }
             TX_FORWARD_MAY_CHANGE=yes
-            remove_cf_probe_forward_mode "${unit}" "${dropin}" \
+            remove_cf_probe_forward_mode "${unit}" "${dropin}" "${TX_FORWARD_SNAPSHOT}" \
                 || { echo 'cf-probe 转发模式未能安全拆除，正在恢复服务代理。' >&2; exit 1; }
         fi
         TX_LIST_MAY_CHANGE=yes

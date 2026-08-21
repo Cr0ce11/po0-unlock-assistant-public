@@ -2741,6 +2741,18 @@ cf_probe_forward_mode_present() {
     [[ -e ${directory} || -L ${directory} || -e ${unit_file} || -L ${unit_file} ]]
 }
 
+cf_probe_forward_mode_complete() {
+    local unit=$1 dropin=$2 directory hosts_file record_file unit_file
+    directory=$(cf_probe_forward_dir "${dropin}") || return 1
+    hosts_file=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+    record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+    managed_cf_probe_forward_dir "${directory}" \
+        && managed_cf_probe_forward_file "${hosts_file}" \
+        && managed_cf_probe_forward_file "${record_file}" \
+        && managed_cf_probe_forward_file "${unit_file}"
+}
+
 discard_cf_probe_forward_snapshot() {
     local snapshot=$1
     [[ -d ${snapshot} && ! -L ${snapshot} ]] || return 1
@@ -2792,6 +2804,15 @@ create_cf_probe_forward_snapshot() {
         return 1
     fi
     printf '%s\n' "${snapshot}"
+}
+
+# 外层服务事务只为完整、可恢复的状态建立快照。残缺但仍归本助手所有的状态
+# 不应在预检阶段被永久堵死：后续 prepare/remove 会逐件确认归属后安全清理。
+snapshot_cf_probe_forward_state_if_complete() {
+    local unit=$1 dropin=$2 parent=$3
+    cf_probe_forward_mode_present "${unit}" "${dropin}" || return 0
+    cf_probe_forward_mode_complete "${unit}" "${dropin}" || return 0
+    create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${parent}"
 }
 
 cf_probe_forward_restore_file() {
@@ -2866,8 +2887,8 @@ rollback_cf_probe_forward_snapshot() {
 
 # 启用转发模式。标准输出为 yes/no，表示本次是否新建了转发目录，供事务回滚判断。
 prepare_cf_probe_forward_mode() {
-    local unit=$1 dropin=$2
-    local directory hosts_file record_file unit_file unit_name snapshot=
+    local unit=$1 dropin=$2 external_snapshot=${3:-}
+    local directory hosts_file record_file unit_file unit_name snapshot= snapshot_owned=no
     local config host hosts_content record_content unit_content created=no files_written=no
     directory=$(cf_probe_forward_dir "${dropin}") || return 1
     hosts_file=$(cf_probe_forward_hosts_file "${dropin}") || return 1
@@ -2889,10 +2910,23 @@ prepare_cf_probe_forward_mode() {
         managed_cf_probe_forward_dir "${directory}" \
             || { echo '转发工作目录已存在且不是本助手创建的，拒绝复用。' >&2; return 1; }
     fi
-    if [[ -e ${unit_file} || -L ${unit_file} || -e ${directory} || -L ${directory} ]]; then
-        snapshot=$(create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${dropin}") \
-            || { echo '既有转发状态不完整或不属于本助手，拒绝复用。' >&2; return 1; }
-    elif ! cf_probe_forward_listen_available; then
+    if cf_probe_forward_mode_present "${unit}" "${dropin}"; then
+        if cf_probe_forward_mode_complete "${unit}" "${dropin}"; then
+            if [[ -n ${external_snapshot} ]]; then
+                [[ -d ${external_snapshot} && ! -L ${external_snapshot} ]] \
+                    || { echo '外层转发事务快照无效，拒绝改写既有状态。' >&2; return 1; }
+                snapshot=${external_snapshot}
+            else
+                snapshot=$(create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${dropin}") \
+                    || { echo '既有转发状态无法建立恢复快照，拒绝复用。' >&2; return 1; }
+                snapshot_owned=yes
+            fi
+        else
+            remove_cf_probe_forward_mode "${unit}" "${dropin}" \
+                || { echo '既有转发残缺状态无法安全清理，拒绝继续启用。' >&2; return 1; }
+        fi
+    fi
+    if [[ -z ${snapshot} ]] && ! cf_probe_forward_listen_available; then
         echo "本机 ${CF_PROBE_FORWARD_LISTEN_ADDRESS}:${CF_PROBE_FORWARD_LISTEN_PORT} 已被占用，拒绝启用转发模式。" >&2
         return 1
     fi
@@ -2910,17 +2944,20 @@ prepare_cf_probe_forward_mode() {
         || ! cf_probe_forward_write_file "${record_file}" "${record_content}" \
         || ! cf_probe_write_go_guard_file "${unit_file}" "${unit_content}"; then
         if [[ -n ${snapshot} ]]; then
-            rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
+            [[ ${snapshot_owned} == no ]] \
+                || rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
         else
             rm -f -- "${unit_file}" "${hosts_file}" "${record_file}"
             [[ ${created} == no ]] || rmdir -- "${directory}" 2>/dev/null || true
         fi
+        echo '转发模式文件写入失败，已撤销本次文件改写。' >&2
         return 1
     fi
     files_written=yes
     if ! systemctl daemon-reload || ! systemctl enable --now -- "${unit_name}" >/dev/null; then
         if [[ -n ${snapshot} ]]; then
-            rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
+            [[ ${snapshot_owned} == no ]] \
+                || rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
         elif [[ ${files_written} == yes ]]; then
             remove_cf_probe_forward_mode "${unit}" "${dropin}" \
                 || echo '严重警告：本次新建的转发状态未能自动清理，请人工检查。' >&2
@@ -2928,7 +2965,7 @@ prepare_cf_probe_forward_mode() {
         echo '转发单元未能启动，已撤销本次转发模式配置。' >&2
         return 1
     fi
-    if [[ -n ${snapshot} ]]; then
+    if [[ -n ${snapshot} && ${snapshot_owned} == yes ]]; then
         discard_cf_probe_forward_snapshot "${snapshot}" || return 1
     fi
     printf '%s\n' "${created}"
@@ -2985,8 +3022,9 @@ reconcile_cf_probe_forward_unit() {
 
 # 拆除转发模式：只动本助手写的东西，任何一处被人工改过都拒绝，避免误删他人文件。
 remove_cf_probe_forward_mode() {
-    local unit=$1 dropin=$2
+    local unit=$1 dropin=$2 external_snapshot=${3:-}
     local directory hosts_file record_file unit_file unit_name snapshot= active_state complete=yes
+    local snapshot_owned=no
     directory=$(cf_probe_forward_dir "${dropin}") || return 1
     hosts_file=$(cf_probe_forward_hosts_file "${dropin}") || return 1
     record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
@@ -3014,22 +3052,31 @@ remove_cf_probe_forward_mode() {
         complete=no
     fi
     if [[ ${complete} == yes ]]; then
-        snapshot=$(create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${dropin}") || return 1
+        if [[ -n ${external_snapshot} ]]; then
+            [[ -d ${external_snapshot} && ! -L ${external_snapshot} ]] || return 1
+            snapshot=${external_snapshot}
+        else
+            snapshot=$(create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${dropin}") || return 1
+            snapshot_owned=yes
+        fi
     fi
     if [[ -e ${unit_file} || -L ${unit_file} ]]; then
-        if ! systemctl disable --now -- "${unit_name}"; then
-            [[ -z ${snapshot} ]] || rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
+        if ! systemctl disable --now -- "${unit_name}" 1>&2; then
+            [[ -z ${snapshot} || ${snapshot_owned} == no ]] \
+                || rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
             return 1
         fi
         active_state=$(systemctl show -p ActiveState --value -- "${unit_name}" 2>/dev/null) || {
-            [[ -z ${snapshot} ]] || rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
+            [[ -z ${snapshot} || ${snapshot_owned} == no ]] \
+                || rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
             return 1
         }
         case "${active_state}" in
             inactive|failed) ;;
             *)
                 echo "转发单元停用后仍处于 ${active_state:-未知} 状态，拒绝删除文件。" >&2
-                [[ -z ${snapshot} ]] || rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
+                [[ -z ${snapshot} || ${snapshot_owned} == no ]] \
+                    || rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
                 return 1
                 ;;
         esac
@@ -3038,13 +3085,13 @@ remove_cf_probe_forward_mode() {
         || ! systemctl daemon-reload \
         || ! rm -f -- "${hosts_file}" "${record_file}" \
         || ! { [[ ! -d ${directory} ]] || rmdir -- "${directory}"; }; then
-        if [[ -n ${snapshot} ]]; then
+        if [[ -n ${snapshot} && ${snapshot_owned} == yes ]]; then
             rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
         fi
         return 1
     fi
     systemctl reset-failed -- "${unit_name}" >/dev/null 2>&1 || true
-    [[ -z ${snapshot} ]] || discard_cf_probe_forward_snapshot "${snapshot}"
+    [[ -z ${snapshot} || ${snapshot_owned} == no ]] || discard_cf_probe_forward_snapshot "${snapshot}"
 }
 
 cf_probe_forward_mode_active() {
@@ -3750,14 +3797,14 @@ case "${1:-}" in
             fi
             if [[ ${outbound_mode} == forward ]]; then
                 TX_FORWARD_DROPIN=${dropin}
-                if cf_probe_forward_mode_present "${unit}" "${dropin}"; then
-                    TX_FORWARD_SNAPSHOT=$(create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${state}") \
-                        || { echo '既有 cf-probe 转发状态不完整，拒绝在无法回退时复用。' >&2; exit 1; }
-                fi
+                TX_FORWARD_SNAPSHOT=$(snapshot_cf_probe_forward_state_if_complete \
+                    "${unit}" "${dropin}" "${state}") \
+                    || { echo '既有 cf-probe 转发状态无法建立恢复快照，拒绝复用。' >&2; exit 1; }
                 TX_FORWARD_MAY_CHANGE=yes
                 # 提前置位：即使收到信号中断在 prepare 中间，清理也会处理本次新建的残片。
                 TX_FORWARD_PREPARED=yes
-                prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
+                prepare_cf_probe_forward_mode \
+                    "${unit}" "${dropin}" "${TX_FORWARD_SNAPSHOT}" >/dev/null \
                     || { echo 'cf-probe 转发模式配置失败，正在撤销本次服务代理。' >&2; exit 1; }
                 cf_probe_forward_dropin_line "${dropin}" >>"${tmp}" \
                     || { echo 'cf-probe 转发模式的挂载配置写入失败，正在撤销本次服务代理。' >&2; exit 1; }
@@ -4141,10 +4188,11 @@ case "${1:-}" in
         fi
         if cf_probe_forward_mode_present "${unit}" "${dropin}"; then
             TX_FORWARD_DROPIN=${dropin}
-            TX_FORWARD_SNAPSHOT=$(create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${state}") \
-                || { echo 'cf-probe 转发状态不完整，拒绝在无法回退时拆除。' >&2; exit 1; }
+            TX_FORWARD_SNAPSHOT=$(snapshot_cf_probe_forward_state_if_complete \
+                "${unit}" "${dropin}" "${state}") \
+                || { echo 'cf-probe 转发状态无法建立恢复快照，拒绝拆除。' >&2; exit 1; }
             TX_FORWARD_MAY_CHANGE=yes
-            remove_cf_probe_forward_mode "${unit}" "${dropin}" \
+            remove_cf_probe_forward_mode "${unit}" "${dropin}" "${TX_FORWARD_SNAPSHOT}" \
                 || { echo 'cf-probe 转发模式未能安全拆除，正在恢复服务代理。' >&2; exit 1; }
         fi
         TX_LIST_MAY_CHANGE=yes
@@ -5154,7 +5202,7 @@ __PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
     exit_actual=$(sha256sum "${exit_new}" | awk '{print $1}')
     cn_entry_actual=$(sha256sum "${cn_entry_new}" | awk '{print $1}')
     [[ ${exit_actual} == 'bb75e1213278b7170d885038b790e7a2ef43ea13b0b9f38f3029e2262922b5d5' ]] || die '国外出口内置组件哈希校验失败。'
-    [[ ${cn_entry_actual} == '11b0706daf534a64a11528137e86439c1ae3e30dc8433d7b5f2e54464b4cf47e' ]] || die '国内入口内置组件哈希校验失败。'
+    [[ ${cn_entry_actual} == '2e92a92a8d4ccbfd5f9363c113d957fe58d4d72086927b314da11f80dafd30b1' ]] || die '国内入口内置组件哈希校验失败。'
     /bin/bash -n "${exit_new}" || die '国外出口内置组件语法检查失败。'
     /bin/bash -n "${cn_entry_new}" || die '国内入口内置组件语法检查失败。'
     mv "${exit_new}" "${EXIT_ROLE}"
@@ -5185,7 +5233,7 @@ bundle_self_test() {
     printf 'Po0 单文件版本=%s\n' '2.5.30'
     printf 'Po0 单文件版本类型=%s\n' "${SCRIPT_EDITION_LABEL}"
     printf 'overseas-exit-role SHA-256=%s\n' 'bb75e1213278b7170d885038b790e7a2ef43ea13b0b9f38f3029e2262922b5d5'
-    printf 'cn-entry-role SHA-256=%s\n' '11b0706daf534a64a11528137e86439c1ae3e30dc8433d7b5f2e54464b4cf47e'
+    printf 'cn-entry-role SHA-256=%s\n' '2e92a92a8d4ccbfd5f9363c113d957fe58d4d72086927b314da11f80dafd30b1'
     printf '%s\n'         "scan-agents -> cn-entry:${CN_ENTRY_CMD_SCAN}"         "rollback[1] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_SERVICES}"         "rollback[2] -> overseas-exit:${EXIT_CMD_ROLLBACK}"         "rollback[3] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_FINALIZE}"         "status -> cn-entry:${CN_ENTRY_CMD_STATUS}"         "status -> overseas-exit:${EXIT_CMD_STATUS}"         "health -> cn-entry:${CN_ENTRY_CMD_HEALTH}"         "health -> overseas-exit:${EXIT_CMD_HEALTH}"         "repair -> overseas-exit:${EXIT_CMD_REPAIR}"
     printf '%s\n' 'SELF_TEST=PASS'
 }
