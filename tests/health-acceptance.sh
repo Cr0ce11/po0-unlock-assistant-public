@@ -503,12 +503,17 @@ test_overseas_rollback_seals_active_safely() (
     printf '%s\n' no >"${fixture_state}/tinyproxy-enabled-before"
     printf '%s\n' "${fixture_state}" >"${ACTIVE_FILE}"
 
+    eval "$(sed -n '/^stop_core_service_for_rollback() {/,/^}/p' "${EXIT_SOURCE}")"
     eval "$(sed -n '/^rollback() {/,/^}/p' "${EXIT_SOURCE}")"
     require_root() { :; }
     active_state() { printf '%s\n' "${fixture_state}"; }
     remove_managed_file() { :; }
     remove_managed_public_key_file() { :; }
-    systemctl() { :; }
+    systemctl() {
+        if [[ ${1:-} == show ]]; then
+            printf '%s\n' inactive
+        fi
+    }
     apt-get() { :; }
     log() { printf '%s\n' "$*"; }
     die() { printf '%s\n' "$*" >&2; exit 1; }
@@ -537,6 +542,119 @@ test_overseas_rollback_seals_active_safely() (
     out=$( (rollback) 2>&1 ) || rc=$?
     [[ ${rc} -ne 0 ]] || { fail '封存失败时回滚没有中止'; return 1; }
     assert_not_contains "${out}" '国外出口已回滚' '封存失败仍然报告已回滚' || return 1
+)
+
+test_overseas_rollback_requires_stopped_core_services() (
+    local case_dir fixture_state cleanup_log rc out failure_mode=command
+    local tunnel_active=yes proxy_active=yes
+    case_dir=$(mktemp -d "${TMPDIR:-/tmp}/po0-rollback-stop-gate.XXXXXXXX")
+    trap 'rm -rf -- "${case_dir}"' EXIT
+    fixture_state=${case_dir}/20260821T010203Z
+    mkdir -p -- "${fixture_state}"
+    STATE_ROOT=${case_dir}
+    ACTIVE_FILE=${case_dir}/ACTIVE
+    TUNNEL_UNIT=${case_dir}/tunnel.service
+    PROXY_UNIT=${case_dir}/proxy.service
+    PROXY_CONF=${case_dir}/proxy.conf
+    KEY_FILE=${case_dir}/key
+    KNOWN_HOSTS=${case_dir}/known-hosts
+    cleanup_log=${case_dir}/cleanup.log
+    printf '%s\n' no >"${fixture_state}/tinyproxy-installed-before"
+    printf '%s\n' no >"${fixture_state}/tinyproxy-bin-installed-before"
+    printf '%s\n' no >"${fixture_state}/tinyproxy-active-before"
+    printf '%s\n' no >"${fixture_state}/tinyproxy-enabled-before"
+    printf '%s\n' "${fixture_state}" >"${ACTIVE_FILE}"
+
+    eval "$(sed -n '/^stop_core_service_for_rollback() {/,/^}/p' "${EXIT_SOURCE}")"
+    eval "$(sed -n '/^rollback() {/,/^}/p' "${EXIT_SOURCE}")"
+    require_root() { :; }
+    active_state() { printf '%s\n' "${fixture_state}"; }
+    remove_managed_file() { printf '%s\n' "$1" >>"${cleanup_log}"; }
+    remove_managed_public_key_file() { printf '%s\n' "$1" >>"${cleanup_log}"; }
+    apt-get() { :; }
+    log() { printf '%s\n' "$*"; }
+    die() { printf '%s\n' "$*" >&2; exit 1; }
+    systemctl() {
+        local action=${1:-} unit=${*: -1}
+        case "${action}" in
+            disable)
+                if [[ ${unit} == po0-unlock-reverse-tunnel.service ]]; then
+                    case "${failure_mode}" in
+                        command) return 1 ;;
+                        still-active) return 0 ;;
+                        query|proxy-command|none) tunnel_active=no; return 0 ;;
+                    esac
+                fi
+                [[ ${failure_mode} != proxy-command ]] || return 1
+                proxy_active=no
+                return 0
+                ;;
+            show)
+                [[ ${failure_mode} != query ]] || return 1
+                if [[ ${unit} == po0-unlock-reverse-tunnel.service ]]; then
+                    [[ ${tunnel_active} == yes ]] && printf '%s\n' active || printf '%s\n' inactive
+                else
+                    [[ ${proxy_active} == yes ]] && printf '%s\n' active || printf '%s\n' inactive
+                fi
+                return 0
+                ;;
+            *) return 0 ;;
+        esac
+    }
+
+    rc=0
+    out=$(rollback 2>&1) || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '核心服务停用命令失败时完整回滚仍然成功'; return 1; }
+    [[ ! -s ${cleanup_log} ]] \
+        || { fail '核心服务停用命令失败后仍删除了国外出口材料'; return 1; }
+    [[ -f ${ACTIVE_FILE} && ! -e ${fixture_state}/ACTIVE.closed ]] \
+        || { fail '核心服务停用命令失败后 ACTIVE 状态被封存'; return 1; }
+    [[ ! -e ${fixture_state}/rolled-back-at ]] \
+        || { fail '核心服务停用命令失败后仍写入回滚完成时间'; return 1; }
+    assert_contains "${out}" '反向隧道服务停用失败' \
+        '核心服务停用失败原因不明确' || return 1
+
+    failure_mode='proxy-command'
+    rc=0
+    out=$(rollback 2>&1) || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '国外出口代理停用失败时完整回滚仍然成功'; return 1; }
+    [[ ! -s ${cleanup_log} ]] \
+        || { fail '国外出口代理停用失败后仍删除了国外出口材料'; return 1; }
+    [[ -f ${ACTIVE_FILE} && ! -e ${fixture_state}/ACTIVE.closed ]] \
+        || { fail '国外出口代理停用失败后 ACTIVE 状态被封存'; return 1; }
+    assert_contains "${out}" '国外出口代理服务停用失败' \
+        '国外出口代理停用失败原因不明确' || return 1
+
+    failure_mode='still-active'
+    rc=0
+    out=$(rollback 2>&1) || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '核心服务仍在运行时完整回滚仍然成功'; return 1; }
+    [[ ! -s ${cleanup_log} ]] \
+        || { fail '核心服务仍在运行时仍删除了国外出口材料'; return 1; }
+    [[ -f ${ACTIVE_FILE} && ! -e ${fixture_state}/ACTIVE.closed ]] \
+        || { fail '核心服务仍在运行时 ACTIVE 状态被封存'; return 1; }
+    assert_contains "${out}" '反向隧道服务仍在运行' \
+        '核心服务未停止的原因不明确' || return 1
+
+    failure_mode=query
+    rc=0
+    out=$(rollback 2>&1) || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '核心服务状态无法确认时完整回滚仍然成功'; return 1; }
+    [[ ! -s ${cleanup_log} ]] \
+        || { fail '核心服务状态无法确认时仍删除了国外出口材料'; return 1; }
+    [[ -f ${ACTIVE_FILE} && ! -e ${fixture_state}/ACTIVE.closed ]] \
+        || { fail '核心服务状态无法确认时 ACTIVE 状态被封存'; return 1; }
+    assert_contains "${out}" '无法确认反向隧道服务已经停止' \
+        '核心服务状态无法确认的原因不明确' || return 1
+
+    failure_mode=none
+    rc=0
+    out=$(rollback 2>&1) || rc=$?
+    [[ ${rc} -eq 0 ]] || { fail "修正停止条件后无法安全重试完整回滚：${out}"; return 1; }
+    [[ $(wc -l <"${cleanup_log}" | tr -d '[:space:]') == 6 ]] \
+        || { fail '安全重试没有清理全部国外出口材料'; return 1; }
+    [[ ! -e ${ACTIVE_FILE} && -f ${fixture_state}/ACTIVE.closed ]] \
+        || { fail '安全重试没有正确封存 ACTIVE 状态'; return 1; }
 )
 
 # 转发模式的结论必须真正走到健康检查的输出里。BUG-019 就是这条路断了：判定函数
@@ -1960,6 +2078,7 @@ main() {
     run_case '安全修复的用户确认闸门实跑验证' test_safe_repair_confirmation_at_runtime
     run_case '健康检查核对隧道单元的启动参数' test_health_verifies_tunnel_exec_start
     run_case '国外出口回滚安全封存 ACTIVE 记录' test_overseas_rollback_seals_active_safely
+    run_case '国外出口完整回滚要求核心服务确认停止' test_overseas_rollback_requires_stopped_core_services
     run_case '两端健康检查的返回码实跑覆盖' test_health_exit_codes_are_runtime_covered
     run_case '转发模式结论真正走到健康检查输出' test_forward_mode_verdict_reaches_health_output
     run_case '安全修复校验隧道单元的主机密钥参数' test_repair_verifies_tunnel_host_key_options
