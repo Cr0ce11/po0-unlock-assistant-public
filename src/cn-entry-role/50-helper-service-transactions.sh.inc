@@ -243,11 +243,19 @@ enable_transaction_cleanup() {
             remove_cf_probe_go_guard_units "${TX_UNIT}" "${TX_COMPAT_DIR}" \
                 || echo '警告：未能清理 cf-probe 动态配置守卫，请人工检查。' >&2
         fi
-        # 转发模式的目录、专属 hosts 与转发单元都是本次事务新建的，未提交时整套撤掉；
-        # 拆除函数只动带本助手标记的文件，人工改过的一律拒绝删除。
-        if [[ ${TX_FORWARD_PREPARED:-no} == yes && -n ${TX_FORWARD_DROPIN:-} ]]; then
+        # 复用既有转发状态时从快照恢复；只有本次全新创建时才整套拆除。
+        # 快照在 prepare 前建立，所以启动失败和后续服务代理失败都不会误删旧配置。
+        if [[ ${TX_FORWARD_MAY_CHANGE:-no} == yes \
+            && -n ${TX_FORWARD_SNAPSHOT:-} && -n ${TX_FORWARD_DROPIN:-} ]]; then
+            if restore_cf_probe_forward_snapshot "${TX_UNIT}" "${TX_FORWARD_DROPIN}" "${TX_FORWARD_SNAPSHOT}"; then
+                discard_cf_probe_forward_snapshot "${TX_FORWARD_SNAPSHOT}" \
+                    || echo '警告：既有转发状态已恢复，但事务快照未能清理。' >&2
+            else
+                echo "严重警告：未能恢复 cf-probe 既有转发状态；快照保留在 ${TX_FORWARD_SNAPSHOT}。" >&2
+            fi
+        elif [[ ${TX_FORWARD_PREPARED:-no} == yes && -n ${TX_FORWARD_DROPIN:-} ]]; then
             remove_cf_probe_forward_mode "${TX_UNIT}" "${TX_FORWARD_DROPIN}" \
-                || echo '警告：未能清理 cf-probe 转发模式配置，请人工检查。' >&2
+                || echo '警告：未能清理本次新建的 cf-probe 转发模式配置，请人工检查。' >&2
         fi
         if [[ ${TX_KOMARI_IDENTITY_CREATED:-no} == yes \
             && -n ${TX_KOMARI_IDENTITY_DIR:-} ]]; then
@@ -297,6 +305,16 @@ disable_transaction_cleanup() {
     set +e
     rm -f "${TX_MANAGED_TMP:-}"
     if [[ ${TX_COMMITTED:-no} != yes ]]; then
+        # 转发三件套必须先于主代理 drop-in 恢复：Agent 重启时会立即使用专属 hosts。
+        if [[ ${TX_FORWARD_MAY_CHANGE:-no} == yes \
+            && -n ${TX_FORWARD_SNAPSHOT:-} && -n ${TX_FORWARD_DROPIN:-} ]]; then
+            if restore_cf_probe_forward_snapshot "${TX_UNIT}" "${TX_FORWARD_DROPIN}" "${TX_FORWARD_SNAPSHOT}"; then
+                discard_cf_probe_forward_snapshot "${TX_FORWARD_SNAPSHOT}" \
+                    || echo '警告：转发状态已恢复，但事务快照未能清理。' >&2
+            else
+                echo "严重警告：未能恢复 cf-probe 转发状态；快照保留在 ${TX_FORWARD_SNAPSHOT}。" >&2
+            fi
+        fi
         if [[ ${TX_DROPIN_MAY_BE_REMOVED:-no} == yes ]]; then
             if [[ ${TX_CF_GO_TARGETS_RESTORED:-no} == yes \
                 && -n ${TX_COMPAT_DIR:-} ]]; then

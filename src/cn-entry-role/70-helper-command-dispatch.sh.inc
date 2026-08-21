@@ -141,6 +141,8 @@ case "${1:-}" in
         TX_KOMARI_IDENTITY_CREATED=no
         TX_FORWARD_DROPIN=
         TX_FORWARD_PREPARED=no
+        TX_FORWARD_SNAPSHOT=
+        TX_FORWARD_MAY_CHANGE=no
         trap 'enable_transaction_cleanup "$?"' EXIT
         trap 'exit 130' INT
         trap 'exit 143' TERM
@@ -168,9 +170,15 @@ case "${1:-}" in
             fi
             if [[ ${outbound_mode} == forward ]]; then
                 TX_FORWARD_DROPIN=${dropin}
+                if cf_probe_forward_mode_present "${unit}" "${dropin}"; then
+                    TX_FORWARD_SNAPSHOT=$(create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${state}") \
+                        || { echo '既有 cf-probe 转发状态不完整，拒绝在无法回退时复用。' >&2; exit 1; }
+                fi
+                TX_FORWARD_MAY_CHANGE=yes
+                # 提前置位：即使收到信号中断在 prepare 中间，清理也会处理本次新建的残片。
+                TX_FORWARD_PREPARED=yes
                 prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
                     || { echo 'cf-probe 转发模式配置失败，正在撤销本次服务代理。' >&2; exit 1; }
-                TX_FORWARD_PREPARED=yes
                 cf_probe_forward_dropin_line "${dropin}" >>"${tmp}" \
                     || { echo 'cf-probe 转发模式的挂载配置写入失败，正在撤销本次服务代理。' >&2; exit 1; }
             fi
@@ -219,6 +227,10 @@ case "${1:-}" in
         mv "${managed_tmp}" "${state}/managed-services"
         TX_COMMITTED=yes
         trap - EXIT INT TERM HUP
+        if [[ -n ${TX_FORWARD_SNAPSHOT} ]]; then
+            discard_cf_probe_forward_snapshot "${TX_FORWARD_SNAPSHOT}" \
+                || echo "警告：服务代理已启用，但转发事务快照 ${TX_FORWARD_SNAPSHOT} 未能清理。" >&2
+        fi
         echo "已为 ${unit} 启用国外出口。"
         [[ -z ${compat_dir} ]] \
             || if [[ -f ${compat_dir}/go-record ]]; then
@@ -249,6 +261,7 @@ case "${1:-}" in
         komari_identity_created=no
         compat_created=no
         compat_curl_created=no
+        forward_active=no
         original_running=no
         service_is_running "${unit}" && original_running=yes
         report_ip=$(report_ipv4_from_dropin "${dropin_file}" || true)
@@ -301,11 +314,9 @@ case "${1:-}" in
             fi
             # 重写 drop-in 会丢掉挂载行，转发模式已启用时必须原样补回，否则静默失效。
             if cf_probe_forward_mode_active "${dropin}"; then
+                forward_active=yes
                 cf_probe_forward_dropin_line "${dropin}" >>"${tmp}" \
                     || { echo 'cf-probe 转发模式的挂载配置写入失败，正在恢复更新前配置。' >&2; exit 1; }
-                # 已落地的转发单元不会随升级自己更新，在这里收敛才能补上开机自启。
-                reconcile_cf_probe_forward_unit "${unit}" "${dropin}" \
-                    || { echo 'cf-probe 转发单元未能收敛到当前版本，正在恢复更新前配置。' >&2; exit 1; }
             fi
         fi
         if is_komari_service "${unit}"; then
@@ -353,6 +364,12 @@ case "${1:-}" in
             && ! commit_cf_probe_go_latency_compat "${compat_dir}"; then
             echo 'cf-probe 已恢复运行，但测速目标事务未能安全提交，正在恢复更新前配置。' >&2
             exit 1
+        fi
+        # 把转发单元收敛放到最后一个可能失败的阶段；函数自身会恢复旧 unit 与
+        # 启用/运行状态，因此它一旦成功，后面只剩事务提交，不再出现半更新窗口。
+        if [[ ${forward_active} == yes ]]; then
+            reconcile_cf_probe_forward_unit "${unit}" "${dropin}" \
+                || { echo 'cf-probe 转发单元未能收敛到当前版本，正在恢复更新前配置。' >&2; exit 1; }
         fi
         TX_COMMITTED=yes
         trap - EXIT INT TERM HUP
@@ -508,6 +525,9 @@ case "${1:-}" in
         TX_DROPIN_MAY_BE_REMOVED=no
         TX_DROPIN_WAS_MISSING=${dropin_missing}
         TX_LIST_MAY_CHANGE=no
+        TX_FORWARD_DROPIN=
+        TX_FORWARD_SNAPSHOT=
+        TX_FORWARD_MAY_CHANGE=no
         trap 'disable_transaction_cleanup "$?"' EXIT
         trap 'exit 130' INT
         trap 'exit 143' TERM
@@ -539,11 +559,23 @@ case "${1:-}" in
             remove_legacy_komari_latency_compat "${state}" "${unit}" \
                 || { echo '旧版 Komari 延迟转发未能安全清理，正在恢复服务代理。' >&2; exit 1; }
         fi
+        if cf_probe_forward_mode_present "${unit}" "${dropin}"; then
+            TX_FORWARD_DROPIN=${dropin}
+            TX_FORWARD_SNAPSHOT=$(create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${state}") \
+                || { echo 'cf-probe 转发状态不完整，拒绝在无法回退时拆除。' >&2; exit 1; }
+            TX_FORWARD_MAY_CHANGE=yes
+            remove_cf_probe_forward_mode "${unit}" "${dropin}" \
+                || { echo 'cf-probe 转发模式未能安全拆除，正在恢复服务代理。' >&2; exit 1; }
+        fi
         TX_LIST_MAY_CHANGE=yes
         mv "${managed_tmp}" "${state}/managed-services"
         TX_COMMITTED=yes
         trap - EXIT INT TERM HUP
         rm -f "${backup}"
+        if [[ -n ${TX_FORWARD_SNAPSHOT} ]]; then
+            discard_cf_probe_forward_snapshot "${TX_FORWARD_SNAPSHOT}" \
+                || echo "警告：国外出口已移除，但转发事务快照 ${TX_FORWARD_SNAPSHOT} 未能清理。" >&2
+        fi
         if [[ -e ${compat_dir} || -L ${compat_dir} ]]; then
             remove_cf_probe_latency_compat "${compat_dir}" \
                 || echo '警告：国外出口已移除，但 cf-probe 兼容文件未能清理。' >&2
@@ -554,11 +586,7 @@ case "${1:-}" in
                 || echo '警告：国外出口已移除，但 Komari 身份守卫未能清理。' >&2
             rmdir "${dropin}" 2>/dev/null || true
         fi
-        if cf_probe_forward_mode_active "${dropin}"; then
-            remove_cf_probe_forward_mode "${unit}" "${dropin}" \
-                || echo '警告：国外出口已移除，但 cf-probe 转发模式未能清理。' >&2
-            rmdir "${dropin}" 2>/dev/null || true
-        fi
+        rmdir "${dropin}" 2>/dev/null || true
         if [[ ${original_running} == yes ]]; then
             echo "已移除 ${unit} 的国外出口，服务保持 active/running。"
         else
