@@ -55,7 +55,8 @@ case "${1:-}" in
         valid_helper_service_unit "${unit}" \
             || { echo '服务名必须是合法的 .service 单元名。' >&2; exit 2; }
         dropin="/etc/systemd/system/${unit}.d"
-        cf_probe_forward_mode_active "${dropin}" || exit 3
+        cf_probe_forward_mode_present "${unit}" "${dropin}" || exit 3
+        cf_probe_forward_mode_active "${unit}" "${dropin}" || exit 1
         cf_probe_forward_health "${unit}" "${dropin}"
         ;;
     reconcile-cf-probe)
@@ -170,6 +171,8 @@ case "${1:-}" in
             fi
             if [[ ${outbound_mode} == forward ]]; then
                 TX_FORWARD_DROPIN=${dropin}
+                cf_probe_forward_state_safe_to_prepare "${unit}" "${dropin}" \
+                    || { echo '既有 cf-probe 转发状态的权限或内容已变化，拒绝覆盖。' >&2; exit 1; }
                 TX_FORWARD_SNAPSHOT=$(snapshot_cf_probe_forward_state_if_complete \
                     "${unit}" "${dropin}" "${state}") \
                     || { echo '既有 cf-probe 转发状态无法建立恢复快照，拒绝复用。' >&2; exit 1; }
@@ -313,7 +316,9 @@ case "${1:-}" in
                 TX_COMPAT_CURL_CREATED=no
             fi
             # 重写 drop-in 会丢掉挂载行，转发模式已启用时必须原样补回，否则静默失效。
-            if cf_probe_forward_mode_active "${dropin}"; then
+            if cf_probe_forward_mode_present "${unit}" "${dropin}"; then
+                cf_probe_forward_mode_active "${unit}" "${dropin}" \
+                    || { echo 'cf-probe 转发模式状态不完整或已被修改，拒绝刷新。' >&2; exit 1; }
                 forward_active=yes
                 cf_probe_forward_dropin_line "${dropin}" >>"${tmp}" \
                     || { echo 'cf-probe 转发模式的挂载配置写入失败，正在恢复更新前配置。' >&2; exit 1; }
