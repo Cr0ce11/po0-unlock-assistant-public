@@ -56,6 +56,11 @@ CN_ENTRY_TIMEOUT_FINALIZE=120
 CN_ENTRY_TIMEOUT_REFRESH=300
 CN_ENTRY_TIMEOUT_ROLLBACK_SERVICES=300
 CN_ENTRY_TIMEOUT_ROLLBACK_FINALIZE=120
+# `check` 的工作阶段最多占 165 秒，另给 TERM/EXIT 陷阱 15 秒清理远端临时组件、
+# SSH 控制会话和操作锁；外部调用者看到的总体最坏时限因此是 180 秒。
+READONLY_CHECK_WORK_TIMEOUT=165
+READONLY_CHECK_CLEANUP_GRACE=15
+READONLY_CHECK_TOTAL_TIMEOUT=180
 EXIT_CMD_STATUS=status
 EXIT_CMD_HEALTH=health
 EXIT_CMD_REPAIR=repair
@@ -5672,7 +5677,7 @@ maybe_migrate_config() {
     local requested_command=${1:-}
     case "${requested_command}" in
         # 只读子命令不得触发任何写路径：从候选副本运行 check 时也不该接管已安装脚本。
-        self-test|__extract-role|check) return 0 ;;
+        self-test|__extract-role|check|__readonly-check-inner) return 0 ;;
     esac
     valid_release_version "${SCRIPT_VERSION}" || return 0
     is_root || return 0
@@ -5885,7 +5890,8 @@ cleanup_cn_entry_session() {
         if cn_entry_control_dir_safe "${directory}"; then
             attempt_log=${directory}/${CN_ENTRY_ATTEMPT_LOG_NAME}
             [[ -z ${path} ]] \
-                || ssh -S "${path}" -O exit localhost >/dev/null 2>&1 \
+                || timeout --kill-after=2s 5s ssh -S "${path}" -O exit localhost \
+                    >/dev/null 2>&1 \
                 || true
             [[ -z ${path} || ${path%/*} != "${directory}" ]] \
                 || rm -f -- "${path}" \
@@ -5979,6 +5985,20 @@ ssh_cn_entry_command() {
     timeout --foreground --kill-after=5s "${timeout_seconds}s" ssh \
         -S "${CN_ENTRY_CONTROL_PATH}" -o ControlMaster=no \
         -o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes \
+        -o BindAddress="${EXIT_PRIVATE_IP}" -i "${ADMIN_KEY}" \
+        -o GlobalKnownHostsFile=/dev/null \
+        -o UserKnownHostsFile="${ADMIN_KNOWN_HOSTS}" -o StrictHostKeyChecking=yes \
+        -p "${CN_ENTRY_SSH_PORT}" "${CN_ENTRY_TARGET}" "$@"
+}
+
+# 仅用于退出清理：绝不重新建连，避免总时限到期后清理动作又触发三轮 SSH 重试。
+ssh_cn_entry_existing_session_command() {
+    local timeout_seconds=$1
+    shift
+    [[ ${timeout_seconds} =~ ^[1-9][0-9]*$ && -S ${CN_ENTRY_CONTROL_PATH:-} ]] || return 1
+    timeout --foreground --kill-after=2s "${timeout_seconds}s" ssh \
+        -S "${CN_ENTRY_CONTROL_PATH}" -o ControlMaster=no \
+        -o BatchMode=yes -o ConnectTimeout=5 -o IdentitiesOnly=yes \
         -o BindAddress="${EXIT_PRIVATE_IP}" -i "${ADMIN_KEY}" \
         -o GlobalKnownHostsFile=/dev/null \
         -o UserKnownHostsFile="${ADMIN_KNOWN_HOSTS}" -o StrictHostKeyChecking=yes \
@@ -8076,7 +8096,7 @@ maybe_handoff_to_official_entry() {
     local requested_command=${1:-} installed_version installed_edition
     case "${requested_command}" in
         # 只读子命令不得触发任何写路径：从候选副本运行 check 时也不该接管已安装脚本。
-        self-test|__extract-role|check) return 0 ;;
+        self-test|__extract-role|check|__readonly-check-inner) return 0 ;;
     esac
     valid_release_version "${SCRIPT_VERSION}" || return 0
     is_root || return 0
@@ -8770,13 +8790,14 @@ readonly_check_report_tool_error() {
 
 readonly_check() (
     local mode=${1:-human} exit_output= entry_output= config_error=
-    local remote= remote_temporary=no line level name detail key
+    local remote= remote_temporary=no remote_command line level name detail key
     local ok_count=0 warn_count=0 error_count=0 json_items= attention=
 
     cleanup_readonly_check() {
         if [[ ${remote_temporary} == yes ]] \
             && valid_cn_entry_scan_temp_path "${remote:-}"; then
-            ssh_cn_entry "rm -f -- '${remote}'" >/dev/null 2>&1 || true
+            ssh_cn_entry_existing_session_command 5 "rm -f -- '${remote}'" \
+                >/dev/null 2>&1 || true
             remote=
         fi
     }
@@ -8814,8 +8835,14 @@ readonly_check() (
         readonly_check_report_tool_error "${mode}" '无法选择当前国内入口组件。'
         return "${READONLY_CHECK_TOOL_ERROR}"
     fi
+    remote_command="PO0_HEALTH_TSV=yes '${remote}' '${CN_ENTRY_CMD_HEALTH}'"
+    if [[ ${remote_temporary} == yes ]]; then
+        # 远端自身也负责删除临时组件；即使本地总时限终止 SSH，远端 90 秒内到期时
+        # EXIT 陷阱仍会清理。外层清理保留为正常返回和建连异常时的第二道兜底。
+        remote_command="tmp='${remote}'; trap 'rm -f -- \"\${tmp}\"' EXIT; ${remote_command}"
+    fi
     entry_output=$(ssh_cn_entry_component "${CN_ENTRY_TIMEOUT_HEALTH}" read-only '只读状态检查' \
-        "PO0_HEALTH_TSV=yes '${remote}' '${CN_ENTRY_CMD_HEALTH}'" 2>/dev/null) || true
+        "${remote_command}" 2>/dev/null) || true
     if ! grep -q '^PO0LINE' <<<"${entry_output}"; then
         readonly_check_report_tool_error "${mode}" '国内入口检查没有返回可解析的结果。'
         return "${READONLY_CHECK_TOOL_ERROR}"
@@ -8867,13 +8894,37 @@ readonly_check() (
 )
 
 run_readonly_check() {
-    local mode=human rc=0
+    local mode=human rc=0 output=
     case "${1:-}" in
         '') ;;
         --json) mode=json ;;
         *) usage; exit 2 ;;
     esac
-    run_cn_entry_operation readonly_check "${mode}" || rc=$?
+    if ! command -v timeout >/dev/null 2>&1; then
+        readonly_check_report_tool_error "${mode}" '国外出口缺少 timeout，无法保证检查总体时限。'
+        return 3
+    fi
+    if [[ ! ${READONLY_CHECK_WORK_TIMEOUT} =~ ^[1-9][0-9]*$ \
+        || ! ${READONLY_CHECK_CLEANUP_GRACE} =~ ^[1-9][0-9]*$ \
+        || ! ${READONLY_CHECK_TOTAL_TIMEOUT} =~ ^[1-9][0-9]*$ \
+        || $((READONLY_CHECK_WORK_TIMEOUT + READONLY_CHECK_CLEANUP_GRACE)) \
+            -ne READONLY_CHECK_TOTAL_TIMEOUT ]]; then
+        readonly_check_report_tool_error "${mode}" '检查总体时限配置无效。'
+        return 3
+    fi
+    # 不使用 --foreground：timeout 建立独立进程组，达到工作预算时会同时通知主控、
+    # SSH 和远端组件包装进程；各层 TERM/EXIT 陷阱随后在清理预留时间内收尾。
+    output=$(timeout --kill-after="${READONLY_CHECK_CLEANUP_GRACE}s" \
+        "${READONLY_CHECK_WORK_TIMEOUT}s" /bin/bash "${SCRIPT_PATH}" \
+        __readonly-check-inner "${mode}") || rc=$?
+    if (( rc == 124 || rc == 137 )); then
+        readonly_check_report_tool_error "${mode}" \
+            "检查超过 ${READONLY_CHECK_TOTAL_TIMEOUT} 秒总体时限（工作预算 ${READONLY_CHECK_WORK_TIMEOUT} 秒，另预留 ${READONLY_CHECK_CLEANUP_GRACE} 秒清理临时文件、SSH 会话和操作锁）。"
+        return 3
+    fi
+    if (( rc >= READONLY_CHECK_OK && rc <= READONLY_CHECK_TOOL_ERROR )); then
+        printf '%s\n' "${output}"
+    fi
     case "${rc}" in
         "${READONLY_CHECK_OK}") return 0 ;;
         "${READONLY_CHECK_WARN}") return 1 ;;
@@ -8924,6 +8975,10 @@ case "${1:-}" in
     scan-agents) run_cn_entry_operation scan_agent_services ;;
     status|health) run_cn_entry_operation health_check ;;
     check) run_readonly_check "${2:-}" ;;
+    __readonly-check-inner)
+        [[ $# -eq 2 && ( ${2:-} == human || ${2:-} == json ) ]] || exit "${READONLY_CHECK_TOOL_ERROR}"
+        run_cn_entry_operation readonly_check "$2"
+        ;;
     diagnose) run_cn_entry_operation diagnostic_report ;;
     raw-status) run_cn_entry_operation status_all ;;
     rollback) run_cn_entry_operation rollback_all direct ;;

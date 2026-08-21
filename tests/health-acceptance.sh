@@ -69,6 +69,117 @@ test_read_only_check_contract() {
     done
 }
 
+# `po0 check` 给定时巡检使用，局部超时相加仍可能把整次调用拖得不可预测。
+# 这里用真实 sleep 挂住被检查进程，确认外层总预算会终止整个进程组、映射为退出码 3，
+# 且 TERM/EXIT 清理仍有时间处理远端临时组件、SSH 控制会话和操作锁。
+test_readonly_check_total_deadline_and_cleanup() (
+    local wrapper readonly_body session_cleanup fixture state output rc=0 started elapsed
+    wrapper=$(sed -n '/^run_readonly_check() {/,/^}/p' "${SETUP_SOURCE}")
+    readonly_body=$(sed -n '/^readonly_check() (/,/^)/p' "${SETUP_SOURCE}")
+    session_cleanup=$(sed -n '/^cleanup_cn_entry_session() {/,/^}/p' "${SETUP_SOURCE}")
+    assert_contains "${wrapper}" 'timeout --kill-after=' \
+        '只读检查还没有整次调用的总时限' || return 1
+    assert_contains "${wrapper}" '__readonly-check-inner' \
+        '总时限没有包住完整的只读检查入口' || return 1
+    assert_contains "${readonly_body}" "trap 'rm -f --" \
+        '临时国内入口组件没有远端 EXIT 清理兜底' || return 1
+    assert_contains "${readonly_body}" 'ssh_cn_entry_existing_session_command 5' \
+        '总时限退出后清理临时组件仍可能触发重新建连' || return 1
+    assert_contains "${session_cleanup}" 'timeout --kill-after=2s 5s ssh' \
+        'SSH 控制会话关闭没有被限制在清理预留时间内' || return 1
+
+    state=$(mktemp -d "${TMPDIR:-/tmp}/po0-health-deadline.XXXXXXXX") || return 1
+    cleanup_deadline_fixture() {
+        case "${state}" in
+            "${TMPDIR:-/tmp}"/po0-health-deadline.*) rm -rf -- "${state}" ;;
+            *) fail "拒绝清理异常总时限夹具路径：${state}" ;;
+        esac
+    }
+    trap cleanup_deadline_fixture EXIT
+    fixture=${state}/hung-check.sh
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'set -Eeuo pipefail' \
+        'state=${BASH_SOURCE[0]%/*}' \
+        '[[ ${1:-} == __readonly-check-inner ]]' \
+        'sleeper=' \
+        'cleanup_all() {' \
+        '  [[ -z ${sleeper} ]] || kill "${sleeper}" 2>/dev/null || true' \
+        '  [[ -z ${sleeper} ]] || wait "${sleeper}" 2>/dev/null || true' \
+        '  touch "${state}/remote-clean" "${state}/control-clean" "${state}/lock-clean"' \
+        '}' \
+        'trap cleanup_all EXIT' \
+        'trap "exit 143" TERM' \
+        'touch "${state}/started"' \
+        'sleep 30 &' \
+        'sleeper=$!' \
+        'wait "${sleeper}"' >"${fixture}"
+    chmod 0700 "${fixture}"
+
+    readonly_check_report_tool_error() {
+        local mode=$1 reason=$2
+        if [[ ${mode} == json ]]; then
+            printf '{"overall":"tool_error","error":"%s"}\n' "${reason}"
+        else
+            printf 'Po0 状态：检查未完成\n原因：%s\n' "${reason}"
+        fi
+    }
+    READONLY_CHECK_WORK_TIMEOUT=1
+    READONLY_CHECK_CLEANUP_GRACE=2
+    READONLY_CHECK_TOTAL_TIMEOUT=3
+    SCRIPT_PATH=${fixture}
+    # macOS 默认没有 GNU timeout；这个夹具函数真的启动、等待并终止子进程，返回码
+    # 与 GNU timeout 一致，不把 sleep 替换成立即成功的空桩。
+    timeout() {
+        local grace=${1#--kill-after=}
+        local work child watchdog rc=0 timed=${state}/timed-out
+        grace=${grace%s}
+        shift
+        work=${1%s}
+        shift
+        "$@" &
+        child=$!
+        (
+            sleep "${work}"
+            : >"${timed}"
+            kill -TERM "${child}" 2>/dev/null || true
+            sleep "${grace}"
+            kill -KILL "${child}" 2>/dev/null || true
+        ) &
+        watchdog=$!
+        wait "${child}" || rc=$?
+        kill "${watchdog}" 2>/dev/null || true
+        wait "${watchdog}" 2>/dev/null || true
+        [[ ! -e ${timed} ]] || return 124
+        return "${rc}"
+    }
+    eval "${wrapper}"
+
+    started=${SECONDS}
+    output=$(run_readonly_check 2>/dev/null) || rc=$?
+    elapsed=$((SECONDS - started))
+    assert_eq 3 "${rc}" '总时限没有映射为工具错误退出码 3' || return 1
+    (( elapsed <= READONLY_CHECK_TOTAL_TIMEOUT + 2 )) \
+        || { fail "挂起检查没有在总体时限内结束（耗时 ${elapsed} 秒）"; return 1; }
+    assert_contains "${output}" '检查未完成' '人类可读输出没有说明检查未完成' || return 1
+    assert_contains "${output}" '3 秒' "超时说明没有给出精确总体上限；实际输出=${output}" || return 1
+    for marker in remote-clean control-clean lock-clean; do
+        [[ -e ${state}/${marker} ]] \
+            || { fail "总时限退出没有完成 ${marker} 清理"; return 1; }
+    done
+
+    rm -f -- "${state}/timed-out" "${state}/remote-clean" \
+        "${state}/control-clean" "${state}/lock-clean" "${state}/started"
+    rc=0
+    output=$(run_readonly_check --json 2>/dev/null) || rc=$?
+    assert_eq 3 "${rc}" 'JSON 模式超时没有返回工具错误退出码 3' || return 1
+    assert_contains "${output}" '"overall":"tool_error"' \
+        'JSON 模式超时没有输出结构化工具错误' || return 1
+    assert_contains "${output}" '3 秒' 'JSON 模式超时没有报告同一个总体上限' || return 1
+    [[ $(wc -l <<<"${output}" | tr -d ' ') == 1 ]] \
+        || { fail 'JSON 模式超时输出了不止一个文档'; return 1; }
+)
+
 test_health_scope_contract() {
     local exit_body cn_body
     exit_body=$(sed -n '/^health() (/,/^)/p' "${EXIT_SOURCE}")
@@ -2163,6 +2274,7 @@ main() {
     printf '%s\n' '一键健康检查与安全修复验收：'
     run_case '普通用户菜单、直接命令与返回行为' test_user_interface_contract
     run_case '检查阶段保持完全只读' test_read_only_check_contract
+    run_case '非交互检查有总体时限且超时后完整清理' test_readonly_check_total_deadline_and_cleanup
     run_case '两端核心连接、配置、Agent 与旧残留检查完整' test_health_scope_contract
     run_case '两端健康返回码只保留真实可达状态' test_health_return_code_contract
     run_case 'SSH 对端临时路径严格限制为 mktemp 固定格式' test_remote_temp_paths_are_strictly_validated
