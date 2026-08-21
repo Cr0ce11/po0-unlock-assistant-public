@@ -64,7 +64,7 @@
 |---|---|
 | 交回前维护方 | Claude Code |
 | 交回后执行方 | Codex |
-| 独立复核方 | Claude；复核 Codex PR 的差异、测试证据、风险和回退方式，结论进入 PR 后再合并 |
+| 独立复核方 | 按项目所有者当前分工由 Claude 复核 Codex 的工作成果；这是职责记录，不是绑定特定工具的合并门禁 |
 | Claude 维护期合并的 PR | [#6](https://github.com/Cr0ce11/po0-unlock-assistant-public/pull/6) 至 [#63](https://github.com/Cr0ce11/po0-unlock-assistant-public/pull/63)，共 58 个连续 PR |
 | Claude 维护期发布的版本 | v2.5.19 至 v2.5.30 |
 | 交回时 `main` 提交 | `f234f79`（“记录 v2.5.30 的真机验证与故障注入演练结果”） |
@@ -83,7 +83,7 @@
 
 1. Codex 每次只处理一个清晰事项，先登记或引用 `TODO.md` 编号，在独立分支实现并创建 PR。
 2. Codex 在提交前逐项执行 `AGENTS.md` 的完整本地验收清单，并在 PR 记录实际结果、生产影响与回退方式。
-3. Claude 对 PR 做独立复核；发现必须由 Codex 修正并重新提交，最终复核结论保存在 PR。Claude 复核是协作职责，不新增 `CLAUDE.md`、`.claude/` 或任何工具专属门禁。
+3. 按项目所有者当前分工，Claude 负责独立复核 Codex 的工作成果，复核意见可记录在 PR 供后续追溯。这是对当前职责的描述，不改变 `AGENTS.md` 的规则唯一来源地位，也不新增 `CLAUDE.md`、`.claude/` 或任何依赖特定工具的合并门禁。
 4. 生产部署、故障注入、服务器写操作和正式发布仍由项目所有者保留最终授权；审查通过不自动扩大权限。
 
 本节补齐了原交接的关闭条件。`HAND-001` 随本次治理 PR 关闭；后续维护以 `PROJECT.md` 的当前执行方和 `TODO.md` 的开放项为准。
