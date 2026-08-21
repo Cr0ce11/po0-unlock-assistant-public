@@ -1738,6 +1738,19 @@ dispatch_commands() {
 role_bridge_invocations() {
     local source=${1:-${CN_ENTRY_ROLE}}
     role_region "${source}" | awk '
+        function simple_command_prefix(prefix, segment) {
+            segment=prefix
+            sub(/[[:space:]]+$/, "", segment)
+            # 只保留最后一个 shell 命令边界后的内容，再剥掉控制关键字。
+            sub(/^.*(\$\(|[({;]|&&|\|\||[|&!])[[:space:]]*/, "", segment)
+            while (sub(/^(if|then|else|do|while|until|time)[[:space:]]+/, "", segment)) {}
+            return segment
+        }
+        function approved_wrapper_position(prefix, segment) {
+            segment=simple_command_prefix(prefix)
+            # 包装器必须从当前简单命令开头出现，不能把普通参数位置误当成调用。
+            return segment ~ /^(timeout|env|nice|sudo)([[:space:]]+[^[:space:]]+)*$/
+        }
         function bridge_command_position(prefix, target, trimmed) {
             trimmed=prefix
             sub(/[[:space:]]+$/, "", trimmed)
@@ -1745,6 +1758,7 @@ role_bridge_invocations() {
             if (trimmed ~ /(\$\(|[({;]|&&|\|\||[|&!])$/) return 1
             if (trimmed ~ /(^|[[:space:];])(if|then|else|do|while|until|time)$/) return 1
             if (target == "role" && trimmed ~ /\/bin\/bash([[:space:]]+--)?$/) return 1
+            if (approved_wrapper_position(prefix)) return 1
             return 0
         }
         /^[[:space:]]*#/ { next }
@@ -1828,6 +1842,12 @@ test_role_bridge_guard_rejects_unregistered_commands() (
                 print "\"${HELPER}\" ${po0_bridge_probe} \"${unit}\" >/dev/null 2>&1 || true"
                 print "po0_role_bridge_probe=totally-unregistered-role-command"
                 print "/bin/bash -- \"$0\" $po0_role_bridge_probe >/dev/null 2>&1 || true"
+                print "if false; then timeout 30 \"${HELPER}\" qa-timeout-helper; fi"
+                print "qa_env_bridge_probe=totally-unregistered-env-command"
+                print "if false; then env FOO=1 \"${HELPER}\" ${qa_env_bridge_probe}; fi"
+                print "if false; then nice -n 5 \"${HELPER}\" qa-nice-helper; fi"
+                print "if false; then sudo -u nobody -- \"${HELPER}\" qa-sudo-helper; fi"
+                print "if false; then timeout 30 /bin/bash -- \"$0\" qa-timeout-role; fi"
             }
         }
         { print }
@@ -1846,6 +1866,35 @@ test_role_bridge_guard_rejects_unregistered_commands() (
         '契约守卫没有拒绝未加引号的 helper 动态子命令' || return 1
     assert_contains "${output}" 'po0_role_bridge_probe' \
         '契约守卫没有拒绝未加引号的角色动态子命令' || return 1
+    assert_contains "${output}" 'qa-timeout-helper' \
+        '契约守卫没有核对 timeout 包装的 helper 子命令' || return 1
+    assert_contains "${output}" 'qa_env_bridge_probe' \
+        '契约守卫没有拒绝 env 包装的动态 helper 子命令' || return 1
+    assert_contains "${output}" 'qa-nice-helper' \
+        '契约守卫没有核对 nice 包装的 helper 子命令' || return 1
+    assert_contains "${output}" 'qa-sudo-helper' \
+        '契约守卫没有核对 sudo 包装的 helper 子命令' || return 1
+    assert_contains "${output}" 'qa-timeout-role' \
+        '契约守卫没有核对 timeout 包装的角色子命令' || return 1
+)
+
+test_role_bridge_guard_accepts_registered_wrapped_commands() (
+    local mutated=${WORK_ROOT}/cn-entry-role-registered-wrappers.sh
+    awk '
+        $0 == "case \"${1:-}\" in" {
+            dispatches++
+            if (dispatches == 2) {
+                print "if false; then timeout 30 \"${HELPER}\" disable-service \"${unit}\"; fi"
+                print "if false; then env FOO=1 \"${HELPER}\" refresh-service \"${unit}\"; fi"
+                print "if false; then nice -n 5 \"${HELPER}\" set-report-ip \"${unit}\" 192.0.2.10; fi"
+                print "if false; then sudo -u nobody -- \"${HELPER}\" test; fi"
+                print "if false; then timeout 30 /bin/bash -- \"$0\" health; fi"
+            }
+        }
+        { print }
+    ' "${CN_ENTRY_ROLE}" >"${mutated}"
+    check_role_bridge_dispatch_contract "${mutated}" \
+        || { fail '包装器后的已登记字面子命令被契约守卫误拒绝'; return 1; }
 )
 
 # 从真实角色 dispatch 进入 health，再让原 health 逻辑调用 helper 的只读入口。
@@ -2059,6 +2108,7 @@ main() {
     run_case '切换出站方式的正常、取消与两种失败路径' test_switch_outbound_mode_paths
     run_case '角色跨进程字面子命令均接入对应 dispatch' test_role_bridge_commands_match_dispatches
     run_case '新增未登记或动态子命令会被契约守卫拒绝' test_role_bridge_guard_rejects_unregistered_commands
+    run_case '包装器后的已登记字面子命令仍会通过契约守卫' test_role_bridge_guard_accepts_registered_wrapped_commands
     run_case 'helper 只读桥接经真实角色入口运行' test_read_only_helper_bridge_runs_through_role_entry
     run_case 'helper 不调用只在角色侧定义的函数' test_helper_library_defines_every_function_it_calls
     run_case '角色脚本不调用只在组件里定义的函数' test_role_does_not_call_helper_only_functions
