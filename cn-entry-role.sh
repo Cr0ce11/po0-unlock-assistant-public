@@ -3783,7 +3783,6 @@ manage_configured_service() {
 
 scan_services() {
     local state unit description fragment exec_data exec_path exec_name reason status selection answer index outbound_mode='env'
-    local -a enable_args=()
     local report_ip managed metadata_line scan_started metadata_output units_output rc
     local -a units=() descriptions=() fragments=() exec_names=() reasons=() proxy_states=() managed_states=()
     require_root
@@ -3910,9 +3909,13 @@ scan_services() {
     printf '\n[%s] 正在配置……\n' "${unit}"
     refresh_helper_from_state
     # 默认模式不追加参数：既有服务的调用形态与此前逐字节相同。
-    enable_args=(enable-service "${unit}")
-    [[ ${outbound_mode} == env ]] || enable_args+=("${outbound_mode}")
-    if "${HELPER}" "${enable_args[@]}"; then
+    rc=0
+    if [[ ${outbound_mode} == env ]]; then
+        "${HELPER}" enable-service "${unit}" || rc=$?
+    else
+        "${HELPER}" enable-service "${unit}" "${outbound_mode}" || rc=$?
+    fi
+    if (( rc == 0 )); then
         printf '%s\tENABLE\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${unit}" >>"${state}/service-proxy-actions.log"
         printf '\n完成：已为 %s 启用国外出口。\n' "${unit}"
     else

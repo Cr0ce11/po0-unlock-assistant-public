@@ -4916,7 +4916,6 @@ manage_configured_service() {
 
 scan_services() {
     local state unit description fragment exec_data exec_path exec_name reason status selection answer index outbound_mode='env'
-    local -a enable_args=()
     local report_ip managed metadata_line scan_started metadata_output units_output rc
     local -a units=() descriptions=() fragments=() exec_names=() reasons=() proxy_states=() managed_states=()
     require_root
@@ -5043,9 +5042,13 @@ scan_services() {
     printf '\n[%s] 正在配置……\n' "${unit}"
     refresh_helper_from_state
     # 默认模式不追加参数：既有服务的调用形态与此前逐字节相同。
-    enable_args=(enable-service "${unit}")
-    [[ ${outbound_mode} == env ]] || enable_args+=("${outbound_mode}")
-    if "${HELPER}" "${enable_args[@]}"; then
+    rc=0
+    if [[ ${outbound_mode} == env ]]; then
+        "${HELPER}" enable-service "${unit}" || rc=$?
+    else
+        "${HELPER}" enable-service "${unit}" "${outbound_mode}" || rc=$?
+    fi
+    if (( rc == 0 )); then
         printf '%s\tENABLE\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${unit}" >>"${state}/service-proxy-actions.log"
         printf '\n完成：已为 %s 启用国外出口。\n' "${unit}"
     else
@@ -5486,7 +5489,7 @@ __PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
     exit_actual=$(sha256sum "${exit_new}" | awk '{print $1}')
     cn_entry_actual=$(sha256sum "${cn_entry_new}" | awk '{print $1}')
     [[ ${exit_actual} == 'bb75e1213278b7170d885038b790e7a2ef43ea13b0b9f38f3029e2262922b5d5' ]] || die '国外出口内置组件哈希校验失败。'
-    [[ ${cn_entry_actual} == '970057b3346108c27e28a1047dd14f7e37af36c98e2ecab10ac9b3c7dce24e2f' ]] || die '国内入口内置组件哈希校验失败。'
+    [[ ${cn_entry_actual} == '94e9e6766e86a876957630b21137a8c8e47091882a409b2bf9c99e9a9d467867' ]] || die '国内入口内置组件哈希校验失败。'
     /bin/bash -n "${exit_new}" || die '国外出口内置组件语法检查失败。'
     /bin/bash -n "${cn_entry_new}" || die '国内入口内置组件语法检查失败。'
     mv "${exit_new}" "${EXIT_ROLE}"
@@ -5517,7 +5520,7 @@ bundle_self_test() {
     printf 'Po0 单文件版本=%s\n' '2.5.30'
     printf 'Po0 单文件版本类型=%s\n' "${SCRIPT_EDITION_LABEL}"
     printf 'overseas-exit-role SHA-256=%s\n' 'bb75e1213278b7170d885038b790e7a2ef43ea13b0b9f38f3029e2262922b5d5'
-    printf 'cn-entry-role SHA-256=%s\n' '970057b3346108c27e28a1047dd14f7e37af36c98e2ecab10ac9b3c7dce24e2f'
+    printf 'cn-entry-role SHA-256=%s\n' '94e9e6766e86a876957630b21137a8c8e47091882a409b2bf9c99e9a9d467867'
     printf '%s\n'         "scan-agents -> cn-entry:${CN_ENTRY_CMD_SCAN}"         "rollback[1] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_SERVICES}"         "rollback[2] -> overseas-exit:${EXIT_CMD_ROLLBACK}"         "rollback[3] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_FINALIZE}"         "status -> cn-entry:${CN_ENTRY_CMD_STATUS}"         "status -> overseas-exit:${EXIT_CMD_STATUS}"         "health -> cn-entry:${CN_ENTRY_CMD_HEALTH}"         "health -> overseas-exit:${EXIT_CMD_HEALTH}"         "repair -> overseas-exit:${EXIT_CMD_REPAIR}"
     printf '%s\n' 'SELF_TEST=PASS'
 }
