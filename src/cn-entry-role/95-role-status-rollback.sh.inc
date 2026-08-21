@@ -406,6 +406,7 @@ case "${1:-}" in
     finalize) finalize "${2:-}" "${3:-}" ;;
     refresh) refresh "${2:-}" "${3:-}" ;;
     __refresh-managed-service) refresh_one_managed_service "${2:-}" ;;
+    cf-probe-outbound-capability) current_component_cf_probe_outbound_capability "${2:-}" ;;
     scan-services) scan_services ;;
     rollback-services) rollback_services ;;
     rollback-finalize) rollback_finalize ;;
