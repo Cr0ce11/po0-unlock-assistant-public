@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 # 本脚本必须在国外出口 VPS 上以 root 运行。
-SCRIPT_VERSION=2.5.30
+SCRIPT_VERSION=2.5.31
 SCRIPT_EDITION_LABEL=公开版
 resolve_script_path() {
     local source=$1 directory target depth=0
@@ -5517,7 +5517,7 @@ bundle_self_test() {
     [[ ${helper_shebang} == '#!/usr/bin/env bash' ]]         || die '国内入口生成的 po0-cn-entry helper 缺少有效 shebang。'
     /bin/bash -n "${helper_test}"         || die '国内入口生成的 po0-cn-entry helper 语法检查失败。'
     rm -f -- "${helper_test}"
-    printf 'Po0 单文件版本=%s\n' '2.5.30'
+    printf 'Po0 单文件版本=%s\n' '2.5.31'
     printf 'Po0 单文件版本类型=%s\n' "${SCRIPT_EDITION_LABEL}"
     printf 'overseas-exit-role SHA-256=%s\n' 'bb75e1213278b7170d885038b790e7a2ef43ea13b0b9f38f3029e2262922b5d5'
     printf 'cn-entry-role SHA-256=%s\n' '94e9e6766e86a876957630b21137a8c8e47091882a409b2bf9c99e9a9d467867'
