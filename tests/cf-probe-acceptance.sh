@@ -1735,24 +1735,39 @@ dispatch_commands() {
     '
 }
 
-literal_role_bridge_calls() {
+role_bridge_invocations() {
     local source=${1:-${CN_ENTRY_ROLE}}
     role_region "${source}" | awk '
+        function bridge_command_position(prefix, target, trimmed) {
+            trimmed=prefix
+            sub(/[[:space:]]+$/, "", trimmed)
+            if (trimmed == "") return 1
+            if (trimmed ~ /(\$\(|[({;]|&&|\|\||[|&!])$/) return 1
+            if (trimmed ~ /(^|[[:space:];])(if|then|else|do|while|until|time)$/) return 1
+            if (target == "role" && trimmed ~ /\/bin\/bash([[:space:]]+--)?$/) return 1
+            return 0
+        }
         /^[[:space:]]*#/ { next }
         {
             original=$0
             line=original
-            while (match(line, /"\$\{HELPER\}"[[:space:]]+[A-Za-z_][A-Za-z0-9_-]*/)) {
-                call=substr(line, RSTART, RLENGTH)
-                sub(/^"\$\{HELPER\}"[[:space:]]+/, "", call)
-                printf "helper\t%s\t%d\n", call, NR
+            while (match(line, /"\$\{HELPER\}"[[:space:]]+[^[:space:];|&()<>]+/)) {
+                prefix=substr(line, 1, RSTART - 1)
+                token=substr(line, RSTART, RLENGTH)
+                sub(/^"\$\{HELPER\}"[[:space:]]+/, "", token)
+                if (bridge_command_position(prefix, "helper")) {
+                    printf "helper\t%s\t%d\n", token, NR
+                }
                 line=substr(line, RSTART + RLENGTH)
             }
             line=original
-            while (match(line, /"\$0"[[:space:]]+[A-Za-z_][A-Za-z0-9_-]*/)) {
-                call=substr(line, RSTART, RLENGTH)
-                sub(/^"\$0"[[:space:]]+/, "", call)
-                printf "role\t%s\t%d\n", call, NR
+            while (match(line, /"\$0"[[:space:]]+[^[:space:];|&()<>]+/)) {
+                prefix=substr(line, 1, RSTART - 1)
+                token=substr(line, RSTART, RLENGTH)
+                sub(/^"\$0"[[:space:]]+/, "", token)
+                if (bridge_command_position(prefix, "role")) {
+                    printf "role\t%s\t%d\n", token, NR
+                }
                 line=substr(line, RSTART + RLENGTH)
             }
         }
@@ -1760,24 +1775,23 @@ literal_role_bridge_calls() {
 }
 
 check_role_bridge_dispatch_contract() {
-    local source=${1:-${CN_ENTRY_ROLE}} helper_dispatch role_dispatch dynamic_calls
+    local source=${1:-${CN_ENTRY_ROLE}} helper_dispatch role_dispatch
     local target command line available violations=0
     helper_dispatch=$(helper_region "${source}" | dispatch_commands) \
         || { printf '%s\n' '未能提取 helper dispatch。' >&2; return 1; }
     role_dispatch=$(role_region "${source}" | dispatch_commands) \
         || { printf '%s\n' '未能提取角色 dispatch。' >&2; return 1; }
 
-    # 子命令若藏在变量或数组里，静态契约就无法核对。跨进程调用必须把命令名直接
-    # 写在 ${HELPER} 或 $0 后面；参数仍然可以使用变量。
-    dynamic_calls=$(role_region "${source}" \
-        | grep -nE '"\$\{HELPER\}"[[:space:]]+"\$\{|"\$0"[[:space:]]+"\$\{' || true)
-    if [[ -n ${dynamic_calls} ]]; then
-        printf '跨进程调用使用了动态子命令，契约守卫无法核对：\n%s\n' "${dynamic_calls}" >&2
-        violations=$((violations + 1))
-    fi
-
     while IFS=$'\t' read -r target command line; do
         [[ -n ${target} && -n ${command} ]] || continue
+        # 白名单：每次桥接调用的第一个 token 必须直接是小写字面子命令。
+        # 引号变量、未加引号变量、数组和续行符都会在这里被保守拒绝。
+        if [[ ! ${command} =~ ^[a-z][a-z0-9-]*$ ]]; then
+            printf '角色区间第 %s 行的 %s 桥接首个 token 不是可核对的字面子命令：%s\n' \
+                "${line}" "${target}" "${command}" >&2
+            violations=$((violations + 1))
+            continue
+        fi
         case "${target}" in
             helper) available=${helper_dispatch} ;;
             role) available=${role_dispatch} ;;
@@ -1792,7 +1806,7 @@ check_role_bridge_dispatch_contract() {
                 "${line}" "${target}" "${command}" >&2
             violations=$((violations + 1))
         fi
-    done < <(literal_role_bridge_calls "${source}")
+    done < <(role_bridge_invocations "${source}")
     (( violations == 0 ))
 }
 
@@ -1810,6 +1824,10 @@ test_role_bridge_guard_rejects_unregistered_commands() (
                 print "if false; then \"${HELPER}\" qa-missing-helper; fi"
                 print "if false; then /bin/bash -- \"$0\" qa-missing-role; fi"
                 print "if false; then \"${HELPER}\" \"${qa_dynamic_command}\"; fi"
+                print "po0_bridge_probe=totally-unregistered-command"
+                print "\"${HELPER}\" ${po0_bridge_probe} \"${unit}\" >/dev/null 2>&1 || true"
+                print "po0_role_bridge_probe=totally-unregistered-role-command"
+                print "/bin/bash -- \"$0\" $po0_role_bridge_probe >/dev/null 2>&1 || true"
             }
         }
         { print }
@@ -1824,6 +1842,10 @@ test_role_bridge_guard_rejects_unregistered_commands() (
         '契约守卫没有指出缺失的角色子命令' || return 1
     assert_contains "${output}" 'qa_dynamic_command' \
         '契约守卫没有拒绝无法静态核对的动态子命令' || return 1
+    assert_contains "${output}" 'po0_bridge_probe' \
+        '契约守卫没有拒绝未加引号的 helper 动态子命令' || return 1
+    assert_contains "${output}" 'po0_role_bridge_probe' \
+        '契约守卫没有拒绝未加引号的角色动态子命令' || return 1
 )
 
 # 从真实角色 dispatch 进入 health，再让原 health 逻辑调用 helper 的只读入口。
