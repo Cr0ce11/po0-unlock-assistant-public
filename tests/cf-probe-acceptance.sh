@@ -770,8 +770,8 @@ test_source_lifecycle_contracts() {
     # 转发模式：启用与刷新都必须写挂载行，否则刷新会把它抹掉、实时通道静默失效
     assert_eq 2 "$(grep -Fc 'cf_probe_forward_dropin_line "${dropin}" >>"${tmp}"' <<<"${helper_case}")" \
         '启用与刷新没有同时写入转发模式的挂载行' || return 1
-    assert_contains "${helper_case}" 'prepare_cf_probe_forward_mode "${unit}" "${dropin}"' \
-        '启用路径没有接入转发模式' || return 1
+    assert_contains "${helper_case}" '"${unit}" "${dropin}" "${TX_FORWARD_SNAPSHOT}" >/dev/null' \
+        '启用路径没有把外层事务快照交给转发模式准备流程' || return 1
     # 刷新是既有部署拿到新版转发单元的唯一入口，断了这条线老部署永远不会开机自启
     assert_contains "${helper_case}" 'reconcile_cf_probe_forward_unit "${unit}" "${dropin}"' \
         '刷新路径没有核对转发单元，既有部署补不上开机自启' || return 1
@@ -785,8 +785,18 @@ test_source_lifecycle_contracts() {
         '已托管菜单没有提供切换出站方式' || return 1
     assert_contains "${source}" 'remove_cf_probe_forward_mode "${TX_UNIT}" "${TX_FORWARD_DROPIN}"' \
         '启用失败回滚不会拆除转发模式' || return 1
+    assert_contains "${source}" 'restore_cf_probe_forward_snapshot "${TX_UNIT}" "${TX_FORWARD_DROPIN}" "${TX_FORWARD_SNAPSHOT}"' \
+        '服务事务失败时不会从快照恢复既有转发状态' || return 1
+    assert_eq 2 "$(grep -Fc 'TX_FORWARD_SNAPSHOT=$(snapshot_cf_probe_forward_state_if_complete' <<<"${helper_case}")" \
+        '启用与停用没有在改动完整转发状态前把快照接入外层服务事务' || return 1
     assert_contains "${disable_body}" 'remove_cf_probe_forward_mode "${unit}" "${dropin}"' \
         '停用服务不会拆除转发模式' || return 1
+    awk '
+        /remove_cf_probe_forward_mode "\$\{unit\}" "\$\{dropin\}"/ { removed=NR }
+        /TX_COMMITTED=yes/ { committed=NR }
+        END { exit !(removed && committed && removed < committed) }
+    ' <<<"${disable_body}" \
+        || { fail '停用服务在拆除转发模式前就提交并注销了托管记录'; return 1; }
     assert_contains "${source}" 'cf_probe_forward_health "${unit}"' \
         '健康检查没有覆盖转发模式' || return 1
     # 转发模式的判定只在组件作用域里，角色侧必须经组件的只读入口取结论
@@ -826,18 +836,48 @@ forward_fixture() {
     # 单元的运行状态与开机自启状态由这两个文件表达，用例改文件即可，不必重定义 systemctl
     printf '%s\n' 0 >"${case_dir}/is-active.rc"
     printf '%s\n' enabled >"${case_dir}/is-enabled.out"
+    : >"${case_dir}/systemctl-fail-next"
     CF_PROBE_FORWARD_SOCAT=${case_dir}/socat
     cf_probe_go_systemd_root() { printf '%s\n' "${case_dir}/systemd"; }
     cf_probe_go_config_path_unverified() { printf '%s\n' "${case_dir}/etc/config.conf"; }
     systemctl() {
         printf '%s\n' "$*" >>"${case_dir}/systemctl.log"
+        if [[ -s ${case_dir}/systemctl-fail-next ]] \
+            && grep -Fxq -- "$*" "${case_dir}/systemctl-fail-next"; then
+            : >"${case_dir}/systemctl-fail-next"
+            printf 'fixture systemctl failure: %s\n' "$*" >&2
+            return 1
+        fi
         case "${1:-}" in
             is-active) return "$(cat "${case_dir}/is-active.rc")" ;;
             is-enabled) cat "${case_dir}/is-enabled.out" ;;
+            show)
+                if [[ $(cat "${case_dir}/is-active.rc") == 0 ]]; then
+                    printf '%s\n' active
+                else
+                    printf '%s\n' inactive
+                fi
+                ;;
+            enable)
+                printf '%s\n' enabled >"${case_dir}/is-enabled.out"
+                [[ $* != *'--now'* ]] || printf '%s\n' 0 >"${case_dir}/is-active.rc"
+                ;;
+            disable)
+                printf '%s\n' disabled >"${case_dir}/is-enabled.out"
+                [[ $* != *'--now'* ]] || printf '%s\n' 3 >"${case_dir}/is-active.rc"
+                ;;
+            start|restart) printf '%s\n' 0 >"${case_dir}/is-active.rc" ;;
+            stop) printf '%s\n' 3 >"${case_dir}/is-active.rc" ;;
         esac
         return 0
     }
     ss() { cat "${case_dir}/ss.out" 2>/dev/null; return 0; }
+}
+
+forward_fail_next_systemctl() {
+    local case_dir=$1
+    shift
+    printf '%s\n' "$*" >"${case_dir}/systemctl-fail-next"
 }
 
 # 启用后要生成受管目录、专属 hosts、受管记录与转发单元，并给出挂载行；拆除后一件不剩。
@@ -939,6 +979,227 @@ test_forward_unit_boot_enable_and_reconcile() (
         && { fail '转发单元不是本助手所写时刷新没有拒绝'; return 1; }
     assert_eq '# hand written' "$(cat "${unit_file}")" \
         '拒绝时改动了他人的单元文件' || return 1
+)
+
+# 既有转发三件套可能来自上一次未完成的服务事务。再次启用若启动失败，必须把
+# 旧 unit、hosts、record 与原服务状态完整还原，不能把原本可用的配置当作新文件删除。
+test_forward_prepare_failure_restores_reused_state() (
+    local case_dir unit host dropin directory hosts record unit_file unit_name snapshot output
+    unit=cf-probe.service
+    host=panel.example.invalid
+    case_dir=$(mktemp -d "${WORK_ROOT}/forward-prepare-rollback.XXXXXX") || return 1
+    forward_fixture "${case_dir}" "${host}"
+    dropin=${case_dir}/dropin
+    directory=$(cf_probe_forward_dir "${dropin}") || return 1
+    hosts=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+    record=$(cf_probe_forward_record_file "${dropin}") || return 1
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+    unit_name=$(cf_probe_forward_unit_name "${unit}") || return 1
+
+    prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
+        || { fail '建立既有转发夹具失败'; return 1; }
+    # 保持首行归属标记，但造出与当前模板不同的旧版内容，确保重试确实发生过改写。
+    printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" 'legacy hosts content' >"${hosts}"
+    printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" \
+        "UNIT=${unit}" "FORWARD_HOST=${host}" 'LISTEN=127.0.0.1:443' 'LEGACY=yes' >"${record}"
+    printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" '[Unit]' 'Description=legacy forward unit' >"${unit_file}"
+    snapshot=${case_dir}/before
+    mkdir -p "${snapshot}"
+    cp -p -- "${hosts}" "${record}" "${unit_file}" "${snapshot}/"
+
+    forward_fail_next_systemctl "${case_dir}" enable --now -- "${unit_name}"
+    output=$(prepare_cf_probe_forward_mode "${unit}" "${dropin}" 2>&1) \
+        && { fail '复用既有配置时启动失败却返回成功'; return 1; }
+    assert_contains "${output}" '转发单元未能启动' '启动失败没有给出明确原因' || return 1
+    [[ -d ${directory} ]] || { fail '启动失败后删除了既有转发目录'; return 1; }
+    cmp -s "${snapshot}/hosts" "${hosts}" \
+        || { fail '启动失败后没有恢复既有 hosts'; return 1; }
+    cmp -s "${snapshot}/record" "${record}" \
+        || { fail '启动失败后没有恢复既有 record'; return 1; }
+    cmp -s "${snapshot}/${unit_file##*/}" "${unit_file}" \
+        || { fail '启动失败后没有恢复既有转发 unit'; return 1; }
+)
+
+# 复用既有状态时，写 hosts 或写 unit 任一步失败都必须逐字节还原三件套。
+# 这两条路径发生在 systemd 操作之前，不能只靠启动失败用例间接覆盖。
+run_forward_prepare_write_failure_case() (
+    local failure=$1 case_dir unit host dropin directory hosts record unit_file snapshot output
+    unit=cf-probe.service
+    host=panel.example.invalid
+    case_dir=$(mktemp -d "${WORK_ROOT}/forward-write-${failure}.XXXXXX") || return 1
+    forward_fixture "${case_dir}" "${host}"
+    dropin=${case_dir}/dropin
+    directory=$(cf_probe_forward_dir "${dropin}") || return 1
+    hosts=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+    record=$(cf_probe_forward_record_file "${dropin}") || return 1
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+
+    prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
+        || { fail "建立 ${failure} 写失败夹具失败"; return 1; }
+    printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" 'legacy hosts before write failure' >"${hosts}"
+    printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" \
+        "UNIT=${unit}" "FORWARD_HOST=${host}" 'LISTEN=127.0.0.1:443' \
+        'LEGACY=before-write-failure' >"${record}"
+    printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" '[Unit]' \
+        "Description=legacy unit before ${failure}" >"${unit_file}"
+    snapshot=${case_dir}/before
+    mkdir -p "${snapshot}"
+    cp -p -- "${hosts}" "${record}" "${unit_file}" "${snapshot}/"
+
+    case "${failure}" in
+        forward-write)
+            cf_probe_forward_write_file() { return 1; }
+            ;;
+        guard-write)
+            cf_probe_write_go_guard_file() { return 1; }
+            ;;
+        *)
+            fail "未知写失败夹具：${failure}"
+            return 1
+            ;;
+    esac
+    output=$(prepare_cf_probe_forward_mode "${unit}" "${dropin}" 2>&1) \
+        && { fail "${failure} 失败时准备仍返回成功"; return 1; }
+    [[ -d ${directory} ]] || { fail "${failure} 失败后删除了既有目录"; return 1; }
+    cmp -s "${snapshot}/hosts" "${hosts}" \
+        || { fail "${failure} 失败后没有恢复既有 hosts"; return 1; }
+    cmp -s "${snapshot}/record" "${record}" \
+        || { fail "${failure} 失败后没有恢复既有 record"; return 1; }
+    cmp -s "${snapshot}/${unit_file##*/}" "${unit_file}" \
+        || { fail "${failure} 失败后没有恢复既有 unit"; return 1; }
+    [[ -n ${output} ]] || { fail "${failure} 没有保留失败信息"; return 1; }
+)
+
+test_forward_prepare_write_failures_restore_reused_state() (
+    run_forward_prepare_write_failure_case forward-write || return 1
+    run_forward_prepare_write_failure_case guard-write || return 1
+)
+
+# 上一次事务若只留下部分托管材料，事务预检不能先因“快照不完整”把恢复入口堵死：
+# 停用应能清干净；再次启用应能先清残留再重建完整状态。
+test_forward_partial_state_can_be_removed_and_recreated() (
+    local case_dir unit host dropin directory hosts record unit_file state snapshot
+    unit=cf-probe.service
+    host=panel.example.invalid
+    case_dir=$(mktemp -d "${WORK_ROOT}/forward-partial.XXXXXX") || return 1
+    forward_fixture "${case_dir}" "${host}"
+    dropin=${case_dir}/dropin
+    directory=$(cf_probe_forward_dir "${dropin}") || return 1
+    hosts=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+    record=$(cf_probe_forward_record_file "${dropin}") || return 1
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+    state=${case_dir}/state
+    mkdir -p "${state}"
+    chmod 0700 "${state}"
+
+    prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
+        || { fail '建立残缺状态夹具失败'; return 1; }
+    rm -- "${record}"
+    snapshot=$(snapshot_cf_probe_forward_state_if_complete \
+        "${unit}" "${dropin}" "${state}") \
+        || { fail '停用事务预检拒绝了可安全清理的残缺状态'; return 1; }
+    [[ -z ${snapshot} ]] || { fail '残缺状态不应产生完整事务快照'; return 1; }
+    remove_cf_probe_forward_mode "${unit}" "${dropin}" \
+        || { fail '残缺托管状态无法撤销'; return 1; }
+    [[ ! -e ${hosts} && ! -e ${record} && ! -e ${unit_file} && ! -d ${directory} ]] \
+        || { fail '撤销残缺状态后仍有材料残留'; return 1; }
+
+    prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
+        || { fail '清理后无法重新启用转发模式'; return 1; }
+    rm -- "${record}"
+    snapshot=$(snapshot_cf_probe_forward_state_if_complete \
+        "${unit}" "${dropin}" "${state}") \
+        || { fail '启用事务预检拒绝了可安全重建的残缺状态'; return 1; }
+    [[ -z ${snapshot} ]] || { fail '残缺状态不应产生完整事务快照'; return 1; }
+    prepare_cf_probe_forward_mode "${unit}" "${dropin}" "${snapshot}" >/dev/null \
+        || { fail '再次启用没有从残缺状态自动重建'; return 1; }
+    [[ -f ${hosts} && -f ${record} && -f ${unit_file} ]] \
+        || { fail '再次启用后没有恢复完整三件套'; return 1; }
+)
+
+# 刷新旧 unit 的三个 systemd 阶段都可能失败；每个阶段都必须恢复刷新前的逐字节内容。
+test_forward_reconcile_failures_restore_unit() (
+    local command case_dir unit host dropin unit_file unit_name before output
+    unit=cf-probe.service
+    host=panel.example.invalid
+    for command in daemon-reload try-restart enable; do
+        case_dir=$(mktemp -d "${WORK_ROOT}/forward-reconcile-${command}.XXXXXX") || return 1
+        forward_fixture "${case_dir}" "${host}"
+        dropin=${case_dir}/dropin
+        unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+        unit_name=$(cf_probe_forward_unit_name "${unit}") || return 1
+        prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
+            || { fail "建立 ${command} 失败夹具失败"; return 1; }
+        printf '%s\n' "${CF_PROBE_FORWARD_MARKER}" '[Unit]' \
+            "Description=legacy before ${command}" >"${unit_file}"
+        before=${case_dir}/before-unit
+        cp -p -- "${unit_file}" "${before}"
+        case "${command}" in
+            daemon-reload) forward_fail_next_systemctl "${case_dir}" daemon-reload ;;
+            try-restart) forward_fail_next_systemctl "${case_dir}" try-restart -- "${unit_name}" ;;
+            enable) forward_fail_next_systemctl "${case_dir}" enable --now -- "${unit_name}" ;;
+        esac
+        output=$(reconcile_cf_probe_forward_unit "${unit}" "${dropin}" 2>&1) \
+            && { fail "${command} 失败时刷新仍返回成功"; return 1; }
+        cmp -s "${before}" "${unit_file}" \
+            || { fail "${command} 失败后没有恢复旧转发 unit"; return 1; }
+        assert_contains "${output}" 'fixture systemctl failure' \
+            "${command} 的 systemd 错误没有保留" || return 1
+    done
+)
+
+# 拆除必须先确认转发单元真的停下；停用失败时不得删文件。若后续服务事务失败，
+# 已拆除的转发状态与托管清单也必须能从事务快照恢复。
+test_forward_disable_failure_and_transaction_restore() (
+    local case_dir unit host dropin hosts record unit_file unit_name state snapshot output rc
+    unit=cf-probe.service
+    host=panel.example.invalid
+    case_dir=$(mktemp -d "${WORK_ROOT}/forward-disable-rollback.XXXXXX") || return 1
+    forward_fixture "${case_dir}" "${host}"
+    dropin=${case_dir}/dropin
+    hosts=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+    record=$(cf_probe_forward_record_file "${dropin}") || return 1
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+    unit_name=$(cf_probe_forward_unit_name "${unit}") || return 1
+    prepare_cf_probe_forward_mode "${unit}" "${dropin}" >/dev/null \
+        || { fail '建立拆除夹具失败'; return 1; }
+
+    forward_fail_next_systemctl "${case_dir}" disable --now -- "${unit_name}"
+    output=$(remove_cf_probe_forward_mode "${unit}" "${dropin}" 2>&1) \
+        && { fail '转发单元停用失败时拆除仍返回成功'; return 1; }
+    assert_contains "${output}" 'fixture systemctl failure' '停用失败的 systemd 原因被吞掉' || return 1
+    [[ -f ${hosts} && -f ${record} && -f ${unit_file} ]] \
+        || { fail '停用失败时仍删除了转发材料'; return 1; }
+
+    state=${case_dir}/state
+    mkdir -p "${state}"
+    chmod 0700 "${state}"
+    printf '%s\n' "${unit}" >"${state}/managed-services"
+    snapshot=$(create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${state}") \
+        || { fail '无法建立转发事务快照'; return 1; }
+    remove_cf_probe_forward_mode "${unit}" "${dropin}" \
+        || { fail '正常拆除转发模式失败'; return 1; }
+    [[ ! -e ${hosts} && ! -e ${record} && ! -e ${unit_file} ]] \
+        || { fail '正常拆除后仍有转发材料'; return 1; }
+
+    TX_COMMITTED=no
+    TX_UNIT=${unit}
+    TX_STATE=${state}
+    TX_DROPIN_MAY_BE_REMOVED=no
+    TX_LIST_MAY_CHANGE=yes
+    TX_FORWARD_DROPIN=${dropin}
+    TX_FORWARD_SNAPSHOT=${snapshot}
+    TX_FORWARD_MAY_CHANGE=yes
+    TX_CF_GUARD_REMOVED=no
+    TX_ORIGINAL_RUNNING=no
+    rc=0
+    ( disable_transaction_cleanup 1 ) >/dev/null 2>&1 || rc=$?
+    assert_eq 1 "${rc}" '事务清理没有保留原失败退出码' || return 1
+    [[ -f ${hosts} && -f ${record} && -f ${unit_file} ]] \
+        || { fail '服务事务失败后没有恢复转发材料'; return 1; }
+    grep -Fxq -- "${unit}" "${state}/managed-services" \
+        || { fail '服务事务失败后没有恢复托管记录'; return 1; }
+    [[ ! -e ${snapshot} ]] || { fail '事务恢复后仍遗留转发快照'; return 1; }
 )
 
 # 角色侧的健康检查完全依赖这条组件入口的退出码：3 表示未启用转发模式（照旧显示正常），
@@ -1336,6 +1597,11 @@ main() {
     run_case '启用、刷新、失败回滚、停用和扫描路径均已接入' test_source_lifecycle_contracts
     run_case '转发模式可启用、可核对、可完整拆除' test_forward_mode_lifecycle
     run_case '转发单元开机自启，旧单元在刷新时被收敛' test_forward_unit_boot_enable_and_reconcile
+    run_case '复用既有转发状态失败时逐字节恢复' test_forward_prepare_failure_restores_reused_state
+    run_case '转发材料写失败时逐字节恢复既有状态' test_forward_prepare_write_failures_restore_reused_state
+    run_case '残缺转发状态可撤销并可重新启用' test_forward_partial_state_can_be_removed_and_recreated
+    run_case '刷新转发单元各阶段失败时恢复旧内容' test_forward_reconcile_failures_restore_unit
+    run_case '停用失败不删除且服务事务可恢复转发状态' test_forward_disable_failure_and_transaction_restore
     run_case '组件转发健康入口的退出码实跑覆盖' test_forward_health_entry_exit_codes
     run_case '转发模式的护栏拒绝不安全前提' test_forward_mode_guards_refuse_unsafe
     run_case '转发模式健康检查区分正常、异常与提醒' test_forward_mode_health_reports

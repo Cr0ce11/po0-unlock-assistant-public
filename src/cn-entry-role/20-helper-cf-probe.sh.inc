@@ -974,10 +974,162 @@ cf_probe_forward_dropin_line() {
     printf 'BindReadOnlyPaths=%s:/etc/hosts\n' "${hosts_file}"
 }
 
+cf_probe_forward_mode_present() {
+    local unit=$1 dropin=$2 directory unit_file
+    directory=$(cf_probe_forward_dir "${dropin}") || return 1
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+    [[ -e ${directory} || -L ${directory} || -e ${unit_file} || -L ${unit_file} ]]
+}
+
+cf_probe_forward_mode_complete() {
+    local unit=$1 dropin=$2 directory hosts_file record_file unit_file
+    directory=$(cf_probe_forward_dir "${dropin}") || return 1
+    hosts_file=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+    record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+    managed_cf_probe_forward_dir "${directory}" \
+        && managed_cf_probe_forward_file "${hosts_file}" \
+        && managed_cf_probe_forward_file "${record_file}" \
+        && managed_cf_probe_forward_file "${unit_file}"
+}
+
+discard_cf_probe_forward_snapshot() {
+    local snapshot=$1
+    [[ -d ${snapshot} && ! -L ${snapshot} ]] || return 1
+    rm -f -- "${snapshot}/unit" "${snapshot}/hosts" "${snapshot}/record" "${snapshot}/state" \
+        || return 1
+    rmdir -- "${snapshot}"
+}
+
+cf_probe_forward_snapshot_value() {
+    local snapshot=$1 key=$2 line
+    [[ $(grep -Ec "^${key}=" "${snapshot}/state" 2>/dev/null || true) == 1 ]] || return 1
+    line=$(grep -E "^${key}=" "${snapshot}/state") || return 1
+    printf '%s\n' "${line#*=}"
+}
+
+# 在改写或拆除转发状态前保存三件套与 systemd 状态。快照只放在调用方指定的
+# root 私有目录中；它既用于函数内失败恢复，也可由外层服务事务保留到最终提交。
+create_cf_probe_forward_snapshot() {
+    local unit=$1 dropin=$2 parent=$3 directory hosts_file record_file unit_file unit_name
+    local snapshot active=no enabled=no directory_mode
+    directory=$(cf_probe_forward_dir "${dropin}") || return 1
+    hosts_file=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+    record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+    unit_name=${unit_file##*/}
+    managed_cf_probe_forward_dir "${directory}" || return 1
+    managed_cf_probe_forward_file "${hosts_file}" || return 1
+    managed_cf_probe_forward_file "${record_file}" || return 1
+    managed_cf_probe_forward_file "${unit_file}" || return 1
+    [[ -d ${parent} && ! -L ${parent} ]] || return 1
+    directory_mode=$(stat -c '%a' "${directory}" 2>/dev/null) || return 1
+    [[ ${directory_mode} =~ ^[0-7]{3,4}$ ]] || return 1
+    systemctl is-active --quiet -- "${unit_name}" >/dev/null 2>&1 && active=yes
+    [[ $(systemctl is-enabled -- "${unit_name}" 2>/dev/null || true) == enabled ]] && enabled=yes
+    snapshot=$(mktemp -d "${parent}/.po0-cf-probe-forward-snapshot.XXXXXXXX") || return 1
+    if ! chmod 0700 "${snapshot}" \
+        || ! chown root:root "${snapshot}" \
+        || ! cp -p -- "${unit_file}" "${snapshot}/unit" \
+        || ! cp -p -- "${hosts_file}" "${snapshot}/hosts" \
+        || ! cp -p -- "${record_file}" "${snapshot}/record" \
+        || ! printf '%s\n' \
+            "ACTIVE=${active}" \
+            "ENABLED=${enabled}" \
+            "DIRECTORY_MODE=${directory_mode}" >"${snapshot}/state" \
+        || ! chmod 0600 "${snapshot}/state" \
+        || ! chown root:root "${snapshot}/state"; then
+        rm -f -- "${snapshot}/unit" "${snapshot}/hosts" "${snapshot}/record" "${snapshot}/state"
+        rmdir -- "${snapshot}" 2>/dev/null || true
+        return 1
+    fi
+    printf '%s\n' "${snapshot}"
+}
+
+# 外层服务事务只为完整、可恢复的状态建立快照。残缺但仍归本助手所有的状态
+# 不应在预检阶段被永久堵死：后续 prepare/remove 会逐件确认归属后安全清理。
+snapshot_cf_probe_forward_state_if_complete() {
+    local unit=$1 dropin=$2 parent=$3
+    cf_probe_forward_mode_present "${unit}" "${dropin}" || return 0
+    cf_probe_forward_mode_complete "${unit}" "${dropin}" || return 0
+    create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${parent}"
+}
+
+cf_probe_forward_restore_file() {
+    local source=$1 target=$2 directory tmp
+    [[ -f ${source} && ! -L ${source} ]] || return 1
+    directory=${target%/*}
+    [[ -d ${directory} && ! -L ${directory} ]] || return 1
+    tmp=$(mktemp "${directory}/.po0-cf-probe-forward-restore.XXXXXXXX") || return 1
+    if ! cp -p -- "${source}" "${tmp}" \
+        || ! chown root:root "${tmp}" \
+        || ! mv -f -- "${tmp}" "${target}"; then
+        rm -f -- "${tmp}"
+        return 1
+    fi
+}
+
+restore_cf_probe_forward_snapshot() {
+    local unit=$1 dropin=$2 snapshot=$3 directory hosts_file record_file unit_file unit_name
+    local active enabled directory_mode current_active current_enabled
+    directory=$(cf_probe_forward_dir "${dropin}") || return 1
+    hosts_file=$(cf_probe_forward_hosts_file "${dropin}") || return 1
+    record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
+    unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
+    unit_name=${unit_file##*/}
+    [[ -d ${snapshot} && ! -L ${snapshot} \
+        && -f ${snapshot}/state && ! -L ${snapshot}/state ]] || return 1
+    active=$(cf_probe_forward_snapshot_value "${snapshot}" ACTIVE) || return 1
+    enabled=$(cf_probe_forward_snapshot_value "${snapshot}" ENABLED) || return 1
+    directory_mode=$(cf_probe_forward_snapshot_value "${snapshot}" DIRECTORY_MODE) || return 1
+    case "${active}:${enabled}" in yes:yes|yes:no|no:yes|no:no) ;; *) return 1 ;; esac
+    [[ ${directory_mode} =~ ^[0-7]{3,4}$ ]] || return 1
+    install -d -m "${directory_mode}" "${directory}" || return 1
+    chown root:root "${directory}" || return 1
+    cf_probe_forward_restore_file "${snapshot}/hosts" "${hosts_file}" || return 1
+    cf_probe_forward_restore_file "${snapshot}/record" "${record_file}" || return 1
+    cf_probe_forward_restore_file "${snapshot}/unit" "${unit_file}" || return 1
+    systemctl daemon-reload || return 1
+    if [[ ${enabled} == yes ]]; then
+        systemctl enable -- "${unit_name}" >/dev/null || return 1
+    else
+        systemctl disable -- "${unit_name}" >/dev/null || return 1
+    fi
+    if [[ ${active} == yes ]]; then
+        systemctl restart -- "${unit_name}" >/dev/null || return 1
+    else
+        systemctl stop -- "${unit_name}" >/dev/null || return 1
+    fi
+    current_active=$(systemctl show -p ActiveState --value -- "${unit_name}" 2>/dev/null) || return 1
+    current_enabled=$(systemctl is-enabled -- "${unit_name}" 2>/dev/null || true)
+    if [[ ${active} == yes ]]; then
+        [[ ${current_active} == active ]] || return 1
+    else
+        case "${current_active}" in inactive|failed) ;; *) return 1 ;; esac
+    fi
+    if [[ ${enabled} == yes ]]; then
+        [[ ${current_enabled} == enabled ]] || return 1
+    else
+        [[ ${current_enabled} != enabled ]] || return 1
+    fi
+}
+
+rollback_cf_probe_forward_snapshot() {
+    local unit=$1 dropin=$2 snapshot=$3
+    if restore_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}"; then
+        discard_cf_probe_forward_snapshot "${snapshot}" \
+            || echo "警告：转发状态已恢复，但临时快照 ${snapshot} 未能清理。" >&2
+        return 0
+    fi
+    echo "严重警告：cf-probe 转发状态未能自动恢复；快照保留在 ${snapshot}。" >&2
+    return 1
+}
+
 # 启用转发模式。标准输出为 yes/no，表示本次是否新建了转发目录，供事务回滚判断。
 prepare_cf_probe_forward_mode() {
-    local unit=$1 dropin=$2 directory hosts_file record_file unit_file unit_name
-    local config host hosts_content record_content unit_content created=no tmp
+    local unit=$1 dropin=$2 external_snapshot=${3:-}
+    local directory hosts_file record_file unit_file unit_name snapshot= snapshot_owned=no
+    local config host hosts_content record_content unit_content created=no files_written=no
     directory=$(cf_probe_forward_dir "${dropin}") || return 1
     hosts_file=$(cf_probe_forward_hosts_file "${dropin}") || return 1
     record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
@@ -993,7 +1145,28 @@ prepare_cf_probe_forward_mode() {
     if [[ -e ${unit_file} || -L ${unit_file} ]]; then
         managed_cf_probe_forward_file "${unit_file}" \
             || { echo '转发单元已存在且不是本助手写入的，拒绝覆盖。' >&2; return 1; }
-    elif ! cf_probe_forward_listen_available; then
+    fi
+    if [[ -e ${directory} || -L ${directory} ]]; then
+        managed_cf_probe_forward_dir "${directory}" \
+            || { echo '转发工作目录已存在且不是本助手创建的，拒绝复用。' >&2; return 1; }
+    fi
+    if cf_probe_forward_mode_present "${unit}" "${dropin}"; then
+        if cf_probe_forward_mode_complete "${unit}" "${dropin}"; then
+            if [[ -n ${external_snapshot} ]]; then
+                [[ -d ${external_snapshot} && ! -L ${external_snapshot} ]] \
+                    || { echo '外层转发事务快照无效，拒绝改写既有状态。' >&2; return 1; }
+                snapshot=${external_snapshot}
+            else
+                snapshot=$(create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${dropin}") \
+                    || { echo '既有转发状态无法建立恢复快照，拒绝复用。' >&2; return 1; }
+                snapshot_owned=yes
+            fi
+        else
+            remove_cf_probe_forward_mode "${unit}" "${dropin}" \
+                || { echo '既有转发残缺状态无法安全清理，拒绝继续启用。' >&2; return 1; }
+        fi
+    fi
+    if [[ -z ${snapshot} ]] && ! cf_probe_forward_listen_available; then
         echo "本机 ${CF_PROBE_FORWARD_LISTEN_ADDRESS}:${CF_PROBE_FORWARD_LISTEN_PORT} 已被占用，拒绝启用转发模式。" >&2
         return 1
     fi
@@ -1010,17 +1183,30 @@ prepare_cf_probe_forward_mode() {
     if ! cf_probe_forward_write_file "${hosts_file}" "${hosts_content}" \
         || ! cf_probe_forward_write_file "${record_file}" "${record_content}" \
         || ! cf_probe_write_go_guard_file "${unit_file}" "${unit_content}"; then
-        rm -f -- "${hosts_file}" "${record_file}"
-        [[ ${created} == no ]] || rmdir -- "${directory}" 2>/dev/null || true
+        if [[ -n ${snapshot} ]]; then
+            [[ ${snapshot_owned} == no ]] \
+                || rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
+        else
+            rm -f -- "${unit_file}" "${hosts_file}" "${record_file}"
+            [[ ${created} == no ]] || rmdir -- "${directory}" 2>/dev/null || true
+        fi
+        echo '转发模式文件写入失败，已撤销本次文件改写。' >&2
         return 1
     fi
+    files_written=yes
     if ! systemctl daemon-reload || ! systemctl enable --now -- "${unit_name}" >/dev/null; then
-        systemctl disable -- "${unit_name}" >/dev/null 2>&1 || true
-        rm -f -- "${unit_file}" "${hosts_file}" "${record_file}"
-        [[ ${created} == no ]] || rmdir -- "${directory}" 2>/dev/null || true
-        systemctl daemon-reload >/dev/null 2>&1 || true
+        if [[ -n ${snapshot} ]]; then
+            [[ ${snapshot_owned} == no ]] \
+                || rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
+        elif [[ ${files_written} == yes ]]; then
+            remove_cf_probe_forward_mode "${unit}" "${dropin}" \
+                || echo '严重警告：本次新建的转发状态未能自动清理，请人工检查。' >&2
+        fi
         echo '转发单元未能启动，已撤销本次转发模式配置。' >&2
         return 1
+    fi
+    if [[ -n ${snapshot} && ${snapshot_owned} == yes ]]; then
+        discard_cf_probe_forward_snapshot "${snapshot}" || return 1
     fi
     printf '%s\n' "${created}"
 }
@@ -1045,7 +1231,7 @@ cf_probe_forward_write_file() {
 # 静默断开，而 HTTP 上报照常，面板仍显示在线。只有在这里核对重写，既有部署才
 # 不必重新纳管一遍。内容一致时不重写，但仍然启用一次，用来补回缺失的开机链接。
 reconcile_cf_probe_forward_unit() {
-    local unit=$1 dropin=$2 record_file unit_file unit_name host expected actual
+    local unit=$1 dropin=$2 record_file unit_file unit_name host expected actual snapshot
     record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
     managed_cf_probe_forward_file "${record_file}" || return 1
     host=$(cf_probe_forward_record_value "${record_file}" FORWARD_HOST) || return 1
@@ -1054,40 +1240,98 @@ reconcile_cf_probe_forward_unit() {
     expected=$(cf_probe_forward_unit_content "${unit}" "${host}") || return 1
     managed_cf_probe_forward_file "${unit_file}" || return 1
     actual=$(sed -n '1,$p' "${unit_file}") || return 1
+    snapshot=$(create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${dropin}") || return 1
     if [[ ${actual} != "${expected}" ]]; then
-        cf_probe_write_go_guard_file "${unit_file}" "${expected}" || return 1
-        systemctl daemon-reload || return 1
+        if ! cf_probe_write_go_guard_file "${unit_file}" "${expected}" \
+            || ! systemctl daemon-reload; then
+            rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
+            return 1
+        fi
         # 只重启本来就在跑的转发器；没在跑的交给下面的 enable --now 拉起。
-        systemctl try-restart -- "${unit_name}" >/dev/null || return 1
+        if ! systemctl try-restart -- "${unit_name}" >/dev/null; then
+            rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
+            return 1
+        fi
     fi
-    systemctl enable --now -- "${unit_name}" >/dev/null || return 1
+    if ! systemctl enable --now -- "${unit_name}" >/dev/null; then
+        rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
+        return 1
+    fi
+    discard_cf_probe_forward_snapshot "${snapshot}"
 }
 
 # 拆除转发模式：只动本助手写的东西，任何一处被人工改过都拒绝，避免误删他人文件。
 remove_cf_probe_forward_mode() {
-    local unit=$1 dropin=$2 directory hosts_file record_file unit_file unit_name
+    local unit=$1 dropin=$2 external_snapshot=${3:-}
+    local directory hosts_file record_file unit_file unit_name snapshot= active_state complete=yes
+    local snapshot_owned=no
     directory=$(cf_probe_forward_dir "${dropin}") || return 1
     hosts_file=$(cf_probe_forward_hosts_file "${dropin}") || return 1
     record_file=$(cf_probe_forward_record_file "${dropin}") || return 1
     unit_file=$(cf_probe_forward_unit_file "${unit}") || return 1
     unit_name=${unit_file##*/}
     [[ -e ${directory} || -L ${directory} || -e ${unit_file} || -L ${unit_file} ]] || return 0
+    if [[ -e ${directory} || -L ${directory} ]]; then
+        managed_cf_probe_forward_dir "${directory}" || return 1
+    else
+        complete=no
+    fi
     if [[ -e ${unit_file} || -L ${unit_file} ]]; then
         managed_cf_probe_forward_file "${unit_file}" || return 1
-        systemctl disable --now -- "${unit_name}" >/dev/null 2>&1 || true
-        rm -f -- "${unit_file}" || return 1
-        systemctl daemon-reload || return 1
-        systemctl reset-failed -- "${unit_name}" >/dev/null 2>&1 || true
+    else
+        complete=no
     fi
     if [[ -e ${hosts_file} || -L ${hosts_file} ]]; then
         managed_cf_probe_forward_file "${hosts_file}" || return 1
-        rm -f -- "${hosts_file}" || return 1
+    else
+        complete=no
     fi
     if [[ -e ${record_file} || -L ${record_file} ]]; then
         managed_cf_probe_forward_file "${record_file}" || return 1
-        rm -f -- "${record_file}" || return 1
+    else
+        complete=no
     fi
-    [[ ! -d ${directory} ]] || rmdir -- "${directory}" || return 1
+    if [[ ${complete} == yes ]]; then
+        if [[ -n ${external_snapshot} ]]; then
+            [[ -d ${external_snapshot} && ! -L ${external_snapshot} ]] || return 1
+            snapshot=${external_snapshot}
+        else
+            snapshot=$(create_cf_probe_forward_snapshot "${unit}" "${dropin}" "${dropin}") || return 1
+            snapshot_owned=yes
+        fi
+    fi
+    if [[ -e ${unit_file} || -L ${unit_file} ]]; then
+        if ! systemctl disable --now -- "${unit_name}" 1>&2; then
+            [[ -z ${snapshot} || ${snapshot_owned} == no ]] \
+                || rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
+            return 1
+        fi
+        active_state=$(systemctl show -p ActiveState --value -- "${unit_name}" 2>/dev/null) || {
+            [[ -z ${snapshot} || ${snapshot_owned} == no ]] \
+                || rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
+            return 1
+        }
+        case "${active_state}" in
+            inactive|failed) ;;
+            *)
+                echo "转发单元停用后仍处于 ${active_state:-未知} 状态，拒绝删除文件。" >&2
+                [[ -z ${snapshot} || ${snapshot_owned} == no ]] \
+                    || rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
+                return 1
+                ;;
+        esac
+    fi
+    if ! rm -f -- "${unit_file}" \
+        || ! systemctl daemon-reload \
+        || ! rm -f -- "${hosts_file}" "${record_file}" \
+        || ! { [[ ! -d ${directory} ]] || rmdir -- "${directory}"; }; then
+        if [[ -n ${snapshot} && ${snapshot_owned} == yes ]]; then
+            rollback_cf_probe_forward_snapshot "${unit}" "${dropin}" "${snapshot}" || true
+        fi
+        return 1
+    fi
+    systemctl reset-failed -- "${unit_name}" >/dev/null 2>&1 || true
+    [[ -z ${snapshot} || ${snapshot_owned} == no ]] || discard_cf_probe_forward_snapshot "${snapshot}"
 }
 
 cf_probe_forward_mode_active() {
