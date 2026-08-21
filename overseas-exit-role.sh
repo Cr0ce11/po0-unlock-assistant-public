@@ -824,6 +824,25 @@ remove_managed_public_key_file() {
     fi
 }
 
+stop_core_service_for_rollback() {
+    local unit=$1 unit_file=$2 label=$3 active_state= disable_error=
+    if [[ -e ${unit_file} || -L ${unit_file} ]]; then
+        if ! disable_error=$(systemctl disable --now -- "${unit}" 2>&1); then
+            [[ -z ${disable_error} ]] \
+                || printf '[国外出口] systemd：%s\n' "${disable_error}" >&2
+            die "${label}停用失败；国外出口材料和 ACTIVE 状态已保留，修复 systemd 后可安全重试完整回滚。"
+        fi
+    fi
+    active_state=$(systemctl show -p ActiveState --value -- "${unit}" 2>/dev/null) \
+        || die "无法确认${label}已经停止；国外出口材料和 ACTIVE 状态已保留，可安全重试完整回滚。"
+    case "${active_state}" in
+        inactive|failed) ;;
+        *)
+            die "${label}仍在运行或状态未稳定；国外出口材料和 ACTIVE 状态已保留，可安全重试完整回滚。"
+            ;;
+    esac
+}
+
 rollback() {
     local state installed_before bin_installed_before active_before enabled_before closed_marker
     require_root
@@ -832,8 +851,10 @@ rollback() {
     bin_installed_before=$(<"${state}/tinyproxy-bin-installed-before")
     active_before=$(<"${state}/tinyproxy-active-before")
     enabled_before=$(<"${state}/tinyproxy-enabled-before")
-    systemctl disable --now po0-unlock-reverse-tunnel.service 2>/dev/null || true
-    systemctl disable --now po0-unlock-exit-proxy.service 2>/dev/null || true
+    stop_core_service_for_rollback \
+        po0-unlock-reverse-tunnel.service "${TUNNEL_UNIT}" '反向隧道服务'
+    stop_core_service_for_rollback \
+        po0-unlock-exit-proxy.service "${PROXY_UNIT}" '国外出口代理服务'
     remove_managed_file "${TUNNEL_UNIT}" 644
     remove_managed_file "${PROXY_UNIT}" 600
     remove_managed_file "${PROXY_CONF}" 644

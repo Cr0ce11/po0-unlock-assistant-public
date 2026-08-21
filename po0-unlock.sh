@@ -1056,6 +1056,25 @@ remove_managed_public_key_file() {
     fi
 }
 
+stop_core_service_for_rollback() {
+    local unit=$1 unit_file=$2 label=$3 active_state= disable_error=
+    if [[ -e ${unit_file} || -L ${unit_file} ]]; then
+        if ! disable_error=$(systemctl disable --now -- "${unit}" 2>&1); then
+            [[ -z ${disable_error} ]] \
+                || printf '[国外出口] systemd：%s\n' "${disable_error}" >&2
+            die "${label}停用失败；国外出口材料和 ACTIVE 状态已保留，修复 systemd 后可安全重试完整回滚。"
+        fi
+    fi
+    active_state=$(systemctl show -p ActiveState --value -- "${unit}" 2>/dev/null) \
+        || die "无法确认${label}已经停止；国外出口材料和 ACTIVE 状态已保留，可安全重试完整回滚。"
+    case "${active_state}" in
+        inactive|failed) ;;
+        *)
+            die "${label}仍在运行或状态未稳定；国外出口材料和 ACTIVE 状态已保留，可安全重试完整回滚。"
+            ;;
+    esac
+}
+
 rollback() {
     local state installed_before bin_installed_before active_before enabled_before closed_marker
     require_root
@@ -1064,8 +1083,10 @@ rollback() {
     bin_installed_before=$(<"${state}/tinyproxy-bin-installed-before")
     active_before=$(<"${state}/tinyproxy-active-before")
     enabled_before=$(<"${state}/tinyproxy-enabled-before")
-    systemctl disable --now po0-unlock-reverse-tunnel.service 2>/dev/null || true
-    systemctl disable --now po0-unlock-exit-proxy.service 2>/dev/null || true
+    stop_core_service_for_rollback \
+        po0-unlock-reverse-tunnel.service "${TUNNEL_UNIT}" '反向隧道服务'
+    stop_core_service_for_rollback \
+        po0-unlock-exit-proxy.service "${PROXY_UNIT}" '国外出口代理服务'
     remove_managed_file "${TUNNEL_UNIT}" 644
     remove_managed_file "${PROXY_UNIT}" 600
     remove_managed_file "${PROXY_CONF}" 644
@@ -4889,7 +4910,7 @@ __PO0_CN_ENTRY_ROLE_018D57A1_PAYLOAD__
     chmod 0600 "${exit_new}" "${cn_entry_new}"
     exit_actual=$(sha256sum "${exit_new}" | awk '{print $1}')
     cn_entry_actual=$(sha256sum "${cn_entry_new}" | awk '{print $1}')
-    [[ ${exit_actual} == 'a74c13b8078091657888a6b9a1d041ebb1d72fd4af16a42413aba51cf0a8e5eb' ]] || die '国外出口内置组件哈希校验失败。'
+    [[ ${exit_actual} == 'bb75e1213278b7170d885038b790e7a2ef43ea13b0b9f38f3029e2262922b5d5' ]] || die '国外出口内置组件哈希校验失败。'
     [[ ${cn_entry_actual} == 'a6fc704b09b89eec520678c8638a8fb8e02cfc49f4d1a29464708d472854117f' ]] || die '国内入口内置组件哈希校验失败。'
     /bin/bash -n "${exit_new}" || die '国外出口内置组件语法检查失败。'
     /bin/bash -n "${cn_entry_new}" || die '国内入口内置组件语法检查失败。'
@@ -4920,7 +4941,7 @@ bundle_self_test() {
     rm -f -- "${helper_test}"
     printf 'Po0 单文件版本=%s\n' '2.5.30'
     printf 'Po0 单文件版本类型=%s\n' "${SCRIPT_EDITION_LABEL}"
-    printf 'overseas-exit-role SHA-256=%s\n' 'a74c13b8078091657888a6b9a1d041ebb1d72fd4af16a42413aba51cf0a8e5eb'
+    printf 'overseas-exit-role SHA-256=%s\n' 'bb75e1213278b7170d885038b790e7a2ef43ea13b0b9f38f3029e2262922b5d5'
     printf 'cn-entry-role SHA-256=%s\n' 'a6fc704b09b89eec520678c8638a8fb8e02cfc49f4d1a29464708d472854117f'
     printf '%s\n'         "scan-agents -> cn-entry:${CN_ENTRY_CMD_SCAN}"         "rollback[1] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_SERVICES}"         "rollback[2] -> overseas-exit:${EXIT_CMD_ROLLBACK}"         "rollback[3] -> cn-entry:${CN_ENTRY_CMD_ROLLBACK_FINALIZE}"         "status -> cn-entry:${CN_ENTRY_CMD_STATUS}"         "status -> overseas-exit:${EXIT_CMD_STATUS}"         "health -> cn-entry:${CN_ENTRY_CMD_HEALTH}"         "health -> overseas-exit:${EXIT_CMD_HEALTH}"         "repair -> overseas-exit:${EXIT_CMD_REPAIR}"
     printf '%s\n' 'SELF_TEST=PASS'
