@@ -780,10 +780,10 @@ test_source_lifecycle_contracts() {
         '刷新路径没有核对转发单元，既有部署补不上开机自启' || return 1
     assert_eq 2 "$(grep -Fc '(( compat_rc == 3 )) || exit 1' <<<"${helper_case}")" \
         '启用与刷新没有同时处理「跳过测速目标但继续配置」的返回码' || return 1
-    assert_contains "${source}" 'enable_args+=("${outbound_mode}")' \
-        '扫描菜单没有把选定的出站方式传给底层' || return 1
-    assert_contains "${source}" '[[ ${outbound_mode} == env ]] || enable_args+=' \
-        '默认模式仍然改变了既有服务的调用形态' || return 1
+    assert_contains "${scan_body}" '"${HELPER}" enable-service "${unit}" || rc=$?' \
+        '默认模式没有按既有调用形态启用服务' || return 1
+    assert_contains "${scan_body}" '"${HELPER}" enable-service "${unit}" "${outbound_mode}" || rc=$?' \
+        '扫描菜单没有把选定的非默认出站方式传给底层' || return 1
     assert_contains "${source}" 'switch_cf_probe_outbound_mode "${unit}" "${state}"' \
         '已托管菜单没有提供切换出站方式' || return 1
     assert_contains "${source}" 'remove_cf_probe_forward_mode "${TX_UNIT}" "${TX_FORWARD_DROPIN}"' \
@@ -1697,20 +1697,199 @@ test_switch_outbound_mode_paths() (
 # enable-service / disable-service / refresh-service 因此一直失败，直到有人真的去增删
 # Agent 才会暴露——六个版本没被发现。
 helper_region() {
+    local source=${1:-${CN_ENTRY_ROLE}}
     awk '
         index($0, "cat >\"${tmp}\" <<\047EOF\047") { capture=1; next }
         capture && $0 == "EOF" { exit }
         capture { print }
-    ' "${CN_ENTRY_ROLE}"
+    ' "${source}"
 }
 
 role_region() {
+    local source=${1:-${CN_ENTRY_ROLE}}
     awk '
         index($0, "cat >\"${tmp}\" <<\047EOF\047") { capture=1; next }
         capture && $0 == "EOF" { capture=0; next }
         !capture { print }
-    ' "${CN_ENTRY_ROLE}"
+    ' "${source}"
 }
+
+dispatch_commands() {
+    awk '
+        $0 == "case \"${1:-}\" in" {
+            in_dispatch=1
+            found_dispatch=1
+            next
+        }
+        in_dispatch && /^    [A-Za-z_][A-Za-z0-9_-]*(\|[A-Za-z_][A-Za-z0-9_-]*)*\)/ {
+            labels=$0
+            sub(/^[[:space:]]+/, "", labels)
+            sub(/\).*/, "", labels)
+            count=split(labels, names, /\|/)
+            for (item=1; item<=count; item++) print names[item]
+            found_command=1
+            next
+        }
+        in_dispatch && /^esac$/ { exit }
+        END { if (!found_dispatch || !found_command) exit 1 }
+    '
+}
+
+literal_role_bridge_calls() {
+    local source=${1:-${CN_ENTRY_ROLE}}
+    role_region "${source}" | awk '
+        /^[[:space:]]*#/ { next }
+        {
+            original=$0
+            line=original
+            while (match(line, /"\$\{HELPER\}"[[:space:]]+[A-Za-z_][A-Za-z0-9_-]*/)) {
+                call=substr(line, RSTART, RLENGTH)
+                sub(/^"\$\{HELPER\}"[[:space:]]+/, "", call)
+                printf "helper\t%s\t%d\n", call, NR
+                line=substr(line, RSTART + RLENGTH)
+            }
+            line=original
+            while (match(line, /"\$0"[[:space:]]+[A-Za-z_][A-Za-z0-9_-]*/)) {
+                call=substr(line, RSTART, RLENGTH)
+                sub(/^"\$0"[[:space:]]+/, "", call)
+                printf "role\t%s\t%d\n", call, NR
+                line=substr(line, RSTART + RLENGTH)
+            }
+        }
+    '
+}
+
+check_role_bridge_dispatch_contract() {
+    local source=${1:-${CN_ENTRY_ROLE}} helper_dispatch role_dispatch dynamic_calls
+    local target command line available violations=0
+    helper_dispatch=$(helper_region "${source}" | dispatch_commands) \
+        || { printf '%s\n' '未能提取 helper dispatch。' >&2; return 1; }
+    role_dispatch=$(role_region "${source}" | dispatch_commands) \
+        || { printf '%s\n' '未能提取角色 dispatch。' >&2; return 1; }
+
+    # 子命令若藏在变量或数组里，静态契约就无法核对。跨进程调用必须把命令名直接
+    # 写在 ${HELPER} 或 $0 后面；参数仍然可以使用变量。
+    dynamic_calls=$(role_region "${source}" \
+        | grep -nE '"\$\{HELPER\}"[[:space:]]+"\$\{|"\$0"[[:space:]]+"\$\{' || true)
+    if [[ -n ${dynamic_calls} ]]; then
+        printf '跨进程调用使用了动态子命令，契约守卫无法核对：\n%s\n' "${dynamic_calls}" >&2
+        violations=$((violations + 1))
+    fi
+
+    while IFS=$'\t' read -r target command line; do
+        [[ -n ${target} && -n ${command} ]] || continue
+        case "${target}" in
+            helper) available=${helper_dispatch} ;;
+            role) available=${role_dispatch} ;;
+            *)
+                printf '未知的跨进程调用目标：%s\n' "${target}" >&2
+                violations=$((violations + 1))
+                continue
+                ;;
+        esac
+        if ! grep -Fxq -- "${command}" <<<"${available}"; then
+            printf '角色区间第 %s 行调用 %s 子命令 %s，但对应 dispatch 没有该入口。\n' \
+                "${line}" "${target}" "${command}" >&2
+            violations=$((violations + 1))
+        fi
+    done < <(literal_role_bridge_calls "${source}")
+    (( violations == 0 ))
+}
+
+test_role_bridge_commands_match_dispatches() {
+    check_role_bridge_dispatch_contract "${CN_ENTRY_ROLE}" \
+        || { fail '角色跨进程调用与 dispatch 契约不一致'; return 1; }
+}
+
+test_role_bridge_guard_rejects_unregistered_commands() (
+    local mutated=${WORK_ROOT}/cn-entry-role-unregistered.sh output
+    awk '
+        $0 == "case \"${1:-}\" in" {
+            dispatches++
+            if (dispatches == 2) {
+                print "if false; then \"${HELPER}\" qa-missing-helper; fi"
+                print "if false; then /bin/bash -- \"$0\" qa-missing-role; fi"
+                print "if false; then \"${HELPER}\" \"${qa_dynamic_command}\"; fi"
+            }
+        }
+        { print }
+    ' "${CN_ENTRY_ROLE}" >"${mutated}"
+    if output=$(check_role_bridge_dispatch_contract "${mutated}" 2>&1); then
+        fail '新增未登记子命令后契约守卫仍然通过'
+        return 1
+    fi
+    assert_contains "${output}" 'qa-missing-helper' \
+        '契约守卫没有指出缺失的 helper 子命令' || return 1
+    assert_contains "${output}" 'qa-missing-role' \
+        '契约守卫没有指出缺失的角色子命令' || return 1
+    assert_contains "${output}" 'qa_dynamic_command' \
+        '契约守卫没有拒绝无法静态核对的动态子命令' || return 1
+)
+
+# 从真实角色 dispatch 进入 health，再让原 health 逻辑调用 helper 的只读入口。
+# 这里只替换系统状态与路径为临时夹具，不抽取或重写被测 health 函数。
+test_read_only_helper_bridge_runs_through_role_entry() (
+    local case_dir state_root state systemd_root helper component log output unit
+    unit=cf-probe.service
+    case_dir=$(mktemp -d "${WORK_ROOT}/role-health-bridge.XXXXXX") || return 1
+    state_root=${case_dir}/state-root
+    state=${state_root}/install
+    systemd_root=${case_dir}/systemd
+    helper=${case_dir}/helper
+    component=${case_dir}/po0-cn-entry
+    log=${case_dir}/helper.log
+    mkdir -p "${state}" "${systemd_root}/${unit}.d"
+    printf '%s\n' "${state}" >"${state_root}/ACTIVE"
+    printf '%s\n' "${unit}" >"${state}/managed-services"
+    printf '%s\n' '# Managed by Po0 Unlock; do not edit manually.' \
+        >"${systemd_root}/${unit}.d/90-po0-unlock-proxy.conf"
+    printf '%s\n' \
+        'Acquire::http::Proxy "http://127.0.0.1:13128";' \
+        'Acquire::https::Proxy "http://127.0.0.1:13128";' >"${case_dir}/apt.conf"
+    printf '%s\n' \
+        '# 国内入口管理出站：国外出口反向 SSH 代理' \
+        "export ALL_PROXY='socks5h://127.0.0.1:19080'" >"${case_dir}/profile.conf"
+    printf '%s\n' '#!/usr/bin/env bash' \
+        'printf "%s\n" "$*" >>"${BRIDGE_LOG}"' \
+        '[[ ${1:-} == cf-probe-forward-health ]] || exit 2' \
+        'printf "%s\n" "正常 真实角色入口已取得 helper 结论"' >"${helper}"
+    chmod 0755 "${helper}"
+
+    awk -v state_root="${state_root}" -v helper="${helper}" \
+        -v apt_conf="${case_dir}/apt.conf" -v profile_conf="${case_dir}/profile.conf" \
+        -v systemd_root="${systemd_root}" '
+        /^STATE_ROOT=/ { print "STATE_ROOT=" state_root; next }
+        /^HELPER=/ { print "HELPER=" helper; next }
+        /^APT_CONF=/ { print "APT_CONF=" apt_conf; next }
+        /^PROFILE_CONF=/ { print "PROFILE_CONF=" profile_conf; next }
+        {
+            gsub(/\/etc\/systemd\/system/, systemd_root)
+        }
+        $0 == "case \"${1:-}\" in" {
+            dispatches++
+            if (dispatches == 2) {
+                print "require_root() { :; }"
+                print "health_safe_state() { printf \047%s\\n\047 \"${FIXTURE_STATE}\"; }"
+                print "health_regular_root_file() { return 0; }"
+                print "tunnel_authorized_keys_hardened() { return 0; }"
+                print "id() { printf \047%s\\n\047 1000; }"
+                print "pgrep() { return 0; }"
+                print "ss() { printf \047%s\\n\047 \047LISTEN 0 128 127.0.0.1:13128 0.0.0.0:*\047 \047LISTEN 0 128 127.0.0.1:19080 0.0.0.0:*\047; }"
+                print "curl() { return 0; }"
+                print "systemctl() { case \"${1:-}\" in show) printf \047%s\\n\047 loaded ;; is-active) return 0 ;; *) return 0 ;; esac; }"
+            }
+        }
+        { print }
+    ' "${CN_ENTRY_ROLE}" >"${component}"
+    /bin/bash -n "${component}" || { fail '真实角色入口夹具语法错误'; return 1; }
+    export BRIDGE_LOG=${log} FIXTURE_STATE=${state}
+    output=$(/bin/bash "${component}" health 2>&1) \
+        || { fail '真实角色 health 入口运行失败'; return 1; }
+    assert_contains "${output}" '真实角色入口已取得 helper 结论' \
+        'health 没有显示 helper 只读入口返回的结论' || return 1
+    assert_eq 'cf-probe-forward-health cf-probe.service' "$(<"${log}")" \
+        '真实角色入口没有按契约调用 helper 子命令' || return 1
+)
 
 test_helper_library_defines_every_function_it_calls() (
     local helper role name violations=0
@@ -1856,6 +2035,9 @@ main() {
     run_case '出站方式选择菜单的取值与拒绝' test_outbound_mode_prompt_choices
     run_case '旧 Shell cf-probe 只提供 env 出站方式' test_shell_cf_probe_only_offers_env_mode
     run_case '切换出站方式的正常、取消与两种失败路径' test_switch_outbound_mode_paths
+    run_case '角色跨进程字面子命令均接入对应 dispatch' test_role_bridge_commands_match_dispatches
+    run_case '新增未登记或动态子命令会被契约守卫拒绝' test_role_bridge_guard_rejects_unregistered_commands
+    run_case 'helper 只读桥接经真实角色入口运行' test_read_only_helper_bridge_runs_through_role_entry
     run_case 'helper 不调用只在角色侧定义的函数' test_helper_library_defines_every_function_it_calls
     run_case '角色脚本不调用只在组件里定义的函数' test_role_does_not_call_helper_only_functions
     run_case 'helper 不读取自己没赋值的常量' test_helper_library_assigns_every_constant_it_reads
