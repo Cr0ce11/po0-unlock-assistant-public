@@ -1489,42 +1489,158 @@ test_forward_mode_health_reports() (
 # 出站方式的选择菜单：回车与 1 都是默认模式，2 才是转发，其他输入不得当成有效选择。
 test_outbound_mode_prompt_choices() (
     local body out rc
-    body=$(sed -n '/^prompt_cf_probe_outbound_mode() {/,/^}/p' "${CN_ENTRY_ROLE}")
+    body=$(sed -n '/^cf_probe_forward_mode_supported() {/,/^}/p' "${CN_ENTRY_ROLE}")$'\n'
+    body+=$(sed -n '/^prompt_cf_probe_outbound_mode() {/,/^}/p' "${CN_ENTRY_ROLE}")
     [[ -n ${body} ]] || { fail '未能提取出站方式选择函数'; return 1; }
     eval "${body}"
+    cf_probe_outbound_capability() { printf '%s\n' forward; }
 
-    assert_eq env "$(prompt_cf_probe_outbound_mode <<<'' 2>/dev/null)" \
+    assert_eq env "$(prompt_cf_probe_outbound_mode cf-probe.service <<<'' 2>/dev/null)" \
         '直接回车没有落到默认模式' || return 1
-    assert_eq env "$(prompt_cf_probe_outbound_mode <<<'1' 2>/dev/null)" \
+    assert_eq env "$(prompt_cf_probe_outbound_mode cf-probe.service <<<'1' 2>/dev/null)" \
         '选 1 没有落到默认模式' || return 1
-    assert_eq forward "$(prompt_cf_probe_outbound_mode <<<'2' 2>/dev/null)" \
+    assert_eq forward "$(prompt_cf_probe_outbound_mode cf-probe.service <<<'2' 2>/dev/null)" \
         '选 2 没有落到转发模式' || return 1
 
     rc=0
-    out=$(prompt_cf_probe_outbound_mode <<<'9' 2>/dev/null) || rc=$?
+    out=$(prompt_cf_probe_outbound_mode cf-probe.service <<<'9' 2>/dev/null) || rc=$?
     [[ ${rc} -ne 0 ]] || { fail '无效选择没有返回非零'; return 1; }
     [[ -z ${out} ]] || { fail "无效选择仍然输出了模式：${out}"; return 1; }
-    assert_contains "$(prompt_cf_probe_outbound_mode <<<'9' 2>&1 >/dev/null)" '选择无效' \
+    assert_contains "$(prompt_cf_probe_outbound_mode cf-probe.service <<<'9' 2>&1 >/dev/null)" '选择无效' \
         '无效输入没有说明是输入错误' || return 1
 
     # 主动取消必须是被支持的出路，且不能被当成输入错误
-    assert_contains "$(prompt_cf_probe_outbound_mode <<<'0' 2>&1 >/dev/null)" '0) 取消' \
+    assert_contains "$(prompt_cf_probe_outbound_mode cf-probe.service <<<'0' 2>&1 >/dev/null)" '0) 取消' \
         '选项里没有提供取消' || return 1
     rc=0
-    out=$(prompt_cf_probe_outbound_mode <<<'0' 2>/dev/null) || rc=$?
+    out=$(prompt_cf_probe_outbound_mode cf-probe.service <<<'0' 2>/dev/null) || rc=$?
     [[ ${rc} -ne 0 ]] || { fail '取消没有返回非零，会被当成选定了模式'; return 1; }
     [[ -z ${out} ]] || { fail "取消仍然输出了模式：${out}"; return 1; }
-    assert_not_contains "$(prompt_cf_probe_outbound_mode <<<'0' 2>&1 >/dev/null)" '选择无效' \
+    assert_not_contains "$(prompt_cf_probe_outbound_mode cf-probe.service <<<'0' 2>&1 >/dev/null)" '选择无效' \
         '主动取消被误报成输入错误' || return 1
+)
+
+# forward 依赖 Go 版受保护配置文件；旧 Shell 版只能用 env。菜单必须在用户选择前
+# 判定能力，不能先展示一个注定在底层失败的选项。历史上已经启用 forward 的异常
+# 状态仍要保留切回 env 的入口，避免用户被锁在不兼容配置里。
+test_shell_cf_probe_only_offers_env_mode() (
+    local source body case_dir state helper log notice out component temp_root
+    local installed_before installed_after rc=0
+    source=$(<"${CN_ENTRY_ROLE}")
+    assert_contains "${source}" 'cf_probe_forward_mode_supported "${unit}"' \
+        '菜单没有在展示 forward 前识别 cf-probe 实现能力' || return 1
+    assert_contains "${source}" 'prompt_cf_probe_outbound_mode "${unit}"' \
+        '扫描路径没有把目标服务交给出站能力判断' || return 1
+    assert_contains "${source}" 'cf-probe-outbound-capability) current_component_cf_probe_outbound_capability' \
+        '角色组件没有把能力查询桥接到当前版本 helper' || return 1
+    body=$(sed -n '/^cf_probe_forward_mode_supported() {/,/^}/p' "${CN_ENTRY_ROLE}")$'\n'
+    body+=$(sed -n '/^cf_probe_outbound_mode_switch_available() {/,/^}/p' "${CN_ENTRY_ROLE}")$'\n'
+    body+=$(sed -n '/^prompt_cf_probe_outbound_mode() {/,/^}/p' "${CN_ENTRY_ROLE}")$'\n'
+    body+=$(sed -n '/^switch_cf_probe_outbound_mode() {/,/^}/p' "${CN_ENTRY_ROLE}")$'\n'
+    body+=$(sed -n '/^manage_configured_service() {/,/^}/p' "${CN_ENTRY_ROLE}")
+    [[ ${body} == *cf_probe_outbound_mode_switch_available* ]] \
+        || { fail '未能提取 cf-probe 出站能力菜单函数'; return 1; }
+    eval "${body}"
+
+    # 真跑完整角色组件，而不是直接运行 helper 片段：角色查询必须先进入当前组件，
+    # 再从当前组件提取临时 helper 执行只读入口，且不能刷新已安装 helper 或写状态锁。
+    case_dir=$(mktemp -d "${WORK_ROOT}/outbound-capability.XXXXXX") || return 1
+    state=${case_dir}/state
+    temp_root=${case_dir}/tmp
+    helper=${case_dir}/installed-helper
+    mkdir -p "${state}" "${temp_root}"
+    printf '%s\n' 'installed helper must remain unchanged' >"${helper}"
+    chmod 0755 "${helper}"
+    installed_before=$(sha256sum "${helper}" | awk '{print $1}') || return 1
+    component=${case_dir}/po0-cn-entry
+    awk -v state="${state}" -v helper="${helper}" -v temp_root="${temp_root}" '
+        /^STATE_ROOT=/ { print "STATE_ROOT=" state; next }
+        /^HELPER=/ { print "HELPER=" helper; next }
+        /^CURRENT_HELPER_TEMP_ROOT=/ { print "CURRENT_HELPER_TEMP_ROOT=" temp_root; next }
+        /^usage\(\) \{/ && !injected {
+            print "is_cf_probe_service() { return 0; }"
+            print "cf_probe_go_config_path_unverified() { [[ ${FIXTURE_CF_KIND:-} == go ]] && { printf \"%s\\n\" /fixture/config.conf; return 0; }; return 1; }"
+            print "cf_probe_script_path() { [[ ${FIXTURE_CF_KIND:-} == shell ]] && { printf \"%s\\n\" /fixture/cf-probe.sh; return 0; }; return 1; }"
+            print "cf_probe_forward_mode_present() { [[ ${FIXTURE_FORWARD_ACTIVE:-no} == yes ]]; }"
+            injected=1
+        }
+        { print }
+    ' "${CN_ENTRY_ROLE}" >"${component}"
+    chmod 0700 "${component}"
+    out=$(FIXTURE_CF_KIND=go FIXTURE_FORWARD_ACTIVE=no \
+        /bin/bash "${component}" cf-probe-outbound-capability cf-probe.service) \
+        || { fail 'Go 版能力查询入口运行失败'; return 1; }
+    assert_eq forward "${out}" 'Go 版没有被识别为支持 forward' || return 1
+    out=$(FIXTURE_CF_KIND=shell FIXTURE_FORWARD_ACTIVE=no \
+        /bin/bash "${component}" cf-probe-outbound-capability cf-probe.service) \
+        || { fail '旧 Shell 能力查询入口运行失败'; return 1; }
+    assert_eq env-shell "${out}" '旧 Shell 没有被限制为 env' || return 1
+    out=$(FIXTURE_CF_KIND=shell FIXTURE_FORWARD_ACTIVE=yes \
+        /bin/bash "${component}" cf-probe-outbound-capability cf-probe.service) \
+        || { fail '旧 Shell 历史 forward 能力查询入口运行失败'; return 1; }
+    assert_eq env-shell-forward-active "${out}" \
+        '旧 Shell 的历史 forward 状态没有保留撤销标记' || return 1
+    out=$(FIXTURE_CF_KIND=unknown FIXTURE_FORWARD_ACTIVE=no \
+        /bin/bash "${component}" cf-probe-outbound-capability cf-probe.service) \
+        || { fail '未知实现能力查询入口运行失败'; return 1; }
+    assert_eq env-unknown "${out}" '未知实现没有保守退回 env' || return 1
+    installed_after=$(sha256sum "${helper}" | awk '{print $1}') || return 1
+    assert_eq "${installed_before}" "${installed_after}" \
+        '只读能力查询改写了已安装 helper' || return 1
+    [[ ! -e ${state}/service-proxy.lock ]] \
+        || { fail '只读能力查询创建了服务写锁'; return 1; }
+    [[ -z $(find "${temp_root}" -mindepth 1 -print -quit) ]] \
+        || { fail '只读能力查询留下了临时 helper'; return 1; }
+
+    case_dir=$(mktemp -d "${WORK_ROOT}/shell-outbound.XXXXXX") || return 1
+    state=${case_dir}/state
+    mkdir -p "${state}"
+    : >"${state}/service-proxy-actions.log"
+    helper=${case_dir}/helper
+    log=${case_dir}/helper.log
+    printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$*" >>"${CALL_LOG}"' >"${helper}"
+    chmod 0700 "${helper}"
+    export CALL_LOG=${log}
+    HELPER=${helper}
+    cf_probe_outbound_capability() { printf '%s\n' env-shell; }
+    refresh_helper_from_state() { :; }
+
+    notice=${case_dir}/notice
+    out=$(prompt_cf_probe_outbound_mode cf-probe.service <<<'2' 2>"${notice}") || rc=$?
+    assert_eq 0 "${rc}" '旧 Shell cf-probe 的默认 env 选择失败' || return 1
+    assert_eq env "${out}" '旧 Shell cf-probe 仍然接受了 forward' || return 1
+    assert_contains "$(<"${notice}")" '旧 Shell' '菜单没有说明为何只使用默认方式' || return 1
+    assert_not_contains "$(<"${notice}")" '2) 在 1 的基础上' \
+        '旧 Shell cf-probe 仍展示了 forward 选项' || return 1
+
+    rc=0
+    out=$(manage_configured_service cf-probe.service '识别为 CF Probe 监控 Agent' "${state}" \
+        <<<'3' 2>&1) || rc=$?
+    [[ ${rc} -ne 0 ]] || { fail '旧 Shell cf-probe 的管理菜单仍接受选项 3'; return 1; }
+    assert_not_contains "${out}" '3) 切换出站方式' \
+        '旧 Shell cf-probe 的管理菜单仍展示切换入口' || return 1
+    [[ ! -s ${log} ]] || { fail '拒绝旧 Shell forward 时仍调用了底层助手'; return 1; }
+
+    cf_probe_outbound_capability() { printf '%s\n' env-shell-forward-active; }
+    out=$(manage_configured_service cf-probe.service '识别为 CF Probe 监控 Agent' "${state}" \
+        <<<$'3\ny' 2>&1) \
+        || { fail '旧 Shell cf-probe 已有 forward 时无法切回 env'; return 1; }
+    assert_contains "${out}" '3) 切换出站方式' '已有 forward 时没有保留切回入口' || return 1
+    assert_eq 'disable-service cf-probe.service' "$(sed -n '1p' "${log}")" \
+        '切回 env 前没有先撤销旧配置' || return 1
+    assert_eq 'enable-service cf-probe.service env' "$(sed -n '2p' "${log}")" \
+        '旧 Shell cf-probe 切回时没有明确使用 env 模式' || return 1
 )
 
 # 切换出站方式必须先撤销再重新纳管；任一步失败都要说清楚服务当前处于什么状态。
 test_switch_outbound_mode_paths() (
     local body case_dir state log out rc
-    body=$(sed -n '/^prompt_cf_probe_outbound_mode() {/,/^}/p' "${CN_ENTRY_ROLE}")
+    body=$(sed -n '/^cf_probe_forward_mode_supported() {/,/^}/p' "${CN_ENTRY_ROLE}")$'\n'
+    body+=$(sed -n '/^prompt_cf_probe_outbound_mode() {/,/^}/p' "${CN_ENTRY_ROLE}")
     body=${body}$'\n'$(sed -n '/^switch_cf_probe_outbound_mode() {/,/^}/p' "${CN_ENTRY_ROLE}")
     [[ ${body} == *switch_cf_probe_outbound_mode* ]] || { fail '未能提取切换函数'; return 1; }
     eval "${body}"
+    cf_probe_outbound_capability() { printf '%s\n' forward; }
     refresh_helper_from_state() { :; }
 
     case_dir=$(mktemp -d "${WORK_ROOT}/switch.XXXXXX") || return 1
@@ -1738,6 +1854,7 @@ main() {
     run_case '转发受管状态拒绝内容漂移' test_forward_managed_state_rejects_tampered_content
     run_case '转发模式健康检查区分正常、异常与提醒' test_forward_mode_health_reports
     run_case '出站方式选择菜单的取值与拒绝' test_outbound_mode_prompt_choices
+    run_case '旧 Shell cf-probe 只提供 env 出站方式' test_shell_cf_probe_only_offers_env_mode
     run_case '切换出站方式的正常、取消与两种失败路径' test_switch_outbound_mode_paths
     run_case 'helper 不调用只在角色侧定义的函数' test_helper_library_defines_every_function_it_calls
     run_case '角色脚本不调用只在组件里定义的函数' test_role_does_not_call_helper_only_functions

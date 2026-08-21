@@ -5,6 +5,7 @@ usage() {
   po0-cn-entry status
   po0-cn-entry test
   po0-cn-entry run <命令> [参数...]
+  po0-cn-entry cf-probe-outbound-capability <systemd-unit>
   po0-cn-entry enable-service <systemd-unit> [env|forward]
   po0-cn-entry disable-service <systemd-unit>
   po0-cn-entry set-report-ip <komari-unit> <IPv4>
@@ -44,6 +45,33 @@ case "${1:-}" in
         [[ $# -gt 0 ]] || { usage; exit 2; }
         proxy_env
         exec "$@"
+        ;;
+    cf-probe-outbound-capability)
+        # 只读入口，供当前角色脚本在展示菜单前区分 Go 与旧 Shell 实现。
+        # 不复用已经安装的 helper：扫描可能正由一个较新的临时组件执行，直接
+        # 查询当前组件才能避免旧 helper 对新能力返回过时结论。
+        unit=${2:-}
+        [[ -n ${unit} ]] || { usage; exit 2; }
+        valid_helper_service_unit "${unit}" \
+            || { echo '服务名必须是合法的 .service 单元名。' >&2; exit 2; }
+        is_cf_probe_service "${unit}" \
+            || { echo '目标服务不是可识别的 cf-probe。' >&2; exit 2; }
+        dropin="/etc/systemd/system/${unit}.d"
+        forward_active=no
+        cf_probe_forward_mode_present "${unit}" "${dropin}" && forward_active=yes
+        if cf_probe_go_config_path_unverified "${unit}" >/dev/null; then
+            printf '%s\n' forward
+        elif cf_probe_script_path "${unit}" >/dev/null; then
+            if [[ ${forward_active} == yes ]]; then
+                printf '%s\n' env-shell-forward-active
+            else
+                printf '%s\n' env-shell
+            fi
+        elif [[ ${forward_active} == yes ]]; then
+            printf '%s\n' env-unknown-forward-active
+        else
+            printf '%s\n' env-unknown
+        fi
         ;;
     cf-probe-forward-health)
         # 只读入口，供角色脚本的健康检查取转发模式结论。转发模式的判定与检查都写在

@@ -164,9 +164,88 @@ manage_komari_report_ipv4() {
     esac
 }
 
-# 让用户在两种出站方式之间选择。标准输出是模式名，说明文字走标准错误；取消时返回非零。
+# 只读能力查询必须使用当前角色组件内嵌的 helper，而不是可能落后一版的已安装
+# ${HELPER}。组件本身不能直接调用 heredoc 里的函数，所以从当前 $0 精确提取该
+# 区间到临时文件，校验后执行 helper 的只读入口；全程不刷新 helper、不取写锁。
+CURRENT_HELPER_TEMP_ROOT=/tmp
+
+current_component_cf_probe_outbound_capability() (
+    local unit=${1:-} source_path=$0 candidate=
+    valid_service_unit "${unit}" || return 2
+    [[ ${source_path} == /* && -f ${source_path} && ! -L ${source_path} \
+        && -r ${source_path} && -O ${source_path} ]] || return 1
+    [[ -d ${CURRENT_HELPER_TEMP_ROOT} && ! -L ${CURRENT_HELPER_TEMP_ROOT} ]] || return 1
+    candidate=$(mktemp \
+        "${CURRENT_HELPER_TEMP_ROOT}/po0-cn-entry-helper-readonly.XXXXXXXX") || return 1
+    cleanup_current_helper_candidate() {
+        local rc=$?
+        trap - EXIT INT TERM HUP
+        rm -f -- "${candidate}"
+        exit "${rc}"
+    }
+    trap cleanup_current_helper_candidate EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    if ! awk '
+        $0 == "    cat >\"${tmp}\" <<\047EOF\047" { capture=1; next }
+        capture && $0 == "EOF" { complete=1; exit }
+        capture { print }
+        END { if (!capture || !complete) exit 1 }
+    ' "${source_path}" >"${candidate}"; then
+        return 1
+    fi
+    chmod 0700 "${candidate}" || return 1
+    [[ -f ${candidate} && ! -L ${candidate} && -O ${candidate} \
+        && $(sed -n '1p' "${candidate}") == '#!/usr/bin/env bash' ]] || return 1
+    /bin/bash -n "${candidate}" || return 1
+    /bin/bash -- "${candidate}" cf-probe-outbound-capability "${unit}"
+)
+
+# 用正在运行的国内组件做只读识别。这里不能直接调用 helper 区间里的实现识别函数；
+# 也不能查询已经安装的 ${HELPER}，因为临时扫描组件可能比它更新。
+cf_probe_outbound_capability() {
+    local unit=$1 capability
+    valid_service_unit "${unit}" || return 1
+    capability=$(/bin/bash -- "$0" cf-probe-outbound-capability "${unit}" 2>/dev/null) \
+        || return 1
+    case "${capability}" in
+        forward|env-shell|env-shell-forward-active|env-unknown|env-unknown-forward-active)
+            printf '%s\n' "${capability}"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+cf_probe_forward_mode_supported() {
+    local unit=$1 capability=${2:-}
+    [[ -n ${capability} ]] || capability=$(cf_probe_outbound_capability "${unit}") || return 1
+    [[ ${capability} == forward ]]
+}
+
+cf_probe_outbound_mode_switch_available() {
+    local unit=$1 capability
+    capability=$(cf_probe_outbound_capability "${unit}") || return 1
+    case "${capability}" in
+        forward|*-forward-active) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 让用户在受支持的出站方式之间选择。标准输出是模式名，说明文字走标准错误；
+# 取消时返回非零。旧 Shell 或无法确认的实现只使用 env，不展示必然失败的 forward。
 prompt_cf_probe_outbound_mode() {
-    local choice
+    local unit=$1 choice capability
+    capability=$(cf_probe_outbound_capability "${unit}" 2>/dev/null) || capability=env-unknown
+    if ! cf_probe_forward_mode_supported "${unit}" "${capability}"; then
+        if [[ ${capability} == env-shell* ]]; then
+            printf '%s\n' '检测到旧 Shell 版 CF Probe：它不支持本地转发，只使用代理环境变量。' >&2
+        else
+            printf '%s\n' '无法确认该 CF Probe 支持本地转发，只使用安全的代理环境变量。' >&2
+        fi
+        printf '%s\n' env
+        return 0
+    fi
     printf '\n%s\n' 'CF Probe 有两种出站方式：' >&2
     printf '%s\n' '  1) 只注入代理环境变量（默认，沿用至今的做法）' >&2
     printf '%s\n' '  2) 在 1 的基础上，额外加一条本地转发' >&2
@@ -187,7 +266,7 @@ prompt_cf_probe_outbound_mode() {
 # 切换出站方式：先撤销再按新方式重新纳管，复用两条已有的事务路径。
 switch_cf_probe_outbound_mode() {
     local unit=$1 state=$2 mode answer
-    mode=$(prompt_cf_probe_outbound_mode) || { printf '%s\n' '未做修改。'; return 0; }
+    mode=$(prompt_cf_probe_outbound_mode "${unit}") || { printf '%s\n' '未做修改。'; return 0; }
     printf '\n%s\n' '切换会先撤销当前配置，再按新方式重新纳管，期间该服务会重启两次。'
     read -r -p '确认切换？[y/N]：' answer
     case "${answer}" in y|Y|yes|YES|是) ;; *) printf '%s\n' '未做修改。'; return 0 ;; esac
@@ -209,11 +288,15 @@ switch_cf_probe_outbound_mode() {
 }
 
 manage_configured_service() {
-    local unit=$1 reason=$2 state=$3 choice answer action
+    local unit=$1 reason=$2 state=$3 choice answer action switch_available=no
+    if [[ ${reason} == *'CF Probe'* ]] \
+        && cf_probe_outbound_mode_switch_available "${unit}"; then
+        switch_available=yes
+    fi
     printf '\n%s\n' '该服务已由 Po0 配置，请选择：'
     printf '%s\n' '1) 检查并更新配置'
     printf '%s\n' '2) 撤销国外出口配置'
-    if [[ ${reason} == *'CF Probe'* ]]; then
+    if [[ ${switch_available} == yes ]]; then
         printf '%s\n' '3) 切换出站方式'
     fi
     printf '%s\n' '0) 返回'
@@ -260,7 +343,7 @@ manage_configured_service() {
             printf '完成：%s 已恢复直接联网；Agent 服务仍保留。\n' "${unit}"
             ;;
         3)
-            [[ ${reason} == *'CF Probe'* ]] \
+            [[ ${reason} == *'CF Probe'* && ${switch_available} == yes ]] \
                 || { printf '%s\n' '选择无效，未做修改。' >&2; return 1; }
             switch_cf_probe_outbound_mode "${unit}" "${state}"
             ;;
@@ -389,7 +472,7 @@ scan_services() {
 
     outbound_mode='env'
     if [[ ${reasons[index]} == *'CF Probe'* ]]; then
-        outbound_mode=$(prompt_cf_probe_outbound_mode) \
+        outbound_mode=$(prompt_cf_probe_outbound_mode "${unit}") \
             || { printf '%s\n' '未做修改。'; return 0; }
     fi
 
