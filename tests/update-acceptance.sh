@@ -2794,7 +2794,7 @@ test_reconfigure_refuses_claimed_entry() (
 # 否则「没装 Po0」「连不上入口」会被误判成一切正常。
 test_readonly_check_entry() (
     set -Eeuo pipefail
-    local out rc json
+    local out rc json readonly_inner
     load_harness 2.5.23
 
     # 级别映射与 JSON 转义
@@ -2805,16 +2805,24 @@ test_readonly_check_entry() (
     assert_eq 'a\"b' "$(readonly_check_json_escape 'a"b')" '双引号没有转义' || return 1
     assert_eq 'a\\b' "$(readonly_check_json_escape 'a\b')" '反斜杠没有转义' || return 1
 
-    # 退出码翻译：内部码 → 对外码；任何意外码都归入 3，不能冒充检查结论
-    run_cn_entry_operation() { return 10; }; rc=0; run_readonly_check || rc=$?
+    # 退出码翻译现在跨过带总体时限的独立子进程；用真 Bash 子进程返回内部码，
+    # 任何意外码仍归入 3，不能冒充检查结论。
+    readonly_inner=${CASE_DIR}/po0-unlock.sh
+    printf '%s\n' '#!/usr/bin/env bash' \
+        '[[ ${1:-} == __readonly-check-inner ]] || exit 99' \
+        'exit "${TEST_READONLY_RC:-99}"' >"${readonly_inner}"
+    chmod 0700 "${readonly_inner}"
+    SCRIPT_PATH=${readonly_inner}
+    export TEST_READONLY_RC=10
+    rc=0; run_readonly_check || rc=$?
     assert_eq 0 "${rc}" '正常没有返回 0' || return 1
-    run_cn_entry_operation() { return 11; }; rc=0; run_readonly_check || rc=$?
+    TEST_READONLY_RC=11; rc=0; run_readonly_check || rc=$?
     assert_eq 1 "${rc}" '提醒没有返回 1' || return 1
-    run_cn_entry_operation() { return 12; }; rc=0; run_readonly_check || rc=$?
+    TEST_READONLY_RC=12; rc=0; run_readonly_check || rc=$?
     assert_eq 2 "${rc}" '异常没有返回 2' || return 1
-    run_cn_entry_operation() { return 13; }; rc=0; run_readonly_check || rc=$?
+    TEST_READONLY_RC=13; rc=0; run_readonly_check || rc=$?
     assert_eq 3 "${rc}" '工具出错没有返回 3' || return 1
-    run_cn_entry_operation() { return 1; }; rc=0; out=$(run_readonly_check 2>&1) || rc=$?
+    TEST_READONLY_RC=1; rc=0; out=$(run_readonly_check 2>&1) || rc=$?
     assert_eq 3 "${rc}" 'die 造成的退出码 1 被当成了检查结论' || return 1
 
     # 未安装：必须是 3，且两种模式都要给出结论，不能崩溃或误报正常
