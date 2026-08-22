@@ -90,7 +90,7 @@ cmp -s <(bash po0-unlock.sh __extract-role cn-entry) cn-entry-role.sh
 - `CHANGELOG.md`、`README.md`、`使用说明.md`、`PROJECT.md`、`TODO.md`、`docs/`、`.github/workflows/`、`AGENTS.md` 及其他工程配置，只能在当前任务确实涉及对应内容时修改；不得顺带整理或改写。
 - 严禁手工编辑生成产物：`cn-entry-role.sh` 与 `po0-unlock.sh` 只能分别由 `tools/build-cn-entry-role.sh` 和 `tools/build-single-file.sh` 生成。
 - 国内入口组件是被写到对端执行的**独立脚本**（由角色脚本中的 heredoc 生成），它取不到角色脚本里的函数与变量。写在组件那几个模块里的代码，只能调用同样进入组件的函数、只能读组件自己赋值的常量；两个作用域都需要的东西按既有约定各留一份、名字不同（如 `active_state`／`helper_active_state`）。`tests/cf-probe-acceptance.sh` 里有两条守卫强制这一点。
-- 角色脚本通过 `$0` 或 `${HELPER}` 跨进程调用子命令时，命令名必须直接写成字面量，并存在于对应角色或 helper 的 dispatch；不得把子命令藏进变量或数组，导致契约无法静态核对。`tests/cf-probe-acceptance.sh` 会系统核对全部这类调用，并通过真实角色入口运行可安全执行的只读桥接夹具。
+- 角色脚本通过 `$0` 或 `${HELPER}` 跨进程调用子命令时，`$0`／`${HELPER}` 必须出现在契约守卫能识别的命令位置：直接作为 shell 命令，或跟在不带路径的字面量 `timeout`、`env`、`nice`、`sudo` 及其参数之后；`$0` 还可以紧跟字面量 `/bin/bash` 与可选的 `--`，包括在前述包装器之内。紧随其后的子命令名必须直接写成小写字面量，并存在于对应角色或 helper 的 dispatch。不得使用 `stdbuf`、`/usr/bin/timeout` 等守卫无法识别的其他包装形式，也不得把子命令藏进变量或数组，导致契约无法静态核对。`tests/cf-probe-acceptance.sh` 会系统核对全部这类调用，并通过真实角色入口运行可安全执行的只读桥接夹具。
 - 修改国内入口模块后，必须运行 `bash tools/build-cn-entry-role.sh` 重新生成产物，并确认 `bash tools/build-cn-entry-role.sh --check` 通过。
 - 修改任何会进入单文件的源码后，必须使用当前版本号重新生成 `po0-unlock.sh`，并执行本地验收清单中的确定性重建检查。
 - 本项目只维护一个公开版单文件。它只允许通过匿名 HTTPS 访问预期的公开 GitHub Release，不得要求、读取、保存或发送 GitHub Token；在线更新、上一版助手恢复和手动上传更高版本后的本地安全接管均保留。
